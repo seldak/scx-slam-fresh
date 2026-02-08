@@ -187,6 +187,8 @@ static void stage_thread(const char *name,
 
         if (out)
             out->push(m);
+
+        slamqos_clear_hint(&q);
     }
 
     slamqos_close(&q);

@@ -33,6 +33,7 @@ int slamqos_publish_job(struct slamqos *q,
                         uint64_t slice_ns,
                         uint32_t weight);
 
+int slamqos_clear_hint(struct slamqos *q);
 #ifdef __cplusplus
 }
 #endif

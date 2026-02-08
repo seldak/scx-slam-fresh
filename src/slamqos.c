@@ -81,3 +81,13 @@ int slamqos_publish_job(struct slamqos *q,
     h.weight = weight;
     return slamqos_publish_hint(q, &h);
 }
+
+int slamqos_clear_hint(struct slamqos *q)
+{
+    struct slam_task_hint h = {0};
+    h.api_version = SLAM_SCX_API_VERSION;
+    h.stage_id = SLAM_STAGE_MISC;
+    h.class_id = SLAM_SCX_CLASS_BE;
+    h.job_id = 0;
+    return slamqos_publish_hint(q, &h);
+}

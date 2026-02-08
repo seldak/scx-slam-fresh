@@ -351,7 +351,17 @@ void BPF_STRUCT_OPS(scx_slam_fresh_running, struct task_struct *p)
     if (!st)
         return;
 
-    st->last_start_ns = scx_now_ns();
+    u64 now_ns = scx_now_ns();
+    struct slam_task_hint *h = get_hint(key);
+
+    /* Reset at job boundary even if there was no enqueue between jobs */
+    if (h && h->job_id != st->last_job_id) {
+        st->exec_ns_in_job = 0;
+        st->overrun = 0;
+        st->last_job_id = h->job_id;
+    }
+
+    st->last_start_ns = now_ns;
 }
 
 void BPF_STRUCT_OPS(scx_slam_fresh_stopping, struct task_struct *p, bool runnable)
