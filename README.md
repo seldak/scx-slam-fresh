@@ -86,6 +86,15 @@ This pins (at least) the following maps:
 
 ### 2) Run the demo pipeline
 
+**Note:** The demo uses *producer-driven hinting* (the thread that pushes a work item publishes the consumer's hint before waking it), so sched_ext sees correct metadata at wake-up.
+
+### Demo knobs
+- `--lidar off|light|mid|heavy` enables a LiDAR stream (10Hz) with bursty compute
+- `--hog N` adds CPU contention
+- `--drop-stale 1` skips compute for stale jobs (models backlog shedding)
+- `--duration S` controls run length
+
+
 #### Option A: partial mode (recommended)
 In partial mode, only `SCHED_EXT` tasks are controlled by this scheduler.
 So the demo must move its pipeline threads into `SCHED_EXT`.

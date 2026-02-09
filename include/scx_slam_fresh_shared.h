@@ -18,7 +18,6 @@ typedef __u64 uint64_t;
 #include <stdint.h>
 #endif
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +38,8 @@ enum slam_stage_id : uint32_t {
     SLAM_STAGE_STATE_EST      = 2,
     SLAM_STAGE_MAPPING_BE     = 3,
     SLAM_STAGE_LOOP_CLOSURE   = 4,
+    SLAM_STAGE_LIDAR_PREINT  = 5,
+    SLAM_STAGE_LIDAR_REG       = 6,
     SLAM_STAGE_MISC           = 15,
     SLAM_STAGE_MAX            = 16
 };

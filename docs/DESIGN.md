@@ -109,3 +109,19 @@ The demo uses a synthetic pipeline, but the integration model maps cleanly to:
 - sensor fusion / VIO with periodic IMU and camera updates
 
 The only required integration is publishing hints (a small library call) at job start.
+
+## Producer-driven hinting (wake-up correctness)
+
+A subtle but critical detail: `sched_ext` policy decisions are made at **enqueue time** (wake-up).
+In a message-driven pipeline (condvars/queues), a consumer thread is enqueued *before* it can pop
+a message and publish metadata about that message.
+
+If the consumer publishes its hint only after it begins running, the wake-up has already been
+misclassified (often as best-effort), and under overload the thread may never catch up.
+
+**Solution in this project:** publish the consumer's next-job hint from the **producer**:
+1. each worker registers its `pid_tgid` (tgid<<32 | tid)
+2. each queue knows its consumer `pid_tgid` and StageCfg
+3. `push()` writes the consumer hint to the `task_hints` map, then wakes the consumer
+
+This ensures the scheduler sees accurate deadline/freshness metadata at the moment it matters.

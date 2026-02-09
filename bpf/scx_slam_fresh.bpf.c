@@ -79,9 +79,9 @@ extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 extern u64 scx_bpf_now(void) __ksym __weak;
 static __always_inline u64 scx_now_ns(void)
 {
-    /*if (bpf_ksym_exists(scx_bpf_now))
-        return scx_bpf_now();*/
-    return bpf_ktime_get_ns(); /* CLOCK_MONOTONIC */
+    if (bpf_ksym_exists(scx_bpf_now))
+        return scx_bpf_now();
+    return bpf_ktime_get_ns();
 }
 
 /* dispatch -> dsq_insert */
@@ -136,6 +136,9 @@ static __always_inline bool scx_move_to_local(u64 dsq_id)
 #define DSQ_STALE  0x5A1EULL
 
 #define MAX_DISPATCH 32
+
+/* Demote tasks that are already past their deadline by this grace period. */
+#define DEADLINE_GRACE_NS 1000000ULL /* 1ms */
 
 /* -----------------------------
  * Maps
@@ -314,6 +317,17 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
         return;
     }
 
+/* Firm-ish deadline handling: if already past deadline, treat as stale to prevent EDF "doom spiral". */
+if (h->deadline_ts_ns && now_ns > h->deadline_ts_ns + DEADLINE_GRACE_NS) {
+    if (st->last_reported_deadline_miss_job != h->job_id) {
+        emit_evt(SLAM_EVT_DEADLINE_MISS, key, h, st, now_ns);
+        st->last_reported_deadline_miss_job = h->job_id;
+    }
+    scx_insert_vtime(p, DSQ_STALE, slice, st->vruntime, enq_flags);
+    return;
+}
+
+
     if (h->class_id == SLAM_SCX_CLASS_FE && !st->overrun) {
         u64 vtime = effective_deadline_ns(h, now_ns);
         scx_insert_vtime(p, DSQ_FE, slice, vtime, enq_flags);
@@ -351,17 +365,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_running, struct task_struct *p)
     if (!st)
         return;
 
-    u64 now_ns = scx_now_ns();
-    struct slam_task_hint *h = get_hint(key);
-
-    /* Reset at job boundary even if there was no enqueue between jobs */
-    if (h && h->job_id != st->last_job_id) {
-        st->exec_ns_in_job = 0;
-        st->overrun = 0;
-        st->last_job_id = h->job_id;
-    }
-
-    st->last_start_ns = now_ns;
+    st->last_start_ns = scx_now_ns();
 }
 
 void BPF_STRUCT_OPS(scx_slam_fresh_stopping, struct task_struct *p, bool runnable)
