@@ -24,7 +24,11 @@ SKEL_H    := $(BUILD_DIR)/scx_slam_fresh.skel.h
 
 VMLINUX_GEN := scripts/gen_vmlinux_h.sh
 
-all: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo
+all: bpf userspace
+
+userspace: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo
+
+bpf: $(SKEL_H)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -40,7 +44,7 @@ $(BPF_OBJ): $(VMLINUX_H) bpf/scx_slam_fresh.bpf.c include/scx_slam_fresh_shared.
 $(SKEL_H): $(BPF_OBJ)
 	bpftool gen skeleton $(BPF_OBJ) > $(SKEL_H)
 
-$(BUILD_DIR)/scx_slam_fresh_user: src/scx_slam_fresh_user.c src/slamqos.c $(SKEL_H) include/scx_slam_fresh_shared.h | $(BUILD_DIR)
+$(BUILD_DIR)/scx_slam_fresh_user: src/scx_slam_fresh_user.c src/slamqos.c include/scx_slam_fresh_shared.h | $(BUILD_DIR)
 	$(CC) -O2 -g -I$(BUILD_DIR) -Iinclude -Isrc \
 		src/scx_slam_fresh_user.c src/slamqos.c \
 		-lbpf -lelf -lz -o $@
@@ -48,6 +52,8 @@ $(BUILD_DIR)/scx_slam_fresh_user: src/scx_slam_fresh_user.c src/slamqos.c $(SKEL
 $(BUILD_DIR)/slam_pipeline_demo: demo/slam_pipeline_demo.cpp src/slamqos.c include/scx_slam_fresh_shared.h | $(BUILD_DIR)
 	$(CXX) -O2 -g -Iinclude -Isrc demo/slam_pipeline_demo.cpp src/slamqos.c \
 		-lbpf -lelf -lz -lpthread -o $@
+
+userspace: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo
 
 clean:
 	rm -rf $(BUILD_DIR)

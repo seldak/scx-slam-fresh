@@ -17,9 +17,5 @@ jobs:
 
       - name: Build (skip if runner lacks BTF)
         run: |
-          if [ -e /sys/kernel/btf/vmlinux ]; then
-            make SLAM_FULL_SWITCH=0
-          else
-            echo "Runner lacks /sys/kernel/btf/vmlinux; skipping BPF build."
-            echo "This repo is expected to build on a machine with kernel BTF enabled."
-          fi
+            make userspace
+
