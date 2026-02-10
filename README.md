@@ -39,14 +39,13 @@ This is by no means production ready, rather a personal experiment.
 
 ---
 
-## Safety model (important)
+## Safety model
 By default, this scheduler is built in **partial switch** mode:
 only tasks running under the `SCHED_EXT` policy are scheduled by sched_ext; normal tasks keep running under CFS.
 
-- This dramatically reduces the “oops I froze my machine” risk while iterating.
+- This dramatically reduces accidental machine freeze risk while iterating.
 - If anything goes wrong, the kernel can abort the BPF scheduler and revert tasks to CFS.
 
-You can also build a **full switch** variant for benchmarking (see below).
 
 ---
 
@@ -95,7 +94,7 @@ This pins (at least) the following maps:
 - `--duration S` controls run length
 
 
-#### Option A: partial mode (recommended)
+#### Option A: partial mode
 In partial mode, only `SCHED_EXT` tasks are controlled by this scheduler.
 So the demo must move its pipeline threads into `SCHED_EXT`.
 
@@ -105,7 +104,7 @@ Because libc headers for `SCHED_EXT` may lag, the demo takes a numeric policy vi
 sudo ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --ext-policy <N>
 ```
 
-#### Option B: full switch mode (convenient for demos, riskier)
+#### Option B: full switch mode
 This makes sched_ext schedule *everything* (not just SCHED_EXT tasks).
 
 Build and run:
@@ -118,16 +117,20 @@ sudo ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh
 
 ---
 
-## Repo layout
+## Results (single-core overload)
+Kernel: 6.14, sched_ext enabled. Workload: LiDAR heavy (300k pts @10Hz) + camera (30Hz) + IMU (200Hz) + 2 CPU hog threads.
+Pinned to one core to force contention.
+
+Commands:
+```bash
+sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15
+sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15 --ext-policy 7
+sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15 --ext-policy 7 --drop-stale 1
 ```
-.
-├── bpf/                      # BPF scheduler (struct_ops)
-├── include/                  # shared structs (BPF <-> user)
-├── src/                      # loader + libslamqos
-├── demo/                     # synthetic SLAM pipeline workload
-├── docs/                     # design docs with mermaid diagrams
-└── scripts/                  # helper scripts (vmlinux.h generation etc)
-```
+
+Summary: estimator deadline misses drop from ~30% (baseline) to ~2% with scx_slam_fresh. Dropping stale work reduces wasted backend compute.
+
+Known limitation: IMU misses increase under this extreme single-core stress; next step is a dedicated IMU dispatch lane (DSQ_IMU).
 
 ---
 
