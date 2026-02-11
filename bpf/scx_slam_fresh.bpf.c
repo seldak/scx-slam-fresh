@@ -79,8 +79,7 @@ extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 extern u64 scx_bpf_now(void) __ksym __weak;
 static __always_inline u64 scx_now_ns(void)
 {
-    if (bpf_ksym_exists(scx_bpf_now))
-        return scx_bpf_now();
+    /* Use monotonic . */
     return bpf_ktime_get_ns();
 }
 
