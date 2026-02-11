@@ -351,6 +351,14 @@ static void wait_for_pid(std::atomic<uint64_t> &pid, const char *name)
     fprintf(stderr, "warning: timed out waiting for %s pid_tgid\n", name);
 }
 
+static double lidar_reg_k_for_mode(const std::string &mode)
+{
+    if (mode == "light") return 0.01;
+    if (mode == "mid")   return 0.02;
+    if (mode == "heavy") return 0.05;
+    return 0.0; // off/unknown
+}
+
 int main(int argc, char **argv)
 {
     const char *pin_dir = nullptr;
@@ -450,6 +458,7 @@ int main(int argc, char **argv)
                       &pid_est);
 
     uint32_t lidar_points = lidar_points_for_mode(lidar_mode);
+    double lidar_k = lidar_reg_k_for_mode(lidar_mode);
 
     std::thread t_lpre;
     std::thread t_lreg;
@@ -462,11 +471,11 @@ int main(int argc, char **argv)
                              &pid_lpre);
 
         t_lreg = std::thread(stage_worker, &q_lidar1, &q_map, cfg_lreg, ext_policy, drop_stale, &running, &st_lreg,
-                             [](const WorkItem &w) -> uint64_t {
+                             [lidar_k](const WorkItem &w) -> uint64_t {
                                  /* registration ~ O(N log N): 8ms + 0.01us * N * log2(N) */
                                  double N = (double)w.points;
                                  double lg = (N > 1.0) ? (std::log(N) / std::log(2.0)) : 1.0;
-                                 double us = 8000.0 + 0.01 * N * lg;
+				 double us = 8000.0 + lidar_k * N * lg;
                                  if (us < 0.0) us = 0.0;
                                  return (uint64_t)us;
                              },
@@ -576,13 +585,14 @@ int main(int argc, char **argv)
                (unsigned long long)st_lpre.dropped_stale,
                lidar_points);
 
-        printf("lidar_reg:  processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u\n",
+        printf("lidar_reg:  processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u reg_k=%.3f\n",
                (unsigned long long)st_lreg.processed,
                (unsigned long long)st_lreg.late,
                pct(st_lreg.late, st_lreg.processed),
                (unsigned long long)st_lreg.stale_seen,
                (unsigned long long)st_lreg.dropped_stale,
-               lidar_points);
+               lidar_points,
+               lidar_k);
     }
 
     printf("mapping_be: processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
