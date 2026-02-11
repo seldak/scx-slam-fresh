@@ -3,12 +3,13 @@
  * scx_slam_fresh: freshness-aware sched_ext scheduler for SLAM-ish pipelines.
  *
  * Policy summary:
- * - Front-end (FE) tasks: EDF-like ordering using DSQ vtime = effective deadline.
- * - Stale work: demoted to DSQ_STALE.
- * - Budget overrun: FE task is demoted to BE for the remainder of the job.
- * - Back-end (BE): vtime fairness using vruntime.
- *
- * This is deliberately a "readable" scheduler, intended for learning + portfolio.
+ * - Tier-0 (IMU / propagation): always route to DSQ_IMU (highest priority),
+ *   never stale-demote / late-demote. Periodic tasks may "arm" hints with future
+ *   release_ts_ns; all age math guards against underflow.
+ * - Front-end (FE): EDF-like ordering using DSQ vtime = effective deadline
+ * - Stale work: demoted to DSQ_STALE
+ * - Budget overrun: FE task demoted to BE for remainder of job
+ * - Back-end (BE): vtime fairness using vruntime
  */
 
 #include "vmlinux.h"
@@ -27,11 +28,6 @@ char LICENSE[] SEC("license") = "GPL";
  *
  * sched_ext kfuncs were renamed across kernel versions (aliases may later vanish).
  * We use weak ksyms + bpf_ksym_exists() to call whichever name exists.
- *
- * Renames include:
- * - scx_bpf_dispatch() -> scx_bpf_dsq_insert() (alias removed in newer kernels)
- * - scx_bpf_dispatch_vtime() -> scx_bpf_dsq_insert_vtime()
- * - scx_bpf_consume() -> scx_bpf_dsq_move_to_local()
  */
 
 #ifndef __weak
@@ -67,9 +63,9 @@ char LICENSE[] SEC("license") = "GPL";
  * Kfunc prototypes
  * ----------------------------- */
 
-extern s32 scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
+extern s32  scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
 extern void scx_bpf_destroy_dsq(u64 dsq_id) __ksym;
-extern u32 scx_bpf_dispatch_nr_slots(void) __ksym;
+extern u32  scx_bpf_dispatch_nr_slots(void) __ksym;
 
 /* CPU selection helper: keep weak and fallback. */
 extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
@@ -130,6 +126,7 @@ static __always_inline bool scx_move_to_local(u64 dsq_id)
 #endif
 
 /* DSQ ids (arbitrary but stable). */
+#define DSQ_IMU    0x1A01ULL
 #define DSQ_FE     0xFE01ULL
 #define DSQ_BE     0xBE01ULL
 #define DSQ_STALE  0x5A1EULL
@@ -138,6 +135,7 @@ static __always_inline bool scx_move_to_local(u64 dsq_id)
 
 /* Demote tasks that are already past their deadline by this grace period. */
 #define DEADLINE_GRACE_NS 1000000ULL /* 1ms */
+
 
 /* -----------------------------
  * Maps
@@ -204,6 +202,16 @@ static __always_inline struct slam_task_hint *get_hint(u64 key)
     return bpf_map_lookup_elem(&task_hints, &key);
 }
 
+static __always_inline u64 safe_age_ns(u64 now_ns, u64 release_ns)
+{
+    /* Guard underflow for "armed next tick" hints where release may be in the future. */
+    if (!release_ns)
+        return 0;
+    if (now_ns < release_ns)
+        return 0;
+    return now_ns - release_ns;
+}
+
 static __always_inline void emit_evt(u32 kind, u64 key,
                                      const struct slam_task_hint *h,
                                      const struct task_state *st,
@@ -224,7 +232,7 @@ static __always_inline void emit_evt(u32 kind, u64 key,
     e->deadline_ts_ns = h ? h->deadline_ts_ns : 0;
 
     e->exec_ns_in_job = st ? st->exec_ns_in_job : 0;
-    e->age_ns = (h && h->release_ts_ns) ? (now_ns - h->release_ts_ns) : 0;
+    e->age_ns = (h) ? safe_age_ns(now_ns, h->release_ts_ns) : 0;
 
     e->class_id = h ? h->class_id : SLAM_SCX_CLASS_BE;
 
@@ -297,15 +305,26 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
         st->last_job_id = h->job_id;
     }
 
-    /* Staleness check */
+    u64 slice = h->slice_ns; /* 0 => kernel default */
+
+    /*
+     * Tier-0 lane: IMU / propagation thread.
+     * - Always route to DSQ_IMU (highest priority)
+     * - Never stale-demote or late-demote (propagation must run ASAP to recover)
+     */
+    if (h->stage_id == SLAM_STAGE_IMU_PREINT) {
+        u64 vtime = effective_deadline_ns(h, now_ns);
+        scx_insert_vtime(p, DSQ_IMU, slice, vtime, enq_flags);
+        return;
+    }
+
+    /* Staleness check (guard future release timestamps). */
     bool stale = false;
     if (h->stale_ns && h->release_ts_ns) {
-        u64 age = now_ns - h->release_ts_ns;
+        u64 age = safe_age_ns(now_ns, h->release_ts_ns);
         if (age > h->stale_ns)
             stale = true;
     }
-
-    u64 slice = h->slice_ns; /* 0 => kernel default */
 
     if (stale) {
         if (st->last_reported_stale_job != h->job_id) {
@@ -316,16 +335,21 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
         return;
     }
 
-/* Firm-ish deadline handling: if already past deadline, treat as stale to prevent EDF "doom spiral". */
-if (h->deadline_ts_ns && now_ns > h->deadline_ts_ns + DEADLINE_GRACE_NS) {
-    if (st->last_reported_deadline_miss_job != h->job_id) {
-        emit_evt(SLAM_EVT_DEADLINE_MISS, key, h, st, now_ns);
-        st->last_reported_deadline_miss_job = h->job_id;
+    /*
+     * Firm-ish late demotion:
+     * If already past deadline, treat as stale/low priority.
+     * (IMU is exempt above.)
+     *
+     * Grace: 1ms to avoid flapping around boundary.
+     */
+    if (h->deadline_ts_ns && now_ns > h->deadline_ts_ns + DEADLINE_GRACE_NS) {
+        if (st->last_reported_deadline_miss_job != h->job_id) {
+            emit_evt(SLAM_EVT_DEADLINE_MISS, key, h, st, now_ns);
+            st->last_reported_deadline_miss_job = h->job_id;
+        }
+        scx_insert_vtime(p, DSQ_STALE, slice, st->vruntime, enq_flags);
+        return;
     }
-    scx_insert_vtime(p, DSQ_STALE, slice, st->vruntime, enq_flags);
-    return;
-}
-
 
     if (h->class_id == SLAM_SCX_CLASS_FE && !st->overrun) {
         u64 vtime = effective_deadline_ns(h, now_ns);
@@ -345,6 +369,10 @@ void BPF_STRUCT_OPS(scx_slam_fresh_dispatch, s32 cpu, struct task_struct *prev)
     for (int i = 0; i < MAX_DISPATCH; i++) {
         if ((u32)i >= nr)
             break;
+
+        /* Highest priority: propagation/IMU */
+        if (scx_move_to_local(DSQ_IMU))
+            continue;
 
         if (scx_move_to_local(DSQ_FE))
             continue;
@@ -395,7 +423,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_stopping, struct task_struct *p, bool runnabl
         }
     }
 
-    /* Deadline miss: best-effort detection (we don't know "job done", only "late while running"). */
+    /* Deadline miss: best-effort detection (emit once/job). */
     if (h && h->deadline_ts_ns && now_ns > h->deadline_ts_ns) {
         if (st->last_reported_deadline_miss_job != h->job_id) {
             emit_evt(SLAM_EVT_DEADLINE_MISS, key, h, st, now_ns);
@@ -410,6 +438,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(scx_slam_fresh_init)
 {
     /* NUMA node -1 means "any". */
     s32 err;
+
+    err = scx_bpf_create_dsq(DSQ_IMU, -1);
+    if (err)
+        return err;
+
     err = scx_bpf_create_dsq(DSQ_FE, -1);
     if (err)
         return err;
@@ -427,6 +460,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(scx_slam_fresh_init)
 
 void BPF_STRUCT_OPS(scx_slam_fresh_exit, struct scx_exit_info *ei)
 {
+    scx_bpf_destroy_dsq(DSQ_IMU);
     scx_bpf_destroy_dsq(DSQ_FE);
     scx_bpf_destroy_dsq(DSQ_BE);
     scx_bpf_destroy_dsq(DSQ_STALE);
@@ -453,9 +487,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_exit_task, struct task_struct *p,
  * sched_ext ops table.
  *
  * Default: partial switch (safer). Full switch can be selected by building with SLAM_FULL_SWITCH=1.
- *
- * NOTE: The enum constant SCX_OPS_SWITCH_PARTIAL is expected to be present in vmlinux.h
- * when building against a kernel that supports sched_ext.
+ * Some kernels might not expose SCX_OPS_SWITCH_PARTIAL in BTF; guard it.
  */
 SCX_OPS_DEFINE(scx_slam_fresh_ops,
     .select_cpu  = (void *)scx_slam_fresh_select_cpu,
@@ -469,6 +501,9 @@ SCX_OPS_DEFINE(scx_slam_fresh_ops,
     .exit_task   = (void *)scx_slam_fresh_exit_task,
     .name        = "scx_slam_fresh",
 #if !SLAM_FULL_SWITCH
+#ifdef SCX_OPS_SWITCH_PARTIAL
     .flags       = (u64)SCX_OPS_SWITCH_PARTIAL,
 #endif
+#endif
 );
+
