@@ -33,7 +33,7 @@ bpf: $(SKEL_H)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(VMLINUX_H): $(BUILD_DIR)
+$(VMLINUX_H): | $(BUILD_DIR)
 	$(VMLINUX_GEN) $(VMLINUX_H)
 
 $(BPF_OBJ): $(VMLINUX_H) bpf/scx_slam_fresh.bpf.c include/scx_slam_fresh_shared.h | $(BUILD_DIR)
@@ -44,7 +44,7 @@ $(BPF_OBJ): $(VMLINUX_H) bpf/scx_slam_fresh.bpf.c include/scx_slam_fresh_shared.
 $(SKEL_H): $(BPF_OBJ)
 	bpftool gen skeleton $(BPF_OBJ) > $(SKEL_H)
 
-$(BUILD_DIR)/scx_slam_fresh_user: src/scx_slam_fresh_user.c src/slamqos.c include/scx_slam_fresh_shared.h | $(BUILD_DIR)
+$(BUILD_DIR)/scx_slam_fresh_user: src/scx_slam_fresh_user.c src/slamqos.c include/scx_slam_fresh_shared.h $(SKEL_H) | $(BUILD_DIR)
 	$(CC) -O2 -g -I$(BUILD_DIR) -Iinclude -Isrc \
 		src/scx_slam_fresh_user.c src/slamqos.c \
 		-lbpf -lelf -lz -o $@
