@@ -38,11 +38,14 @@ Sensor generators share one absolute start epoch, use absolute release times, an
 
 ## Experiments
 
-### E0: LiDAR mode sweep
+### E0: LiDAR mode sweep — partially implemented
+
+- The `light`, `mid`, and `heavy` workload modes are implemented.
 - Hold CPU affinity and hog count constant.
 - Confirm that light remains sustainable, mid approaches saturation, and heavy produces stale LiDAR-registration work.
+- Pending: automate the three-mode sweep and assert the expected load regimes.
 
-### E1: Heavy LiDAR overload
+### ~~E1: Heavy LiDAR overload~~ — completed
 
 Use two matched sub-experiments because strict priority plus two hogs can fully
 starve the back-end. A consumer that never runs cannot demonstrate
@@ -74,9 +77,34 @@ sudo env CPU=0 DURATION=15 HOG_THREADS=2 STALE_HOG_THREADS=0 REPETITIONS=3 \
   scripts/run_single_core_eval.sh
 ```
 
-### E2: Sensor burst / backlog
-- Inject a burst of camera frames.
-- Goal: scheduler prioritizes newer useful frames and demotes stale backlog.
+### ~~E2: Sensor burst / backlog~~ — completed
+
+- Inject a deterministic delayed-delivery camera burst while preserving every
+  frame's original sensor timestamp.
+- Compare matched scx_slam_fresh runs with and without `--drop-stale 1`.
+- Require stale dropping to process fewer obsolete burst frames, preserve the
+  newest burst frame, and reduce its state-estimate completion age.
+
+The root benchmark enforces all three conditions. Use `BURST_COUNT` and
+`BURST_AT_MS` to change the default 12-frame burst delivered near 3000 ms.
+
+#### Latest local verification snapshot
+
+One root run on 2026-08-24 using kernel `7.0.0-30-generic`, CPU 0, 15-second
+cases, and one repetition produced:
+
+- E1 isolation: state-estimator deadline misses were 49.0% under CFS and 0.0%
+  under scx_slam_fresh.
+- E1 stale shedding: LiDAR-registration pending backlog fell from 97 to 3;
+  63 expired queued jobs were evicted.
+- E2 burst recovery: both policies preserved newest burst frame 92. Stale
+  dropping processed 2 rather than 12 burst frames and reduced its
+  state-estimate completion age from 109210us to 26111us.
+
+These figures are a development verification snapshot, not a multi-run
+performance claim. Reproduce them with the benchmark command above; the script
+records the environment, revision, binary hashes, and per-case output in its
+chosen results directory.
 
 ### E3: Budget misconfiguration
 - Set a too-low budget for a front-end stage.

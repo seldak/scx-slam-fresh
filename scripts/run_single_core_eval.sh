@@ -11,6 +11,8 @@ cpu=${CPU:-0}
 duration=${DURATION:-15}
 hog_threads=${HOG_THREADS:-2}
 stale_hog_threads=${STALE_HOG_THREADS:-0}
+burst_count=${BURST_COUNT:-12}
+burst_at_ms=${BURST_AT_MS:-3000}
 ext_policy=${EXT_POLICY:-7}
 repetitions=${REPETITIONS:-1}
 output_dir=${OUTPUT_DIR:-/tmp/scx-slam-fresh-eval-$(date +%Y%m%d-%H%M%S)-$$}
@@ -22,7 +24,8 @@ usage() {
 Usage: sudo scripts/run_single_core_eval.sh
 
 Optional environment variables:
-  CPU=0 DURATION=15 HOG_THREADS=2 STALE_HOG_THREADS=0 EXT_POLICY=7 REPETITIONS=1
+  CPU=0 DURATION=15 HOG_THREADS=2 STALE_HOG_THREADS=0 BURST_COUNT=12
+  BURST_AT_MS=3000 EXT_POLICY=7 REPETITIONS=1
   OUTPUT_DIR=/path/to/results
 EOF
 }
@@ -61,13 +64,14 @@ wait_for_scheduler() {
 run_case() {
     local name=$1
     local case_hogs=$2
-    shift 2
+    local lidar_mode=$3
+    shift 3
 
     echo
     echo "=== $name ==="
     echo "Running for about ${duration}s; results are printed when the workload finishes."
     taskset -c "$cpu" "$demo_bin" \
-        --lidar heavy \
+        --lidar "$lidar_mode" \
         --hog "$case_hogs" \
         --duration "$duration" \
         "$@" 2>&1 | tee "$output_dir/$name.txt"
@@ -138,7 +142,7 @@ fi
 mkdir -p -- "$output_dir"
 trap cleanup EXIT INT TERM
 
-echo "Running $((repetitions * 4)) cases (~$((repetitions * 4 * duration)) seconds of workload time)."
+echo "Running $((repetitions * 6)) cases (~$((repetitions * 6 * duration)) seconds of workload time)."
 echo "Results directory: $output_dir"
 
 cat >"$output_dir/environment.txt" <<EOF
@@ -148,6 +152,8 @@ cpu=$cpu
 duration=$duration
 hog_threads=$hog_threads
 stale_hog_threads=$stale_hog_threads
+burst_count=$burst_count
+burst_at_ms=$burst_at_ms
 ext_policy=$ext_policy
 repetitions=$repetitions
 git_commit=$(git -C "$repo_dir" rev-parse HEAD)
@@ -158,7 +164,7 @@ bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{pri
 EOF
 
 for repetition in $(seq 1 "$repetitions"); do
-    run_case "cfs-isolation-$repetition" "$hog_threads" --no-hints
+    run_case "cfs-isolation-$repetition" "$hog_threads" heavy --no-hints
 done
 
 mkdir -p -- "$pin_dir"
@@ -173,7 +179,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-isolation-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-isolation-$repetition" "$hog_threads" --pin "$pin_dir" --ext-policy "$ext_policy"
+    run_case "scx-isolation-$repetition" "$hog_threads" heavy --pin "$pin_dir" --ext-policy "$ext_policy"
 
     if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
         echo "error: sched_ext stopped before stale-keeping run $repetition" >&2
@@ -181,7 +187,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-stale-keep-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-stale-keep-$repetition" "$stale_hog_threads" --pin "$pin_dir" --ext-policy "$ext_policy"
+    run_case "scx-stale-keep-$repetition" "$stale_hog_threads" heavy --pin "$pin_dir" --ext-policy "$ext_policy"
 
     if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
         echo "error: sched_ext stopped before stale-dropping run $repetition" >&2
@@ -189,7 +195,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-stale-drop-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-stale-drop-$repetition" "$stale_hog_threads" --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1
+    run_case "scx-stale-drop-$repetition" "$stale_hog_threads" heavy --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1
 
     keep_file="$output_dir/scx-stale-keep-$repetition.txt"
     drop_file="$output_dir/scx-stale-drop-$repetition.txt"
@@ -211,6 +217,61 @@ for repetition in $(seq 1 "$repetitions"); do
 
     if (( drop_pending >= keep_pending )); then
         echo "error: stale dropping did not reduce the pending LiDAR registration backlog" >&2
+        exit 1
+    fi
+
+    if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
+        echo "error: sched_ext stopped before burst-keeping run $repetition" >&2
+        tail -n 40 "$output_dir/loader.txt" >&2 || true
+        exit 1
+    fi
+    echo "=== scx-burst-keep-$repetition ===" >>"$output_dir/loader.txt"
+    run_case "scx-burst-keep-$repetition" 0 off \
+        --pin "$pin_dir" --ext-policy "$ext_policy" \
+        --camera-burst-count "$burst_count" --camera-burst-at-ms "$burst_at_ms"
+
+    if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
+        echo "error: sched_ext stopped before burst-dropping run $repetition" >&2
+        tail -n 40 "$output_dir/loader.txt" >&2 || true
+        exit 1
+    fi
+    echo "=== scx-burst-drop-$repetition ===" >>"$output_dir/loader.txt"
+    run_case "scx-burst-drop-$repetition" 0 off \
+        --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1 \
+        --camera-burst-count "$burst_count" --camera-burst-at-ms "$burst_at_ms"
+
+    burst_keep_file="$output_dir/scx-burst-keep-$repetition.txt"
+    burst_drop_file="$output_dir/scx-burst-drop-$repetition.txt"
+    keep_burst_processed=$(read_metric state_est burst_processed "$burst_keep_file")
+    drop_burst_processed=$(read_metric state_est burst_processed "$burst_drop_file")
+    keep_burst_latest_seq=$(read_metric state_est burst_latest_seq "$burst_keep_file")
+    drop_burst_latest_seq=$(read_metric state_est burst_latest_seq "$burst_drop_file")
+    keep_burst_latest_age=$(read_metric state_est burst_latest_age_us "$burst_keep_file")
+    drop_burst_latest_age=$(read_metric state_est burst_latest_age_us "$burst_drop_file")
+    burst_dropped=$(read_metric vision_fe dropped_stale "$burst_drop_file")
+
+    for metric in "$keep_burst_processed" "$drop_burst_processed" \
+                  "$keep_burst_latest_seq" "$drop_burst_latest_seq" \
+                  "$keep_burst_latest_age" "$drop_burst_latest_age" \
+                  "$burst_dropped"; do
+        if [[ ! $metric =~ ^[0-9]+$ ]]; then
+            echo "error: could not parse sensor-burst metrics" >&2
+            exit 1
+        fi
+    done
+
+    if (( burst_dropped == 0 || drop_burst_processed >= keep_burst_processed )); then
+        echo "error: burst stale dropping did not shed obsolete camera frames" >&2
+        exit 1
+    fi
+
+    if (( drop_burst_latest_seq != keep_burst_latest_seq )); then
+        echo "error: burst stale dropping failed to preserve the newest camera frame" >&2
+        exit 1
+    fi
+
+    if (( drop_burst_latest_age >= keep_burst_latest_age )); then
+        echo "error: burst stale dropping did not reduce newest-frame recovery age" >&2
         exit 1
     fi
 done

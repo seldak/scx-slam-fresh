@@ -93,6 +93,9 @@ This pins (at least) the following maps:
 - `--hog N` adds CPU contention
 - `--drop-stale 1` rejects expired dequeued jobs and lets producers evict
   expired queued backlog before enqueueing new work
+- `--camera-burst-count N` delays `N` camera frames and releases them together
+  with their original timestamps
+- `--camera-burst-at-ms N` selects the approximate burst delivery offset
 - `--duration S` controls run length
 
 
@@ -120,13 +123,15 @@ sudo ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh
 ---
 
 ## Evaluation (single-core overload)
-The harness runs two matched single-core workloads. The deadline-isolation pair
+The harness runs three matched single-core workloads. The deadline-isolation pair
 uses LiDAR heavy (300k pts @10Hz), camera (30Hz), IMU (200Hz), and two CPU hogs
 to compare CFS with scx_slam_fresh. The stale-shedding pair uses the same sensor
 load under scx_slam_fresh with zero hogs, comparing stale retention against
 `--drop-stale 1`. Zero hogs leaves enough back-end progress for stale shedding
-to be observable. Results depend on the kernel, hardware, and Git revision; the
-benchmark script records all three.
+to be observable. The burst-recovery pair delays 12 camera frames, then verifies
+that stale dropping preserves the newest frame while reducing obsolete work and
+newest-frame completion age. Results depend on the kernel, hardware, and Git
+revision; the benchmark script records all three.
 
 Commands:
 ```bash
@@ -134,6 +139,8 @@ taskset -c 0 ./build/slam_pipeline_demo --no-hints --lidar heavy --hog 2 --durat
 sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15 --ext-policy 7
 sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 0 --duration 15 --ext-policy 7
 sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 0 --duration 15 --ext-policy 7 --drop-stale 1
+sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar off --hog 0 --duration 15 --ext-policy 7 --camera-burst-count 12 --camera-burst-at-ms 3000
+sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar off --hog 0 --duration 15 --ext-policy 7 --camera-burst-count 12 --camera-burst-at-ms 3000 --drop-stale 1
 ```
 
 Run the complete matrix, capture its environment, and save each run's output with:
@@ -146,6 +153,7 @@ The scheduler now has a dedicated `DSQ_IMU` lane. Results from before that chang
 - `lidar_reg` and `mapping_be` consumer-dropped and queue-evicted stale counts
 - pending backlogs in the matched stale-keeping and stale-dropping runs
 - work completed by stale back-end stages with and without `--drop-stale 1`
+- burst frames processed, newest burst sequence, and newest-frame completion age
 
 Known limitation: the dedicated IMU lane has strict dispatch priority and can starve lower lanes if IMU utilization is misconfigured. The overload matrix is intended to quantify that tradeoff.
 

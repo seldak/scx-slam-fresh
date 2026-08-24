@@ -28,6 +28,8 @@
  *   --lidar <off|light|mid|heavy>  enable LiDAR stream with point counts
  *   --drop-stale <0|1>   discard expired queued/dequeued jobs (default 0)
  *   --hog <N>            number of hog threads (default 1)
+ *   --camera-burst-count <N>  delay N camera frames, then release together
+ *   --camera-burst-at-ms <N>  burst delivery offset (default 3000)
  *
  * Recommended runs:
  *   # baseline (CFS):
@@ -114,6 +116,7 @@ struct WorkItem {
     uint64_t ts_ns;     /* sensor timestamp (release time) */
     uint32_t kind;      /* 1=cam, 2=lidar */
     uint32_t points;    /* lidar only */
+    uint32_t burst_id;  /* nonzero when delayed for a synthetic sensor burst */
 };
 
 struct StageCfg {
@@ -133,6 +136,9 @@ struct StageStats {
     uint64_t stale_seen{0};
     uint64_t dropped_stale{0};
     uint64_t queue_evicted_stale{0};
+    uint64_t burst_processed{0};
+    uint64_t burst_latest_seq{0};
+    uint64_t burst_latest_age_ns{0};
 };
 
 static inline uint64_t deadline_abs(const WorkItem &w, const StageCfg &cfg)
@@ -323,6 +329,12 @@ static void stage_worker(BlockingQueue<WorkItem> *in,
         if (dl && t1 > dl)
             stats->late++;
 
+        if (w.burst_id) {
+            stats->burst_processed++;
+            stats->burst_latest_seq = w.seq;
+            stats->burst_latest_age_ns = t1 > w.ts_ns ? t1 - w.ts_ns : 0;
+        }
+
         if (out)
             out->push(w);
     }
@@ -423,7 +435,7 @@ static uint64_t dropped_stale_total(const StageStats &stats)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N]\n",
+        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N] [--camera-burst-count N] [--camera-burst-at-ms N]\n",
         argv0);
 }
 
@@ -454,6 +466,8 @@ int main(int argc, char **argv)
     std::string lidar_mode = "off";
     bool drop_stale = false;
     int hog_n = 1;
+    int camera_burst_count = 0;
+    int camera_burst_at_ms = 3000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
@@ -470,6 +484,10 @@ int main(int argc, char **argv)
             drop_stale = atoi(argv[++i]) != 0;
         } else if (!strcmp(argv[i], "--hog") && i + 1 < argc) {
             hog_n = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--camera-burst-count") && i + 1 < argc) {
+            camera_burst_count = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--camera-burst-at-ms") && i + 1 < argc) {
+            camera_burst_at_ms = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -482,6 +500,26 @@ int main(int argc, char **argv)
     if ((!pin_dir && !no_hints) || (pin_dir && no_hints) ||
         (no_hints && ext_policy >= 0)) {
         usage(argv[0]);
+        return 1;
+    }
+
+    constexpr uint64_t camera_period_ns = 33'000'000ULL;
+    if (duration_s <= 0 || hog_n < 0 || camera_burst_count < 0 ||
+        camera_burst_at_ms < 0) {
+        fprintf(stderr, "error: duration, hog count, and camera burst values must be non-negative (duration must be positive)\n");
+        return 1;
+    }
+
+    const uint64_t camera_burst_delivery_index =
+        ((uint64_t)camera_burst_at_ms * 1'000'000ULL + camera_period_ns - 1) /
+        camera_period_ns;
+    const uint64_t camera_frame_count =
+        ((uint64_t)duration_s * 1'000'000'000ULL + camera_period_ns - 1) /
+        camera_period_ns;
+    if (camera_burst_count > 0 &&
+        (camera_burst_delivery_index >= camera_frame_count ||
+         (uint64_t)camera_burst_count > camera_burst_delivery_index + 1)) {
+        fprintf(stderr, "error: camera burst must fit between workload start and end\n");
         return 1;
     }
 
@@ -619,18 +657,42 @@ int main(int argc, char **argv)
      */
     std::thread cam_gen([&]{
         uint64_t seq = 1;
-        const uint64_t period_ns = 33'000'000ULL;
+        const uint64_t period_ns = camera_period_ns;
         const uint64_t start = workload_start;
         const uint64_t end = start + (uint64_t)duration_s * 1000000000ULL;
-        for (uint64_t release = start; release < end; release += period_ns) {
+        const uint64_t burst_first_index = camera_burst_count > 0
+            ? camera_burst_delivery_index + 1 - (uint64_t)camera_burst_count
+            : 0;
+        std::vector<WorkItem> held_burst;
+        held_burst.reserve((size_t)camera_burst_count);
+
+        uint64_t frame_index = 0;
+        for (uint64_t release = start; release < end;
+             release += period_ns, frame_index++) {
             sleep_until_ns(release);
             WorkItem w{};
             w.seq = seq++;
             w.ts_ns = release;
             w.kind = 1;
             w.points = 0;
-            q_cam.push(w);
-            cam_generated++;
+            const bool in_burst = camera_burst_count > 0 &&
+                frame_index >= burst_first_index &&
+                frame_index <= camera_burst_delivery_index;
+
+            if (in_burst) {
+                w.burst_id = 1;
+                held_burst.push_back(w);
+                if (frame_index == camera_burst_delivery_index) {
+                    for (const WorkItem &held : held_burst) {
+                        q_cam.push(held);
+                        cam_generated++;
+                    }
+                    held_burst.clear();
+                }
+            } else {
+                q_cam.push(w);
+                cam_generated++;
+            }
         }
     });
 
@@ -691,12 +753,23 @@ int main(int argc, char **argv)
            (unsigned long long)st_imu.processed,
            (unsigned long long)cam_generated,
            (unsigned long long)lidar_generated);
+    printf("camera_burst: injected=%d first_seq=%llu latest_seq=%llu delivery_ms=%llu\n",
+           camera_burst_count,
+           (unsigned long long)(camera_burst_count > 0
+               ? camera_burst_delivery_index + 2 - (uint64_t)camera_burst_count
+               : 0),
+           (unsigned long long)(camera_burst_count > 0
+               ? camera_burst_delivery_index + 1
+               : 0),
+           (unsigned long long)(camera_burst_count > 0
+               ? camera_burst_delivery_index * camera_period_ns / 1'000'000ULL
+               : 0));
     printf("imu_prop:   processed=%llu late=%llu (%.1f%%)\n",
            (unsigned long long)st_imu.processed,
            (unsigned long long)st_imu.late,
            pct(st_imu.late, st_imu.processed));
 
-    printf("vision_fe:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",
+    printf("vision_fe:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu burst_processed=%llu burst_latest_seq=%llu burst_latest_age_us=%llu\n",
            (unsigned long long)(st_vis.processed + st_vis.dropped_stale),
            (unsigned long long)st_vis.processed,
            (unsigned long long)st_vis.late,
@@ -705,9 +778,12 @@ int main(int argc, char **argv)
            (unsigned long long)dropped_stale_total(st_vis),
            (unsigned long long)st_vis.dropped_stale,
            (unsigned long long)st_vis.queue_evicted_stale,
-           pending_vis);
+           pending_vis,
+           (unsigned long long)st_vis.burst_processed,
+           (unsigned long long)st_vis.burst_latest_seq,
+           (unsigned long long)(st_vis.burst_latest_age_ns / 1000ULL));
 
-    printf("state_est:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",
+    printf("state_est:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu burst_processed=%llu burst_latest_seq=%llu burst_latest_age_us=%llu\n",
            (unsigned long long)(st_est.processed + st_est.dropped_stale),
            (unsigned long long)st_est.processed,
            (unsigned long long)st_est.late,
@@ -716,7 +792,10 @@ int main(int argc, char **argv)
            (unsigned long long)dropped_stale_total(st_est),
            (unsigned long long)st_est.dropped_stale,
            (unsigned long long)st_est.queue_evicted_stale,
-           pending_est);
+           pending_est,
+           (unsigned long long)st_est.burst_processed,
+           (unsigned long long)st_est.burst_latest_seq,
+           (unsigned long long)(st_est.burst_latest_age_ns / 1000ULL));
 
     if (lidar_points) {
         printf("lidar_pre:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u\n",
@@ -761,6 +840,7 @@ int main(int argc, char **argv)
     if (pin_dir)
         printf("  sudo taskset -c 0 ./build/slam_pipeline_demo --pin %s --lidar heavy --hog 2 --duration %d --ext-policy 7\n", pin_dir, duration_s);
     printf("Test stale shedding separately with --hog 0, with and without --drop-stale 1.\n");
+    printf("Test burst recovery with --camera-burst-count 12 --camera-burst-at-ms 3000.\n");
 
     slamqos_close(&pub);
     return 0;
