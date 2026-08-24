@@ -85,10 +85,11 @@ This pins (at least) the following maps:
 
 ### 2) Run the demo pipeline
 
-**Note:** The demo uses *producer-driven hinting* (the thread that pushes a work item publishes the consumer's hint before waking it), so sched_ext sees correct metadata at wake-up.
+**Note:** The demo uses *wake-safe hinting*. A producer publishes the head item's hint only when waking a sleeping consumer; after `pop`, the consumer republishes the exact item it is processing. This gives sched_ext correct wake-up metadata without overwriting an in-flight job's hint when a backlog forms.
 
 ### Demo knobs
 - `--lidar off|light|mid|heavy` enables a LiDAR stream (10Hz) with bursty compute
+- `heavy` is intentionally unsustainable and creates a LiDAR-registration backlog
 - `--hog N` adds CPU contention
 - `--drop-stale 1` skips compute for stale jobs (models backlog shedding)
 - `--duration S` controls run length
@@ -117,20 +118,27 @@ sudo ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh
 
 ---
 
-## Results (single-core overload)
-Kernel: 6.14, sched_ext enabled. Workload: LiDAR heavy (300k pts @10Hz) + camera (30Hz) + IMU (200Hz) + 2 CPU hog threads.
-Pinned to one core to force contention.
+## Evaluation (single-core overload)
+Reference workload: LiDAR heavy (300k pts @10Hz) + camera (30Hz) + IMU (200Hz) + 2 CPU hog threads, pinned to one core to force contention. Results depend on the kernel, hardware, and Git revision; the benchmark script records all three.
 
 Commands:
 ```bash
-sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15
+taskset -c 0 ./build/slam_pipeline_demo --no-hints --lidar heavy --hog 2 --duration 15
 sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15 --ext-policy 7
 sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15 --ext-policy 7 --drop-stale 1
 ```
 
-Summary: estimator deadline misses drop from ~30% (baseline) to ~2% with scx_slam_fresh. Dropping stale work reduces wasted backend compute.
+Run the complete matrix, capture its environment, and save each run's output with:
+```bash
+sudo scripts/run_single_core_eval.sh
+```
 
-Known limitation: IMU misses increase under this extreme single-core stress; next step is a dedicated IMU dispatch lane (DSQ_IMU).
+The scheduler now has a dedicated `DSQ_IMU` lane. Results from before that change are not quoted here because they are not comparable to the current policy. Re-run the matrix above before reporting miss-rate improvements. Compare:
+- `imu_prop`, `vision_fe`, and `state_est` deadline-miss percentages
+- `lidar_reg` and `mapping_be` stale/dropped counts
+- work completed by stale back-end stages with and without `--drop-stale 1`
+
+Known limitation: the dedicated IMU lane has strict dispatch priority and can starve lower lanes if IMU utilization is misconfigured. The overload matrix is intended to quantify that tradeoff.
 
 ---
 
@@ -139,7 +147,6 @@ Start here:
 - `docs/DESIGN.md`
 - `docs/DESIGN_SCHED_ALGO.md`
 - `docs/DESIGN_HINTS_API.md`
-- `docs/DESIGN_OBSERVABILITY.md`
 - `docs/DESIGN_EVALUATION.md`
 
 ---
