@@ -457,6 +457,14 @@ static double lidar_reg_k_for_mode(const std::string &mode)
     return 0.0; // off/unknown
 }
 
+static uint64_t lidar_reg_work_us(uint32_t points, double reg_k)
+{
+    double n = (double)points;
+    double lg = n > 1.0 ? std::log(n) / std::log(2.0) : 1.0;
+    double us = 8000.0 + reg_k * n * lg;
+    return us > 0.0 ? (uint64_t)us : 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *pin_dir = nullptr;
@@ -613,11 +621,7 @@ int main(int argc, char **argv)
         t_lreg = std::thread(stage_worker, &q_lidar1, &q_map, cfg_lreg, ext_policy, drop_stale, &running, &st_lreg,
                              [lidar_k](const WorkItem &w) -> uint64_t {
                                  /* registration ~ O(N log N): 8ms + 0.01us * N * log2(N) */
-                                 double N = (double)w.points;
-                                 double lg = (N > 1.0) ? (std::log(N) / std::log(2.0)) : 1.0;
-				 double us = 8000.0 + lidar_k * N * lg;
-                                 if (us < 0.0) us = 0.0;
-                                 return (uint64_t)us;
+                                 return lidar_reg_work_us(w.points, lidar_k);
                              },
                              &pid_lreg);
     }
@@ -810,7 +814,7 @@ int main(int argc, char **argv)
                pending_lpre,
                lidar_points);
 
-        printf("lidar_reg:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u reg_k=%.3f\n",
+        printf("lidar_reg:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u reg_k=%.3f reg_job_us=%llu\n",
                (unsigned long long)(st_lreg.processed + st_lreg.dropped_stale),
                (unsigned long long)st_lreg.processed,
                (unsigned long long)st_lreg.late,
@@ -821,7 +825,8 @@ int main(int argc, char **argv)
                (unsigned long long)st_lreg.queue_evicted_stale,
                pending_lreg,
                lidar_points,
-               lidar_k);
+               lidar_k,
+               (unsigned long long)lidar_reg_work_us(lidar_points, lidar_k));
     }
 
     printf("mapping_be: dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",

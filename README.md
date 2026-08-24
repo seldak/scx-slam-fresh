@@ -123,15 +123,17 @@ sudo ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh
 ---
 
 ## Evaluation (single-core overload)
-The harness runs three matched single-core workloads. The deadline-isolation pair
-uses LiDAR heavy (300k pts @10Hz), camera (30Hz), IMU (200Hz), and two CPU hogs
-to compare CFS with scx_slam_fresh. The stale-shedding pair uses the same sensor
-load under scx_slam_fresh with zero hogs, comparing stale retention against
-`--drop-stale 1`. Zero hogs leaves enough back-end progress for stale shedding
-to be observable. The burst-recovery pair delays 12 camera frames, then verifies
-that stale dropping preserves the newest frame while reducing obsolete work and
-newest-frame completion age. Results depend on the kernel, hardware, and Git
-revision; the benchmark script records all three.
+The harness first sweeps LiDAR light, mid, and heavy under identical single-core
+CFS conditions and asserts sustainable, borderline, and overloaded registration
+regimes. It then runs three matched single-core workloads. The deadline-isolation
+pair uses LiDAR heavy (300k pts @10Hz), camera (30Hz), IMU (200Hz), and two CPU
+hogs to compare CFS with scx_slam_fresh. The stale-shedding pair uses the same
+sensor load under scx_slam_fresh with zero hogs, comparing stale retention
+against `--drop-stale 1`. Zero hogs leaves enough back-end progress for stale
+shedding to be observable. The burst-recovery pair delays 12 camera frames, then
+verifies that stale dropping preserves the newest frame while reducing obsolete
+work and newest-frame completion age. Results depend on the kernel, hardware,
+and Git revision; the benchmark script records all three.
 
 Commands:
 ```bash

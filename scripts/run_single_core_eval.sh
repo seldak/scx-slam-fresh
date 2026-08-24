@@ -9,6 +9,7 @@ loader_bin="$repo_dir/build/scx_slam_fresh_user"
 
 cpu=${CPU:-0}
 duration=${DURATION:-15}
+sweep_duration=${SWEEP_DURATION:-8}
 hog_threads=${HOG_THREADS:-2}
 stale_hog_threads=${STALE_HOG_THREADS:-0}
 burst_count=${BURST_COUNT:-12}
@@ -24,7 +25,7 @@ usage() {
 Usage: sudo scripts/run_single_core_eval.sh
 
 Optional environment variables:
-  CPU=0 DURATION=15 HOG_THREADS=2 STALE_HOG_THREADS=0 BURST_COUNT=12
+  CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 STALE_HOG_THREADS=0 BURST_COUNT=12
   BURST_AT_MS=3000 EXT_POLICY=7 REPETITIONS=1
   OUTPUT_DIR=/path/to/results
 EOF
@@ -65,15 +66,16 @@ run_case() {
     local name=$1
     local case_hogs=$2
     local lidar_mode=$3
-    shift 3
+    local case_duration=$4
+    shift 4
 
     echo
     echo "=== $name ==="
-    echo "Running for about ${duration}s; results are printed when the workload finishes."
+    echo "Running for about ${case_duration}s; results are printed when the workload finishes."
     taskset -c "$cpu" "$demo_bin" \
         --lidar "$lidar_mode" \
         --hog "$case_hogs" \
-        --duration "$duration" \
+        --duration "$case_duration" \
         "$@" 2>&1 | tee "$output_dir/$name.txt"
 }
 
@@ -93,6 +95,64 @@ read_metric() {
             }
         }
     ' "$result_file"
+}
+
+check_e0_sweep() {
+    local repetition=$1
+    local mode result_file generated processed pending stale reg_job_us
+    local light_reg_job_us mid_reg_job_us heavy_reg_job_us
+
+    for mode in light mid heavy; do
+        result_file="$output_dir/cfs-sweep-$mode-$repetition.txt"
+        generated=$(read_metric generated lidar "$result_file")
+        processed=$(read_metric lidar_reg processed "$result_file")
+        pending=$(read_metric lidar_reg pending "$result_file")
+        stale=$(read_metric lidar_reg stale_seen "$result_file")
+        reg_job_us=$(read_metric lidar_reg reg_job_us "$result_file")
+
+        for metric in "$generated" "$processed" "$pending" "$stale" "$reg_job_us"; do
+            if [[ ! $metric =~ ^[0-9]+$ ]]; then
+                echo "error: could not parse E0 $mode sweep metrics" >&2
+                return 1
+            fi
+        done
+
+        case $mode in
+            light)
+                light_reg_job_us=$reg_job_us
+                ;;
+            mid)
+                mid_reg_job_us=$reg_job_us
+                ;;
+            heavy)
+                heavy_reg_job_us=$reg_job_us
+                ;;
+        esac
+
+        if [[ $mode != heavy ]] &&
+           (( processed != generated || pending != 0 || stale != 0 )); then
+            echo "error: E0 $mode mode did not remain sustainable" >&2
+            return 1
+        fi
+
+        if [[ $mode == heavy ]] &&
+           (( processed >= generated || pending == 0 || stale == 0 )); then
+            echo "error: E0 heavy mode did not create an unsustainable stale backlog" >&2
+            return 1
+        fi
+    done
+
+    if (( light_reg_job_us >= mid_reg_job_us ||
+          mid_reg_job_us >= heavy_reg_job_us )); then
+        echo "error: E0 LiDAR registration costs are not strictly increasing" >&2
+        return 1
+    fi
+
+    if (( mid_reg_job_us < 50000 || mid_reg_job_us >= 100000 ||
+          heavy_reg_job_us <= 100000 )); then
+        echo "error: E0 mid/heavy registration costs no longer model borderline/overload regimes" >&2
+        return 1
+    fi
 }
 
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
@@ -142,7 +202,9 @@ fi
 mkdir -p -- "$output_dir"
 trap cleanup EXIT INT TERM
 
-echo "Running $((repetitions * 6)) cases (~$((repetitions * 6 * duration)) seconds of workload time)."
+case_count=$((repetitions * 9))
+workload_seconds=$((repetitions * (6 * duration + 3 * sweep_duration)))
+echo "Running $case_count cases (~$workload_seconds seconds of workload time)."
 echo "Results directory: $output_dir"
 
 cat >"$output_dir/environment.txt" <<EOF
@@ -150,6 +212,7 @@ date=$(date --iso-8601=seconds)
 kernel=$(uname -r)
 cpu=$cpu
 duration=$duration
+sweep_duration=$sweep_duration
 hog_threads=$hog_threads
 stale_hog_threads=$stale_hog_threads
 burst_count=$burst_count
@@ -164,7 +227,12 @@ bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{pri
 EOF
 
 for repetition in $(seq 1 "$repetitions"); do
-    run_case "cfs-isolation-$repetition" "$hog_threads" heavy --no-hints
+    for mode in light mid heavy; do
+        run_case "cfs-sweep-$mode-$repetition" 0 "$mode" "$sweep_duration" --no-hints
+    done
+    check_e0_sweep "$repetition"
+
+    run_case "cfs-isolation-$repetition" "$hog_threads" heavy "$duration" --no-hints
 done
 
 mkdir -p -- "$pin_dir"
@@ -179,7 +247,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-isolation-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-isolation-$repetition" "$hog_threads" heavy --pin "$pin_dir" --ext-policy "$ext_policy"
+    run_case "scx-isolation-$repetition" "$hog_threads" heavy "$duration" --pin "$pin_dir" --ext-policy "$ext_policy"
 
     if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
         echo "error: sched_ext stopped before stale-keeping run $repetition" >&2
@@ -187,7 +255,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-stale-keep-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-stale-keep-$repetition" "$stale_hog_threads" heavy --pin "$pin_dir" --ext-policy "$ext_policy"
+    run_case "scx-stale-keep-$repetition" "$stale_hog_threads" heavy "$duration" --pin "$pin_dir" --ext-policy "$ext_policy"
 
     if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
         echo "error: sched_ext stopped before stale-dropping run $repetition" >&2
@@ -195,7 +263,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-stale-drop-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-stale-drop-$repetition" "$stale_hog_threads" heavy --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1
+    run_case "scx-stale-drop-$repetition" "$stale_hog_threads" heavy "$duration" --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1
 
     keep_file="$output_dir/scx-stale-keep-$repetition.txt"
     drop_file="$output_dir/scx-stale-drop-$repetition.txt"
@@ -226,7 +294,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-burst-keep-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-burst-keep-$repetition" 0 off \
+    run_case "scx-burst-keep-$repetition" 0 off "$duration" \
         --pin "$pin_dir" --ext-policy "$ext_policy" \
         --camera-burst-count "$burst_count" --camera-burst-at-ms "$burst_at_ms"
 
@@ -236,7 +304,7 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
     echo "=== scx-burst-drop-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-burst-drop-$repetition" 0 off \
+    run_case "scx-burst-drop-$repetition" 0 off "$duration" \
         --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1 \
         --camera-burst-count "$burst_count" --camera-burst-at-ms "$burst_at_ms"
 

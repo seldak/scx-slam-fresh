@@ -38,12 +38,18 @@ Sensor generators share one absolute start epoch, use absolute release times, an
 
 ## Experiments
 
-### E0: LiDAR mode sweep — partially implemented
+### ~~E0: LiDAR mode sweep~~ — completed
 
-- The `light`, `mid`, and `heavy` workload modes are implemented.
-- Hold CPU affinity and hog count constant.
-- Confirm that light remains sustainable, mid approaches saturation, and heavy produces stale LiDAR-registration work.
-- Pending: automate the three-mode sweep and assert the expected load regimes.
+- Run `light`, `mid`, and `heavy` under CFS with identical CPU affinity, hog
+  count, and duration.
+- Require light and mid to drain every registration job without stale work or
+  pending backlog.
+- Require strictly increasing registration costs, with mid consuming 50-100ms
+  of each 100ms LiDAR period and heavy exceeding the period.
+- Require heavy to process fewer jobs than generated and accumulate both stale
+  and pending registration work.
+
+The root benchmark runs and enforces this sweep before attaching sched_ext.
 
 ### ~~E1: Heavy LiDAR overload~~ — completed
 
@@ -73,7 +79,8 @@ The script refuses to replace an active sched_ext scheduler, uses a unique BPF p
 
 Example with explicit controls:
 ```bash
-sudo env CPU=0 DURATION=15 HOG_THREADS=2 STALE_HOG_THREADS=0 REPETITIONS=3 \
+sudo env CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 \
+  STALE_HOG_THREADS=0 REPETITIONS=3 \
   scripts/run_single_core_eval.sh
 ```
 
@@ -93,13 +100,16 @@ The root benchmark enforces all three conditions. Use `BURST_COUNT` and
 One root run on 2026-08-24 using kernel `7.0.0-30-generic`, CPU 0, 15-second
 cases, and one repetition produced:
 
-- E1 isolation: state-estimator deadline misses were 49.0% under CFS and 0.0%
+- E0 sweep: light and mid completed 80/80 registration jobs with no stale or
+  pending work; heavy completed 29/80, observed 27 stale jobs, and left 51
+  pending. Nominal registration costs were 15804us, 59583us, and 280919us.
+- E1 isolation: state-estimator deadline misses were 43.7% under CFS and 0.0%
   under scx_slam_fresh.
 - E1 stale shedding: LiDAR-registration pending backlog fell from 97 to 3;
-  63 expired queued jobs were evicted.
+  64 expired queued jobs were evicted.
 - E2 burst recovery: both policies preserved newest burst frame 92. Stale
   dropping processed 2 rather than 12 burst frames and reduced its
-  state-estimate completion age from 109210us to 26111us.
+  state-estimate completion age from 112208us to 25850us.
 
 These figures are a development verification snapshot, not a multi-run
 performance claim. Reproduce them with the benchmark command above; the script
