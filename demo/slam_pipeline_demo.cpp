@@ -7,11 +7,11 @@
  *   If a consumer thread only publishes its "job hint" *after* it runs, the wake-up
  *   is already misclassified, and the demo measures the wrong thing.
  *
- * Therefore this demo uses **producer-driven hinting**:
+ * Therefore this demo uses **wake-safe hinting**:
  *   - each worker thread registers its pid_tgid key (tgid<<32 | tid)
  *   - each queue knows its single consumer's pid_tgid + StageCfg
- *   - when a producer pushes a WorkItem, it publishes the *consumer's* hint first,
- *     then wakes the consumer.
+ *   - a producer publishes the head item's hint before waking a sleeping consumer
+ *   - after pop, the consumer republishes the exact item it is processing
  *
  * Pipeline (threads):
  *   IMU propagate (FE, 200Hz)              -> periodic "timer" work
@@ -22,6 +22,7 @@
  *
  * Options:
  *   --pin <dir>          pinned maps dir from scx_slam_fresh_user
+ *   --no-hints           CFS control run without opening BPF maps
  *   --ext-policy <N>     numeric SCHED_EXT policy (7 on Ubuntu 6.14 headers)
  *   --duration <sec>     demo duration (default 10)
  *   --lidar <off|light|mid|heavy>  enable LiDAR stream with point counts
@@ -37,6 +38,7 @@
  */
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -68,6 +70,15 @@ static uint64_t now_ns()
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static void sleep_until_ns(uint64_t target_ns)
+{
+    struct timespec ts;
+    ts.tv_sec = (time_t)(target_ns / 1000000000ull);
+    ts.tv_nsec = (long)(target_ns % 1000000000ull);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+    }
+}
+
 static void busy_work_us(uint64_t us)
 {
     uint64_t start = now_ns();
@@ -93,7 +104,7 @@ static int set_sched_ext_policy(int policy)
     long rc = syscall(SYS_sched_setattr, 0 /*self*/, &attr, 0);
     if (rc) {
         perror("sched_setattr(SCHED_EXT)");
-        return -1;
+        _exit(EXIT_FAILURE); /* Never report a mislabeled partial/CFS run. */
     }
     return 0;
 }
@@ -153,29 +164,17 @@ public:
 
     void push(const T &v)
     {
-        /* Producer-driven hinting:
-         * publish the *consumer* hint first, then wake it.
+        std::unique_lock<std::mutex> lk(mu_);
+
+        /* Only publish from the producer when it is about to wake a sleeping
+         * consumer. Publishing every queued item would overwrite the hint for
+         * an older item that the consumer is still processing.
          */
-        if (ht_.pub && ht_.pub->map_fd >= 0 && ht_.pid_tgid && ht_.cfg) {
-            uint64_t key = ht_.pid_tgid->load(std::memory_order_acquire);
-            if (key) {
-                const StageCfg &c = *ht_.cfg;
-                uint64_t dl = (c.deadline_rel_ns) ? (v.ts_ns + c.deadline_rel_ns) : 0;
-                (void)slamqos_publish_job_for(ht_.pub,
-                                             key,
-                                             c.stage_id,
-                                             c.class_id,
-                                             v.seq,
-                                             v.ts_ns,
-                                             dl,
-                                             c.stale_ns,
-                                             c.budget_ns,
-                                             c.slice_ns,
-                                             c.weight);
-            }
+        if (waiting_) {
+            publish_hint(v);
+            waiting_ = false;
         }
 
-        std::unique_lock<std::mutex> lk(mu_);
         q_.push_back(v);
         cv_.notify_one();
     }
@@ -183,11 +182,22 @@ public:
     bool pop(T &out)
     {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&]{ return stop_ || !q_.empty(); });
+        while (!stop_ && q_.empty()) {
+            waiting_ = true;
+            cv_.wait(lk);
+            waiting_ = false;
+        }
+
         if (stop_)
             return false;
+
         out = q_.front();
         q_.pop_front();
+
+        /* Synchronize the map with the exact FIFO item now being processed.
+         * This complements producer publication at the wake-up boundary.
+         */
+        publish_hint(out);
         return true;
     }
 
@@ -199,10 +209,35 @@ public:
     }
 
 private:
+    void publish_hint(const T &v)
+    {
+        if (!ht_.pub || ht_.pub->map_fd < 0 || !ht_.pid_tgid || !ht_.cfg)
+            return;
+
+        uint64_t key = ht_.pid_tgid->load(std::memory_order_acquire);
+        if (!key)
+            return;
+
+        const StageCfg &c = *ht_.cfg;
+        uint64_t dl = c.deadline_rel_ns ? v.ts_ns + c.deadline_rel_ns : 0;
+        (void)slamqos_publish_job_for(ht_.pub,
+                                     key,
+                                     c.stage_id,
+                                     c.class_id,
+                                     v.seq,
+                                     v.ts_ns,
+                                     dl,
+                                     c.stale_ns,
+                                     c.budget_ns,
+                                     c.slice_ns,
+                                     c.weight);
+    }
+
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<T> q_;
     bool stop_{false};
+    bool waiting_{false};
     HintTarget ht_{};
 };
 
@@ -254,9 +289,10 @@ static void stage_worker(BlockingQueue<WorkItem> *in,
 static void imu_thread(const StageCfg &cfg,
                        struct slamqos *pub,
                        int ext_policy,
-                       std::atomic<bool> *running,
                        StageStats *stats,
                        double imu_hz,
+                       int duration_s,
+                       std::atomic<uint64_t> *workload_start_ns,
                        std::atomic<uint64_t> *pid_out)
 {
     (void)set_sched_ext_policy(ext_policy);
@@ -266,10 +302,14 @@ static void imu_thread(const StageCfg &cfg,
         pid_out->store(self, std::memory_order_release);
 
     const uint64_t period_ns = (uint64_t)(1e9 / imu_hz);
-    uint64_t next = now_ns();
+    uint64_t next = 0;
+    while (!(next = workload_start_ns->load(std::memory_order_acquire)))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    const uint64_t end_ns = next + (uint64_t)duration_s * 1000000000ULL;
     uint64_t seq = 1;
 
-    while (running->load()) {
+    while (next < end_ns) {
         /* Publish the *next* job hint before sleeping, so wake-up enqueue sees it. */
         if (pub && pub->map_fd >= 0) {
             uint64_t release = next;
@@ -288,10 +328,7 @@ static void imu_thread(const StageCfg &cfg,
         }
 
         /* Sleep until the next tick (absolute). */
-        struct timespec ts;
-        ts.tv_sec = (time_t)(next / 1000000000ull);
-        ts.tv_nsec = (long)(next % 1000000000ull);
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+        sleep_until_ns(next);
 
         uint64_t start = now_ns();
         uint64_t dl_abs = (cfg.deadline_rel_ns) ? (next + cfg.deadline_rel_ns) : 0;
@@ -306,9 +343,6 @@ static void imu_thread(const StageCfg &cfg,
         seq++;
         next += period_ns;
 
-        /* If we slipped a lot, resync. */
-        if (end > next + period_ns)
-            next = end + period_ns;
     }
 }
 
@@ -337,7 +371,7 @@ static double pct(uint64_t a, uint64_t b)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s --pin <dir> [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N]\n",
+        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N]\n",
         argv0);
 }
 
@@ -362,6 +396,7 @@ static double lidar_reg_k_for_mode(const std::string &mode)
 int main(int argc, char **argv)
 {
     const char *pin_dir = nullptr;
+    bool no_hints = false;
     int ext_policy = -1;
     int duration_s = 10;
     std::string lidar_mode = "off";
@@ -371,6 +406,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
             pin_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--no-hints")) {
+            no_hints = true;
         } else if (!strcmp(argv[i], "--ext-policy") && i + 1 < argc) {
             ext_policy = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--duration") && i + 1 < argc) {
@@ -390,7 +427,8 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!pin_dir) {
+    if ((!pin_dir && !no_hints) || (pin_dir && no_hints) ||
+        (no_hints && ext_policy >= 0)) {
         usage(argv[0]);
         return 1;
     }
@@ -398,9 +436,9 @@ int main(int argc, char **argv)
     /* Shared hint publisher used by producers (threads share the fd safely). */
     struct slamqos pub;
     pub.map_fd = -1;
-    if (slamqos_open(&pub, pin_dir) != 0) {
-        fprintf(stderr, "warning: failed to open slamqos maps; running without hints\n");
-        pub.map_fd = -1;
+    if (!no_hints && slamqos_open(&pub, pin_dir) != 0) {
+        fprintf(stderr, "error: hints are required when --pin is used\n");
+        return 1;
     }
 
     /* Queues */
@@ -431,11 +469,12 @@ int main(int argc, char **argv)
 
     StageStats st_imu, st_vis, st_est, st_lpre, st_lreg, st_map;
     std::atomic<bool> running{true};
+    std::atomic<uint64_t> workload_start_ns{0};
 
     /* Consumer pid_tgid registrations */
     std::atomic<uint64_t> pid_imu{0}, pid_vis{0}, pid_est{0}, pid_lpre{0}, pid_lreg{0}, pid_map{0};
 
-    /* Wire producer-driven hint targets: each queue publishes hints for its consumer. */
+    /* Wire wake-safe hint targets for producer wake-up and consumer pop. */
     q_cam.set_hint_target({ &pub, &pid_vis, &cfg_vis });
     q_vis.set_hint_target({ &pub, &pid_est, &cfg_est });
     q_lidar0.set_hint_target({ &pub, &pid_lpre, &cfg_lpre });
@@ -443,7 +482,8 @@ int main(int argc, char **argv)
     q_map.set_hint_target({ &pub, &pid_map, &cfg_map });
 
     /* Start workers (consumers). */
-    std::thread t_imu(imu_thread, cfg_imu, &pub, ext_policy, &running, &st_imu, 200.0, &pid_imu);
+    std::thread t_imu(imu_thread, cfg_imu, &pub, ext_policy, &st_imu, 200.0,
+                      duration_s, &workload_start_ns, &pid_imu);
 
     std::thread t_vis(stage_worker, &q_cam, &q_vis, cfg_vis, ext_policy, drop_stale, &running, &st_vis,
                       [](const WorkItem &w) -> uint64_t {
@@ -496,6 +536,7 @@ int main(int argc, char **argv)
         hogs.emplace_back(hog_thread, &running, ext_policy);
 
     /* Wait for consumers to publish their pid_tgid before starting generators. */
+    wait_for_pid(pid_imu,  "imu_prop");
     wait_for_pid(pid_vis,  "vision_fe");
     wait_for_pid(pid_est,  "state_est");
     wait_for_pid(pid_map,  "mapping_be");
@@ -504,18 +545,30 @@ int main(int argc, char **argv)
         wait_for_pid(pid_lreg, "lidar_reg");
     }
 
-    /* Generators run under normal CFS; they just wake the pipeline. */
+    const uint64_t workload_start = now_ns() + 100'000'000ULL;
+    workload_start_ns.store(workload_start, std::memory_order_release);
+
+    uint64_t cam_generated = 0;
+    uint64_t lidar_generated = 0;
+
+    /* Generators run under normal CFS. Absolute release times keep the offered
+     * workload identical across policies; a delayed generator creates a burst
+     * instead of silently lowering the sensor rate.
+     */
     std::thread cam_gen([&]{
         uint64_t seq = 1;
-        uint64_t start = now_ns();
-        while (now_ns() - start < (uint64_t)duration_s * 1000000000ull) {
+        const uint64_t period_ns = 33'000'000ULL;
+        const uint64_t start = workload_start;
+        const uint64_t end = start + (uint64_t)duration_s * 1000000000ULL;
+        for (uint64_t release = start; release < end; release += period_ns) {
+            sleep_until_ns(release);
             WorkItem w{};
             w.seq = seq++;
-            w.ts_ns = now_ns();
+            w.ts_ns = release;
             w.kind = 1;
             w.points = 0;
             q_cam.push(w);
-            std::this_thread::sleep_for(std::chrono::milliseconds(33)); /* 30Hz */
+            cam_generated++;
         }
     });
 
@@ -523,20 +576,24 @@ int main(int argc, char **argv)
         if (!lidar_points)
             return;
         uint64_t seq = 1;
-        uint64_t start = now_ns();
-        while (now_ns() - start < (uint64_t)duration_s * 1000000000ull) {
+        const uint64_t period_ns = 100'000'000ULL;
+        const uint64_t start = workload_start;
+        const uint64_t end = start + (uint64_t)duration_s * 1000000000ULL;
+        for (uint64_t release = start; release < end; release += period_ns) {
+            sleep_until_ns(release);
             WorkItem w{};
             w.seq = seq++;
-            w.ts_ns = now_ns();
+            w.ts_ns = release;
             w.kind = 2;
             w.points = lidar_points;
             q_lidar0.push(w);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100)); /* 10Hz */
+            lidar_generated++;
         }
     });
 
     cam_gen.join();
     lidar_gen.join();
+    t_imu.join();
 
     running.store(false);
 
@@ -546,7 +603,6 @@ int main(int argc, char **argv)
     q_lidar1.stop();
     q_map.stop();
 
-    t_imu.join();
     t_vis.join();
     t_est.join();
     if (lidar_points) {
@@ -557,19 +613,25 @@ int main(int argc, char **argv)
     for (auto &t : hogs) t.join();
 
     printf("\n=== Results ===\n");
+    printf("generated:  imu=%llu camera=%llu lidar=%llu\n",
+           (unsigned long long)st_imu.processed,
+           (unsigned long long)cam_generated,
+           (unsigned long long)lidar_generated);
     printf("imu_prop:   processed=%llu late=%llu (%.1f%%)\n",
            (unsigned long long)st_imu.processed,
            (unsigned long long)st_imu.late,
            pct(st_imu.late, st_imu.processed));
 
-    printf("vision_fe:  processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+    printf("vision_fe:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+           (unsigned long long)(st_vis.processed + st_vis.dropped_stale),
            (unsigned long long)st_vis.processed,
            (unsigned long long)st_vis.late,
            pct(st_vis.late, st_vis.processed),
            (unsigned long long)st_vis.stale_seen,
            (unsigned long long)st_vis.dropped_stale);
 
-    printf("state_est:  processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+    printf("state_est:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+           (unsigned long long)(st_est.processed + st_est.dropped_stale),
            (unsigned long long)st_est.processed,
            (unsigned long long)st_est.late,
            pct(st_est.late, st_est.processed),
@@ -577,7 +639,8 @@ int main(int argc, char **argv)
            (unsigned long long)st_est.dropped_stale);
 
     if (lidar_points) {
-        printf("lidar_pre:  processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u\n",
+        printf("lidar_pre:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u\n",
+               (unsigned long long)(st_lpre.processed + st_lpre.dropped_stale),
                (unsigned long long)st_lpre.processed,
                (unsigned long long)st_lpre.late,
                pct(st_lpre.late, st_lpre.processed),
@@ -585,7 +648,8 @@ int main(int argc, char **argv)
                (unsigned long long)st_lpre.dropped_stale,
                lidar_points);
 
-        printf("lidar_reg:  processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u reg_k=%.3f\n",
+        printf("lidar_reg:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u reg_k=%.3f\n",
+               (unsigned long long)(st_lreg.processed + st_lreg.dropped_stale),
                (unsigned long long)st_lreg.processed,
                (unsigned long long)st_lreg.late,
                pct(st_lreg.late, st_lreg.processed),
@@ -595,7 +659,8 @@ int main(int argc, char **argv)
                lidar_k);
     }
 
-    printf("mapping_be: processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+    printf("mapping_be: dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+           (unsigned long long)(st_map.processed + st_map.dropped_stale),
            (unsigned long long)st_map.processed,
            (unsigned long long)st_map.late,
            pct(st_map.late, st_map.processed),
@@ -604,8 +669,9 @@ int main(int argc, char **argv)
 
     printf("\nTip: compare runs with/without scx_slam_fresh.\n");
     printf("Try single core:\n");
-    printf("  sudo taskset -c 0 ./build/slam_pipeline_demo --pin %s --lidar heavy --hog 2 --duration %d\n", pin_dir, duration_s);
-    printf("  sudo taskset -c 0 ./build/slam_pipeline_demo --pin %s --lidar heavy --hog 2 --duration %d --ext-policy 7\n", pin_dir, duration_s);
+    printf("  taskset -c 0 ./build/slam_pipeline_demo --no-hints --lidar heavy --hog 2 --duration %d\n", duration_s);
+    if (pin_dir)
+        printf("  sudo taskset -c 0 ./build/slam_pipeline_demo --pin %s --lidar heavy --hog 2 --duration %d --ext-policy 7\n", pin_dir, duration_s);
     printf("Add --drop-stale 1 to see wasted-work shedding.\n");
 
     slamqos_close(&pub);
