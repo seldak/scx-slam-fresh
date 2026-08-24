@@ -10,6 +10,7 @@ loader_bin="$repo_dir/build/scx_slam_fresh_user"
 cpu=${CPU:-0}
 duration=${DURATION:-15}
 hog_threads=${HOG_THREADS:-2}
+stale_hog_threads=${STALE_HOG_THREADS:-0}
 ext_policy=${EXT_POLICY:-7}
 repetitions=${REPETITIONS:-1}
 output_dir=${OUTPUT_DIR:-/tmp/scx-slam-fresh-eval-$(date +%Y%m%d-%H%M%S)-$$}
@@ -21,7 +22,7 @@ usage() {
 Usage: sudo scripts/run_single_core_eval.sh
 
 Optional environment variables:
-  CPU=0 DURATION=15 HOG_THREADS=2 EXT_POLICY=7 REPETITIONS=1
+  CPU=0 DURATION=15 HOG_THREADS=2 STALE_HOG_THREADS=0 EXT_POLICY=7 REPETITIONS=1
   OUTPUT_DIR=/path/to/results
 EOF
 }
@@ -59,16 +60,35 @@ wait_for_scheduler() {
 
 run_case() {
     local name=$1
-    shift
+    local case_hogs=$2
+    shift 2
 
     echo
     echo "=== $name ==="
     echo "Running for about ${duration}s; results are printed when the workload finishes."
     taskset -c "$cpu" "$demo_bin" \
         --lidar heavy \
-        --hog "$hog_threads" \
+        --hog "$case_hogs" \
         --duration "$duration" \
         "$@" 2>&1 | tee "$output_dir/$name.txt"
+}
+
+read_metric() {
+    local stage=$1
+    local metric=$2
+    local result_file=$3
+
+    awk -v stage="$stage:" -v metric="$metric" '
+        $1 == stage {
+            for (i = 2; i <= NF; i++) {
+                if (index($i, metric "=") == 1) {
+                    split($i, value, "=")
+                    print value[2]
+                    exit
+                }
+            }
+        }
+    ' "$result_file"
 }
 
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
@@ -118,7 +138,7 @@ fi
 mkdir -p -- "$output_dir"
 trap cleanup EXIT INT TERM
 
-echo "Running $((repetitions * 3)) cases (~$((repetitions * 3 * duration)) seconds of workload time)."
+echo "Running $((repetitions * 4)) cases (~$((repetitions * 4 * duration)) seconds of workload time)."
 echo "Results directory: $output_dir"
 
 cat >"$output_dir/environment.txt" <<EOF
@@ -127,6 +147,7 @@ kernel=$(uname -r)
 cpu=$cpu
 duration=$duration
 hog_threads=$hog_threads
+stale_hog_threads=$stale_hog_threads
 ext_policy=$ext_policy
 repetitions=$repetitions
 git_commit=$(git -C "$repo_dir" rev-parse HEAD)
@@ -137,7 +158,7 @@ bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{pri
 EOF
 
 for repetition in $(seq 1 "$repetitions"); do
-    run_case "cfs-$repetition" --no-hints
+    run_case "cfs-isolation-$repetition" "$hog_threads" --no-hints
 done
 
 mkdir -p -- "$pin_dir"
@@ -151,16 +172,47 @@ for repetition in $(seq 1 "$repetitions"); do
         tail -n 40 "$output_dir/loader.txt" >&2 || true
         exit 1
     fi
-    echo "=== scx-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-$repetition" --pin "$pin_dir" --ext-policy "$ext_policy"
+    echo "=== scx-isolation-$repetition ===" >>"$output_dir/loader.txt"
+    run_case "scx-isolation-$repetition" "$hog_threads" --pin "$pin_dir" --ext-policy "$ext_policy"
+
+    if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
+        echo "error: sched_ext stopped before stale-keeping run $repetition" >&2
+        tail -n 40 "$output_dir/loader.txt" >&2 || true
+        exit 1
+    fi
+    echo "=== scx-stale-keep-$repetition ===" >>"$output_dir/loader.txt"
+    run_case "scx-stale-keep-$repetition" "$stale_hog_threads" --pin "$pin_dir" --ext-policy "$ext_policy"
 
     if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
         echo "error: sched_ext stopped before stale-dropping run $repetition" >&2
         tail -n 40 "$output_dir/loader.txt" >&2 || true
         exit 1
     fi
-    echo "=== scx-drop-stale-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-drop-stale-$repetition" --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1
+    echo "=== scx-stale-drop-$repetition ===" >>"$output_dir/loader.txt"
+    run_case "scx-stale-drop-$repetition" "$stale_hog_threads" --pin "$pin_dir" --ext-policy "$ext_policy" --drop-stale 1
+
+    keep_file="$output_dir/scx-stale-keep-$repetition.txt"
+    drop_file="$output_dir/scx-stale-drop-$repetition.txt"
+    keep_pending=$(read_metric lidar_reg pending "$keep_file")
+    drop_pending=$(read_metric lidar_reg pending "$drop_file")
+    drop_evicted=$(read_metric lidar_reg queue_evicted_stale "$drop_file")
+
+    if [[ ! $keep_pending =~ ^[0-9]+$ ]] ||
+       [[ ! $drop_pending =~ ^[0-9]+$ ]] ||
+       [[ ! $drop_evicted =~ ^[0-9]+$ ]]; then
+        echo "error: could not parse stale-shedding metrics" >&2
+        exit 1
+    fi
+
+    if (( drop_evicted == 0 )); then
+        echo "error: stale-dropping scenario did not evict queued LiDAR registration work" >&2
+        exit 1
+    fi
+
+    if (( drop_pending >= keep_pending )); then
+        echo "error: stale dropping did not reduce the pending LiDAR registration backlog" >&2
+        exit 1
+    fi
 done
 
 echo

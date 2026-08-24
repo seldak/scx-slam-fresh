@@ -91,7 +91,8 @@ This pins (at least) the following maps:
 - `--lidar off|light|mid|heavy` enables a LiDAR stream (10Hz) with bursty compute
 - `heavy` is intentionally unsustainable and creates a LiDAR-registration backlog
 - `--hog N` adds CPU contention
-- `--drop-stale 1` skips compute for stale jobs (models backlog shedding)
+- `--drop-stale 1` rejects expired dequeued jobs and lets producers evict
+  expired queued backlog before enqueueing new work
 - `--duration S` controls run length
 
 
@@ -119,13 +120,20 @@ sudo ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh
 ---
 
 ## Evaluation (single-core overload)
-Reference workload: LiDAR heavy (300k pts @10Hz) + camera (30Hz) + IMU (200Hz) + 2 CPU hog threads, pinned to one core to force contention. Results depend on the kernel, hardware, and Git revision; the benchmark script records all three.
+The harness runs two matched single-core workloads. The deadline-isolation pair
+uses LiDAR heavy (300k pts @10Hz), camera (30Hz), IMU (200Hz), and two CPU hogs
+to compare CFS with scx_slam_fresh. The stale-shedding pair uses the same sensor
+load under scx_slam_fresh with zero hogs, comparing stale retention against
+`--drop-stale 1`. Zero hogs leaves enough back-end progress for stale shedding
+to be observable. Results depend on the kernel, hardware, and Git revision; the
+benchmark script records all three.
 
 Commands:
 ```bash
 taskset -c 0 ./build/slam_pipeline_demo --no-hints --lidar heavy --hog 2 --duration 15
 sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15 --ext-policy 7
-sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 2 --duration 15 --ext-policy 7 --drop-stale 1
+sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 0 --duration 15 --ext-policy 7
+sudo taskset -c 0 ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh --lidar heavy --hog 0 --duration 15 --ext-policy 7 --drop-stale 1
 ```
 
 Run the complete matrix, capture its environment, and save each run's output with:
@@ -135,7 +143,8 @@ sudo scripts/run_single_core_eval.sh
 
 The scheduler now has a dedicated `DSQ_IMU` lane. Results from before that change are not quoted here because they are not comparable to the current policy. Re-run the matrix above before reporting miss-rate improvements. Compare:
 - `imu_prop`, `vision_fe`, and `state_est` deadline-miss percentages
-- `lidar_reg` and `mapping_be` stale/dropped counts
+- `lidar_reg` and `mapping_be` consumer-dropped and queue-evicted stale counts
+- pending backlogs in the matched stale-keeping and stale-dropping runs
 - work completed by stale back-end stages with and without `--drop-stale 1`
 
 Known limitation: the dedicated IMU lane has strict dispatch priority and can starve lower lanes if IMU utilization is misconfigured. The overload matrix is intended to quantify that tradeoff.

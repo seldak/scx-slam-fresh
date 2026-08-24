@@ -26,7 +26,7 @@
  *   --ext-policy <N>     numeric SCHED_EXT policy (7 on Ubuntu 6.14 headers)
  *   --duration <sec>     demo duration (default 10)
  *   --lidar <off|light|mid|heavy>  enable LiDAR stream with point counts
- *   --drop-stale <0|1>   skip compute for stale jobs (default 0)
+ *   --drop-stale <0|1>   discard expired queued/dequeued jobs (default 0)
  *   --hog <N>            number of hog threads (default 1)
  *
  * Recommended runs:
@@ -132,6 +132,7 @@ struct StageStats {
     uint64_t late{0};
     uint64_t stale_seen{0};
     uint64_t dropped_stale{0};
+    uint64_t queue_evicted_stale{0};
 };
 
 static inline uint64_t deadline_abs(const WorkItem &w, const StageCfg &cfg)
@@ -162,9 +163,21 @@ public:
         ht_ = t;
     }
 
+    void set_stale_eviction(bool enabled)
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        evict_stale_ = enabled;
+    }
+
     void push(const T &v)
     {
         std::unique_lock<std::mutex> lk(mu_);
+
+        /* A starved consumer cannot dequeue and reject its stale backlog.
+         * Let producers prune only expired queued items. The item currently
+         * being processed is no longer in q_ and its active hint is untouched.
+         */
+        evict_stale_locked(now_ns());
 
         /* Only publish from the producer when it is about to wake a sleeping
          * consumer. Publishing every queued item would overwrite the hint for
@@ -208,7 +221,34 @@ public:
         cv_.notify_all();
     }
 
+    uint64_t queue_evicted_stale()
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        return queue_evicted_stale_;
+    }
+
+    size_t pending()
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        return q_.size();
+    }
+
 private:
+    void evict_stale_locked(uint64_t now)
+    {
+        if (!evict_stale_ || !ht_.cfg || !ht_.cfg->stale_ns)
+            return;
+
+        for (auto it = q_.begin(); it != q_.end();) {
+            if (is_stale(now, *it, *ht_.cfg)) {
+                it = q_.erase(it);
+                queue_evicted_stale_++;
+            } else {
+                ++it;
+            }
+        }
+    }
+
     void publish_hint(const T &v)
     {
         if (!ht_.pub || ht_.pub->map_fd < 0 || !ht_.pid_tgid || !ht_.cfg)
@@ -238,6 +278,8 @@ private:
     std::deque<T> q_;
     bool stop_{false};
     bool waiting_{false};
+    bool evict_stale_{false};
+    uint64_t queue_evicted_stale_{0};
     HintTarget ht_{};
 };
 
@@ -368,6 +410,16 @@ static double pct(uint64_t a, uint64_t b)
     return 100.0 * (double)a / (double)b;
 }
 
+static uint64_t stale_seen_total(const StageStats &stats)
+{
+    return stats.stale_seen + stats.queue_evicted_stale;
+}
+
+static uint64_t dropped_stale_total(const StageStats &stats)
+{
+    return stats.dropped_stale + stats.queue_evicted_stale;
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
@@ -480,6 +532,16 @@ int main(int argc, char **argv)
     q_lidar0.set_hint_target({ &pub, &pid_lpre, &cfg_lpre });
     q_lidar1.set_hint_target({ &pub, &pid_lreg, &cfg_lreg });
     q_map.set_hint_target({ &pub, &pid_map, &cfg_map });
+
+    /* With stale dropping enabled, producers also prune expired queued work.
+     * This works even while a consumer is busy or starved and therefore unable
+     * to reach the usual dequeue-time stale check.
+     */
+    q_cam.set_stale_eviction(drop_stale);
+    q_vis.set_stale_eviction(drop_stale);
+    q_lidar0.set_stale_eviction(drop_stale);
+    q_lidar1.set_stale_eviction(drop_stale);
+    q_map.set_stale_eviction(drop_stale);
 
     /* Start workers (consumers). */
     std::thread t_imu(imu_thread, cfg_imu, &pub, ext_policy, &st_imu, 200.0,
@@ -612,6 +674,18 @@ int main(int argc, char **argv)
     t_map.join();
     for (auto &t : hogs) t.join();
 
+    st_vis.queue_evicted_stale = q_cam.queue_evicted_stale();
+    st_est.queue_evicted_stale = q_vis.queue_evicted_stale();
+    st_lpre.queue_evicted_stale = q_lidar0.queue_evicted_stale();
+    st_lreg.queue_evicted_stale = q_lidar1.queue_evicted_stale();
+    st_map.queue_evicted_stale = q_map.queue_evicted_stale();
+
+    const size_t pending_vis = q_cam.pending();
+    const size_t pending_est = q_vis.pending();
+    const size_t pending_lpre = q_lidar0.pending();
+    const size_t pending_lreg = q_lidar1.pending();
+    const size_t pending_map = q_map.pending();
+
     printf("\n=== Results ===\n");
     printf("generated:  imu=%llu camera=%llu lidar=%llu\n",
            (unsigned long long)st_imu.processed,
@@ -622,57 +696,71 @@ int main(int argc, char **argv)
            (unsigned long long)st_imu.late,
            pct(st_imu.late, st_imu.processed));
 
-    printf("vision_fe:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+    printf("vision_fe:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",
            (unsigned long long)(st_vis.processed + st_vis.dropped_stale),
            (unsigned long long)st_vis.processed,
            (unsigned long long)st_vis.late,
            pct(st_vis.late, st_vis.processed),
-           (unsigned long long)st_vis.stale_seen,
-           (unsigned long long)st_vis.dropped_stale);
+           (unsigned long long)stale_seen_total(st_vis),
+           (unsigned long long)dropped_stale_total(st_vis),
+           (unsigned long long)st_vis.dropped_stale,
+           (unsigned long long)st_vis.queue_evicted_stale,
+           pending_vis);
 
-    printf("state_est:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+    printf("state_est:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",
            (unsigned long long)(st_est.processed + st_est.dropped_stale),
            (unsigned long long)st_est.processed,
            (unsigned long long)st_est.late,
            pct(st_est.late, st_est.processed),
-           (unsigned long long)st_est.stale_seen,
-           (unsigned long long)st_est.dropped_stale);
+           (unsigned long long)stale_seen_total(st_est),
+           (unsigned long long)dropped_stale_total(st_est),
+           (unsigned long long)st_est.dropped_stale,
+           (unsigned long long)st_est.queue_evicted_stale,
+           pending_est);
 
     if (lidar_points) {
-        printf("lidar_pre:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u\n",
+        printf("lidar_pre:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u\n",
                (unsigned long long)(st_lpre.processed + st_lpre.dropped_stale),
                (unsigned long long)st_lpre.processed,
                (unsigned long long)st_lpre.late,
                pct(st_lpre.late, st_lpre.processed),
-               (unsigned long long)st_lpre.stale_seen,
+               (unsigned long long)stale_seen_total(st_lpre),
+               (unsigned long long)dropped_stale_total(st_lpre),
                (unsigned long long)st_lpre.dropped_stale,
+               (unsigned long long)st_lpre.queue_evicted_stale,
+               pending_lpre,
                lidar_points);
 
-        printf("lidar_reg:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu points=%u reg_k=%.3f\n",
+        printf("lidar_reg:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u reg_k=%.3f\n",
                (unsigned long long)(st_lreg.processed + st_lreg.dropped_stale),
                (unsigned long long)st_lreg.processed,
                (unsigned long long)st_lreg.late,
                pct(st_lreg.late, st_lreg.processed),
-               (unsigned long long)st_lreg.stale_seen,
+               (unsigned long long)stale_seen_total(st_lreg),
+               (unsigned long long)dropped_stale_total(st_lreg),
                (unsigned long long)st_lreg.dropped_stale,
+               (unsigned long long)st_lreg.queue_evicted_stale,
+               pending_lreg,
                lidar_points,
                lidar_k);
     }
 
-    printf("mapping_be: dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu\n",
+    printf("mapping_be: dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",
            (unsigned long long)(st_map.processed + st_map.dropped_stale),
            (unsigned long long)st_map.processed,
            (unsigned long long)st_map.late,
            pct(st_map.late, st_map.processed),
-           (unsigned long long)st_map.stale_seen,
-           (unsigned long long)st_map.dropped_stale);
+           (unsigned long long)stale_seen_total(st_map),
+           (unsigned long long)dropped_stale_total(st_map),
+           (unsigned long long)st_map.dropped_stale,
+           (unsigned long long)st_map.queue_evicted_stale,
+           pending_map);
 
-    printf("\nTip: compare runs with/without scx_slam_fresh.\n");
-    printf("Try single core:\n");
+    printf("\nTry deadline isolation on one CPU:\n");
     printf("  taskset -c 0 ./build/slam_pipeline_demo --no-hints --lidar heavy --hog 2 --duration %d\n", duration_s);
     if (pin_dir)
         printf("  sudo taskset -c 0 ./build/slam_pipeline_demo --pin %s --lidar heavy --hog 2 --duration %d --ext-policy 7\n", pin_dir, duration_s);
-    printf("Add --drop-stale 1 to see wasted-work shedding.\n");
+    printf("Test stale shedding separately with --hog 0, with and without --drop-stale 1.\n");
 
     slamqos_close(&pub);
     return 0;

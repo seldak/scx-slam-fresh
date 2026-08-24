@@ -5,10 +5,14 @@
 - completion latency (release_ts → stage output)
 - deadline miss rate
 - stale processing rate (age > stale_ns)
-- dropped stale rate (dropped_stale / stale_seen)
+- dropped stale rate (`dropped_stale / stale_seen`)
 - CPU time spent
 
-`processed` excludes items rejected by stale dropping; `dequeued = processed + dropped_stale` makes the accounting explicit.
+`processed` excludes expired items. `consumer_dropped_stale` counts items rejected
+after dequeue, while `queue_evicted_stale` counts expired backlog removed under the
+queue lock by a producer. The reported `dropped_stale` is their sum, and
+`dequeued = processed + consumer_dropped_stale`. `pending` exposes work left in
+the queue when the measurement ends.
 
 ### System level
 - total throughput (frames/s)
@@ -38,10 +42,23 @@ Sensor generators share one absolute start epoch, use absolute release times, an
 - Hold CPU affinity and hog count constant.
 - Confirm that light remains sustainable, mid approaches saturation, and heavy produces stale LiDAR-registration work.
 
-### E1: Heavy LiDAR overload and stale shedding
-- Pin the demo to one CPU with heavy LiDAR and two CPU hogs.
-- Compare CFS, scx_slam_fresh, and scx_slam_fresh with stale dropping.
-- Check front-end deadline misses, stale back-end work, and dropped-stale counts.
+### E1: Heavy LiDAR overload
+
+Use two matched sub-experiments because strict priority plus two hogs can fully
+starve the back-end. A consumer that never runs cannot demonstrate
+dequeue-time dropping.
+
+- Deadline isolation: pin the demo to one CPU with heavy LiDAR and two CPU hogs;
+  compare CFS with scx_slam_fresh.
+- Stale shedding: keep scx_slam_fresh active and use zero CPU hogs; compare
+  keeping stale work with `--drop-stale 1`.
+- Check front-end deadline misses in the first pair, then stale drops and pending
+  backlogs in the second pair.
+
+When stale dropping is enabled, each producer prunes expired queued items before
+enqueueing the next release. The in-flight item is not in the queue, and the
+producer does not overwrite its active scheduler hint. The consumer still
+performs a dequeue-time stale check as a second line of defense.
 
 Run the reproducible matrix:
 ```bash
@@ -53,7 +70,7 @@ The script refuses to replace an active sched_ext scheduler, uses a unique BPF p
 
 Example with explicit controls:
 ```bash
-sudo env CPU=0 DURATION=15 HOG_THREADS=2 REPETITIONS=3 \
+sudo env CPU=0 DURATION=15 HOG_THREADS=2 STALE_HOG_THREADS=0 REPETITIONS=3 \
   scripts/run_single_core_eval.sh
 ```
 
