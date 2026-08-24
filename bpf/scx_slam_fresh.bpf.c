@@ -65,7 +65,6 @@ char LICENSE[] SEC("license") = "GPL";
 
 extern s32  scx_bpf_create_dsq(u64 dsq_id, s32 node) __ksym;
 extern void scx_bpf_destroy_dsq(u64 dsq_id) __ksym;
-extern u32  scx_bpf_dispatch_nr_slots(void) __ksym;
 
 /* CPU selection helper: keep weak and fallback. */
 extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
@@ -130,8 +129,6 @@ static __always_inline bool scx_move_to_local(u64 dsq_id)
 #define DSQ_FE     0xFE01ULL
 #define DSQ_BE     0xBE01ULL
 #define DSQ_STALE  0x5A1EULL
-
-#define MAX_DISPATCH 32
 
 /* Demote tasks that are already past their deadline by this grace period. */
 #define DEADLINE_GRACE_NS 1000000ULL /* 1ms */
@@ -311,9 +308,19 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
      * Tier-0 lane: IMU / propagation thread.
      * - Always route to DSQ_IMU (highest priority)
      * - Never stale-demote or late-demote (propagation must run ASAP to recover)
+     * - A wakeup must preempt the currently running lower lane. Merely adding
+     *   the task to a custom DSQ does not shorten the current task's slice;
+     *   SCX_ENQ_PREEMPT takes effect only for a direct local insertion.
      */
     if (h->stage_id == SLAM_STAGE_IMU_PREINT) {
         u64 vtime = effective_deadline_ns(h, now_ns);
+
+        if (enq_flags & SCX_ENQ_WAKEUP) {
+            scx_insert(p, SCX_DSQ_LOCAL, slice,
+                       enq_flags | SCX_ENQ_PREEMPT);
+            return;
+        }
+
         scx_insert_vtime(p, DSQ_IMU, slice, vtime, enq_flags);
         return;
     }
@@ -363,26 +370,17 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
 
 void BPF_STRUCT_OPS(scx_slam_fresh_dispatch, s32 cpu, struct task_struct *prev)
 {
-    u32 nr = scx_bpf_dispatch_nr_slots();
-
-#pragma unroll
-    for (int i = 0; i < MAX_DISPATCH; i++) {
-        if ((u32)i >= nr)
-            break;
-
-        /* Highest priority: propagation/IMU */
-        if (scx_move_to_local(DSQ_IMU))
-            continue;
-
-        if (scx_move_to_local(DSQ_FE))
-            continue;
-        if (scx_move_to_local(DSQ_BE))
-            continue;
-        if (scx_move_to_local(DSQ_STALE))
-            continue;
-
-        break;
-    }
+    /* Move one task per callback. Pre-filling the local DSQ with lower lanes
+     * creates a priority inversion: an IMU task that wakes afterward cannot
+     * jump ahead of already-local FE/BE work.
+     */
+    if (scx_move_to_local(DSQ_IMU))
+        return;
+    if (scx_move_to_local(DSQ_FE))
+        return;
+    if (scx_move_to_local(DSQ_BE))
+        return;
+    (void)scx_move_to_local(DSQ_STALE);
 }
 
 void BPF_STRUCT_OPS(scx_slam_fresh_running, struct task_struct *p)
@@ -506,4 +504,3 @@ SCX_OPS_DEFINE(scx_slam_fresh_ops,
 #endif
 #endif
 );
-
