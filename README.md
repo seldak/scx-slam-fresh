@@ -91,6 +91,12 @@ This pins (at least) the following maps:
 - `--lidar off|light|mid|heavy` enables a LiDAR stream (10Hz) with bursty compute
 - `heavy` is intentionally unsustainable and creates a LiDAR-registration backlog
 - `--hog N` adds CPU contention
+- `--imu-work-us N` sets IMU compute CPU time per job (default `150` µs,
+  or 3% of the fixed 5 ms period). `0` disables synthetic IMU compute, not
+  releases or hint publication; values at or above `5000` permit overload tests.
+  This does not change the IMU deadline, budget hint, or scheduler policy.
+  The IMU worker finishes all releases scheduled within `--duration`, so
+  overloaded runs can take longer than that wall-clock duration to exit.
 - `--drop-stale 1` rejects expired dequeued jobs and lets producers evict
   expired queued backlog before enqueueing new work
 - `--camera-burst-count N` delays `N` camera frames and releases them together
@@ -101,6 +107,16 @@ This pins (at least) the following maps:
   default 3-5ms pattern
 - `--vision-deadline-us N` sets the vision relative deadline
 - `--duration S` controls run length
+
+The results' `configuration` line records `imu_work_us`. For example, a
+non-root smoke run with 30% nominal IMU utilization is:
+
+```bash
+./build/slam_pipeline_demo --no-hints --lidar off --hog 0 --duration 2 --imu-work-us 1500
+```
+
+Run the non-root CLI and IMU CPU-accounting regression tests with `make test-demo`
+(requires Python 3 and `taskset`). This is not the E4 isolation sweep.
 
 
 #### Option A: partial mode

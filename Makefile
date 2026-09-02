@@ -9,6 +9,7 @@ BPF_CFLAGS ?= -O2 -g -target bpf
 
 CXX ?= g++
 CC ?= gcc
+PYTHON ?= python3
 
 BUILD_DIR ?= build
 PIN_DIR_DEFAULT ?= /sys/fs/bpf/scx_slam_fresh
@@ -58,4 +59,7 @@ userspace: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: all clean
+test-demo: $(BUILD_DIR)/slam_pipeline_demo
+	DEMO_BIN="$(abspath $(BUILD_DIR)/slam_pipeline_demo)" $(PYTHON) tests/test_demo_cli.py
+
+.PHONY: all clean test-demo

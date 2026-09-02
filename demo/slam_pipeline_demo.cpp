@@ -28,6 +28,7 @@
  *   --lidar <off|light|mid|heavy>  enable LiDAR stream with point counts
  *   --drop-stale <0|1>   discard expired queued/dequeued jobs (default 0)
  *   --hog <N>            number of hog threads (default 1)
+ *   --imu-work-us <N>    IMU compute CPU time per 5ms tick (default 150; 0 disables compute)
  *   --camera-burst-count <N>  delay N camera frames, then release together
  *   --camera-burst-at-ms <N>  burst delivery offset (default 3000)
  *   --vision-budget-us <N>     vision FE per-job CPU budget (default 12000)
@@ -359,6 +360,7 @@ static void imu_thread(const StageCfg &cfg,
                        int ext_policy,
                        StageStats *stats,
                        double imu_hz,
+                       uint64_t work_us,
                        int duration_s,
                        std::atomic<uint64_t> *workload_start_ns,
                        std::atomic<uint64_t> *pid_out)
@@ -401,7 +403,7 @@ static void imu_thread(const StageCfg &cfg,
         uint64_t dl_abs = (cfg.deadline_rel_ns) ? (next + cfg.deadline_rel_ns) : 0;
 
         uint64_t cpu_start_ns = thread_cpu_ns();
-        busy_work_us(150); /* ~0.15ms */
+        busy_work_us(work_us);
         stats->cpu_ns += thread_cpu_ns() - cpu_start_ns;
 
         uint64_t end = now_ns();
@@ -450,7 +452,8 @@ static uint64_t dropped_stale_total(const StageStats &stats)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N] [--camera-burst-count N] [--camera-burst-at-ms N] [--vision-budget-us N] [--vision-work-us N] [--vision-deadline-us N]\n",
+        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N] [--imu-work-us N] [--camera-burst-count N] [--camera-burst-at-ms N] [--vision-budget-us N] [--vision-work-us N] [--vision-deadline-us N]\n"
+        "  --imu-work-us N: IMU compute CPU microseconds per 5ms tick (default 150; 0 disables compute)\n",
         argv0);
 }
 
@@ -489,6 +492,7 @@ int main(int argc, char **argv)
     std::string lidar_mode = "off";
     bool drop_stale = false;
     int hog_n = 1;
+    uint64_t imu_work_us = 150;
     int camera_burst_count = 0;
     int camera_burst_at_ms = 3000;
     uint64_t vision_budget_us = 12'000;
@@ -510,6 +514,17 @@ int main(int argc, char **argv)
             drop_stale = atoi(argv[++i]) != 0;
         } else if (!strcmp(argv[i], "--hog") && i + 1 < argc) {
             hog_n = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--imu-work-us") && i + 1 < argc) {
+            const char *arg = argv[++i];
+            char *end = nullptr;
+            errno = 0;
+            unsigned long long value = strtoull(arg, &end, 10);
+            if (!*arg || strspn(arg, "0123456789") != strlen(arg) ||
+                errno || !end || *end != '\0' || value > UINT64_MAX / 1'000ULL) {
+                fprintf(stderr, "error: IMU work must be a non-negative integer number of microseconds that fits in nanoseconds\n");
+                return 1;
+            }
+            imu_work_us = (uint64_t)value;
         } else if (!strcmp(argv[i], "--camera-burst-count") && i + 1 < argc) {
             camera_burst_count = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--camera-burst-at-ms") && i + 1 < argc) {
@@ -641,7 +656,7 @@ int main(int argc, char **argv)
 
     /* Start workers (consumers). */
     std::thread t_imu(imu_thread, cfg_imu, &pub, ext_policy, &st_imu, 200.0,
-                      duration_s, &workload_start_ns, &pid_imu);
+                      imu_work_us, duration_s, &workload_start_ns, &pid_imu);
 
     std::thread t_vis(stage_worker, &q_cam, &q_vis, cfg_vis, ext_policy, drop_stale, &running, &st_vis,
                       [vision_work_us](const WorkItem &w) -> uint64_t {
@@ -819,10 +834,11 @@ int main(int argc, char **argv)
            (unsigned long long)(camera_burst_count > 0
                ? camera_burst_delivery_index * camera_period_ns / 1'000'000ULL
                : 0));
-    printf("configuration: vision_budget_us=%llu vision_work_us=%llu vision_deadline_us=%llu\n",
+    printf("configuration: vision_budget_us=%llu vision_work_us=%llu vision_deadline_us=%llu imu_work_us=%llu\n",
            (unsigned long long)vision_budget_us,
            (unsigned long long)vision_work_us,
-           (unsigned long long)vision_deadline_us);
+           (unsigned long long)vision_deadline_us,
+           (unsigned long long)imu_work_us);
     printf("imu_prop:   processed=%llu late=%llu (%.1f%%) cpu_us=%llu\n",
            (unsigned long long)st_imu.processed,
            (unsigned long long)st_imu.late,
