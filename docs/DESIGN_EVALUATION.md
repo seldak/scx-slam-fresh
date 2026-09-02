@@ -30,7 +30,9 @@ The demo is multi-rate: IMU at 200Hz, camera at 30Hz, and LiDAR at 10Hz. LiDAR m
 - `--lidar mid`: borderline load
 - `--lidar heavy`: intentionally unsustainable; creates a registration backlog
 
-Additional controls are `--hog N`, `--drop-stale 1`, and `--duration S`.
+Additional controls are `--hog N`, `--drop-stale 1`, `--duration S`, and the
+vision-stage `--vision-budget-us`, `--vision-work-us`, and
+`--vision-deadline-us` knobs.
 
 Sensor generators share one absolute start epoch, use absolute release times, and report generated counts. This keeps the offered input stream and measurement window constant across policies; scheduling delay appears as lateness or backlog rather than silently reducing the generated rate.
 
@@ -97,28 +99,42 @@ The root benchmark enforces all three conditions. Use `BURST_COUNT` and
 
 #### Latest local verification snapshot
 
-One root run on 2026-08-24 using kernel `7.0.0-30-generic`, CPU 0, 15-second
+One root run on 2026-09-02 using kernel `7.0.0-30-generic`, CPU 0, 15-second
 cases, and one repetition produced:
 
 - E0 sweep: light and mid completed 80/80 registration jobs with no stale or
   pending work; heavy completed 29/80, observed 27 stale jobs, and left 51
   pending. Nominal registration costs were 15804us, 59583us, and 280919us.
-- E1 isolation: state-estimator deadline misses were 43.7% under CFS and 0.0%
+- E1 isolation: state-estimator deadline misses were 47.7% under CFS and 0.0%
   under scx_slam_fresh.
 - E1 stale shedding: LiDAR-registration pending backlog fell from 97 to 3;
   64 expired queued jobs were evicted.
 - E2 burst recovery: both policies preserved newest burst frame 92. Stale
   dropping processed 2 rather than 12 burst frames and reduced its
-  state-estimate completion age from 112208us to 25850us.
+  state-estimate completion age from 109322us to 25149us.
+- E3 budget validation: with fixed 18ms vision work and a 20ms deadline, the
+  correctly sized 24ms budget missed 5/455 deadlines; a 1ms budget produced
+  455 overrun events, 455 confirmed BE-demotion events, and 126/455 misses.
 
 These figures are a development verification snapshot, not a multi-run
 performance claim. Reproduce them with the benchmark command above; the script
 records the environment, revision, binary hashes, and per-case output in its
 chosen results directory.
 
-### E3: Budget misconfiguration
-- Set a too-low budget for a front-end stage.
-- Goal: observe demotion and increased deadline misses (sanity check).
+### ~~E3: Budget misconfiguration~~ — completed
+
+- Compare matched scx_slam_fresh runs with fixed 18ms vision work and a 20ms
+  relative deadline.
+- Require the 24ms control budget to produce no overrun or demotion events.
+- Require a 1ms budget to produce both overrun and confirmed BE-demotion
+  events, while increasing vision deadline misses.
+- Require the control run to drain every offered vision job so startup
+  starvation cannot masquerade as a budget result.
+
+Run E3 alone with:
+```bash
+sudo env EVAL_SCOPE=e3 scripts/run_single_core_eval.sh
+```
 
 ### E4: IMU-lane isolation
 - Sweep IMU compute cost while holding the heavy-LiDAR workload constant.

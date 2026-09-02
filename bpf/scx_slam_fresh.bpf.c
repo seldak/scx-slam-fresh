@@ -149,6 +149,7 @@ struct task_state {
 
     u64 last_reported_deadline_miss_job;
     u64 last_reported_budget_overrun_job;
+    u64 last_reported_budget_demotion_job;
     u64 last_reported_stale_job;
 };
 
@@ -358,10 +359,17 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
         return;
     }
 
-    if (h->class_id == SLAM_SCX_CLASS_FE && !st->overrun) {
-        u64 vtime = effective_deadline_ns(h, now_ns);
-        scx_insert_vtime(p, DSQ_FE, slice, vtime, enq_flags);
-        return;
+    if (h->class_id == SLAM_SCX_CLASS_FE) {
+        if (!st->overrun) {
+            u64 vtime = effective_deadline_ns(h, now_ns);
+            scx_insert_vtime(p, DSQ_FE, slice, vtime, enq_flags);
+            return;
+        }
+
+        if (st->last_reported_budget_demotion_job != h->job_id) {
+            emit_evt(SLAM_EVT_BUDGET_DEMOTION, key, h, st, now_ns);
+            st->last_reported_budget_demotion_job = h->job_id;
+        }
     }
 
     /* BE or FE-overrun => DSQ_BE */

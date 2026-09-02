@@ -14,8 +14,14 @@ hog_threads=${HOG_THREADS:-2}
 stale_hog_threads=${STALE_HOG_THREADS:-0}
 burst_count=${BURST_COUNT:-12}
 burst_at_ms=${BURST_AT_MS:-3000}
+e3_hog_threads=${E3_HOG_THREADS:-2}
+e3_normal_budget_us=${E3_NORMAL_BUDGET_US:-24000}
+e3_low_budget_us=${E3_LOW_BUDGET_US:-1000}
+e3_vision_work_us=${E3_VISION_WORK_US:-18000}
+e3_vision_deadline_us=${E3_VISION_DEADLINE_US:-20000}
 ext_policy=${EXT_POLICY:-7}
 repetitions=${REPETITIONS:-1}
+eval_scope=${EVAL_SCOPE:-all}
 output_dir=${OUTPUT_DIR:-/tmp/scx-slam-fresh-eval-$(date +%Y%m%d-%H%M%S)-$$}
 pin_dir="/sys/fs/bpf/scx_slam_fresh_eval_$$"
 loader_pid=
@@ -26,7 +32,10 @@ Usage: sudo scripts/run_single_core_eval.sh
 
 Optional environment variables:
   CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 STALE_HOG_THREADS=0 BURST_COUNT=12
-  BURST_AT_MS=3000 EXT_POLICY=7 REPETITIONS=1
+  BURST_AT_MS=3000 E3_HOG_THREADS=2 E3_NORMAL_BUDGET_US=24000 E3_LOW_BUDGET_US=1000
+  E3_VISION_WORK_US=18000
+  E3_VISION_DEADLINE_US=20000
+  EXT_POLICY=7 REPETITIONS=1 EVAL_SCOPE=all|e3
   OUTPUT_DIR=/path/to/results
 EOF
 }
@@ -155,6 +164,102 @@ check_e0_sweep() {
     fi
 }
 
+count_loader_events() {
+    local start_marker=$1
+    local end_marker=$2
+    local event_kind=$3
+    local stage_id=$4
+
+    awk -v start="=== $start_marker ===" -v end="=== $end_marker ===" \
+        -v event="$event_kind" -v stage="stage=$stage_id " '
+        $0 == start { in_case = 1; next }
+        $0 == end { in_case = 0 }
+        in_case && index($0, "[evt] " event " ") && index($0, stage) { count++ }
+        END { print count + 0 }
+    ' "$output_dir/loader.txt"
+}
+
+check_e3_budget() {
+    local repetition=$1
+    local normal_file="$output_dir/scx-budget-normal-$repetition.txt"
+    local low_file="$output_dir/scx-budget-low-$repetition.txt"
+    local normal_late low_late normal_budget low_budget
+    local normal_generated normal_processed low_processed normal_work low_work
+    local normal_deadline low_deadline
+    local normal_overruns normal_demotions low_overruns low_demotions
+
+    normal_late=$(read_metric vision_fe late "$normal_file")
+    low_late=$(read_metric vision_fe late "$low_file")
+    normal_budget=$(read_metric configuration vision_budget_us "$normal_file")
+    low_budget=$(read_metric configuration vision_budget_us "$low_file")
+    normal_work=$(read_metric configuration vision_work_us "$normal_file")
+    low_work=$(read_metric configuration vision_work_us "$low_file")
+    normal_deadline=$(read_metric configuration vision_deadline_us "$normal_file")
+    low_deadline=$(read_metric configuration vision_deadline_us "$low_file")
+    normal_generated=$(read_metric generated camera "$normal_file")
+    normal_processed=$(read_metric vision_fe processed "$normal_file")
+    low_processed=$(read_metric vision_fe processed "$low_file")
+
+    for metric in "$normal_late" "$low_late" "$normal_budget" "$low_budget" \
+                  "$normal_work" "$low_work" "$normal_generated" \
+                  "$normal_processed" "$low_processed" "$normal_deadline" \
+                  "$low_deadline"; do
+        if [[ ! $metric =~ ^[0-9]+$ ]]; then
+            echo "error: could not parse E3 budget metrics" >&2
+            return 1
+        fi
+    done
+
+    normal_overruns=$(count_loader_events "scx-budget-normal-$repetition" \
+        "scx-budget-low-$repetition" BUDGET_OVERRUN 1)
+    normal_demotions=$(count_loader_events "scx-budget-normal-$repetition" \
+        "scx-budget-low-$repetition" BUDGET_DEMOTION 1)
+    low_overruns=$(count_loader_events "scx-budget-low-$repetition" \
+        "scx-budget-end-$repetition" BUDGET_OVERRUN 1)
+    low_demotions=$(count_loader_events "scx-budget-low-$repetition" \
+        "scx-budget-end-$repetition" BUDGET_DEMOTION 1)
+
+    if (( normal_budget != e3_normal_budget_us || low_budget != e3_low_budget_us )); then
+        echo "error: E3 workload did not apply the requested vision budgets" >&2
+        return 1
+    fi
+
+    if (( normal_work != e3_vision_work_us || low_work != e3_vision_work_us )); then
+        echo "error: E3 workload did not apply the requested vision compute cost" >&2
+        return 1
+    fi
+
+    if (( normal_deadline != e3_vision_deadline_us ||
+          low_deadline != e3_vision_deadline_us )); then
+        echo "error: E3 workload did not apply the requested vision deadline" >&2
+        return 1
+    fi
+
+    if (( normal_generated == 0 || normal_processed != normal_generated ||
+          low_processed == 0 )); then
+        echo "error: E3 did not produce a healthy normal run and an active low-budget run" >&2
+        return 1
+    fi
+
+    if (( normal_overruns != 0 || normal_demotions != 0 )); then
+        echo "error: E3 normal vision budget unexpectedly caused an overrun or demotion" >&2
+        return 1
+    fi
+
+    if (( low_overruns == 0 || low_demotions == 0 )); then
+        echo "error: E3 low vision budget did not cause both overrun and demotion events" >&2
+        return 1
+    fi
+
+    if (( low_late <= normal_late )); then
+        echo "error: E3 low vision budget did not increase vision deadline misses" >&2
+        return 1
+    fi
+
+    echo "E3 validated: vision late ${normal_late}->${low_late}; " \
+         "low-budget overruns=$low_overruns demotions=$low_demotions"
+}
+
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
     exit 0
@@ -162,6 +267,11 @@ fi
 
 if (( $# != 0 )); then
     usage >&2
+    exit 2
+fi
+
+if [[ $eval_scope != all && $eval_scope != e3 ]]; then
+    echo "error: EVAL_SCOPE must be 'all' or 'e3'" >&2
     exit 2
 fi
 
@@ -202,8 +312,13 @@ fi
 mkdir -p -- "$output_dir"
 trap cleanup EXIT INT TERM
 
-case_count=$((repetitions * 9))
-workload_seconds=$((repetitions * (6 * duration + 3 * sweep_duration)))
+if [[ $eval_scope == all ]]; then
+    case_count=$((repetitions * 11))
+    workload_seconds=$((repetitions * (8 * duration + 3 * sweep_duration)))
+else
+    case_count=$((repetitions * 2))
+    workload_seconds=$((repetitions * 2 * duration))
+fi
 echo "Running $case_count cases (~$workload_seconds seconds of workload time)."
 echo "Results directory: $output_dir"
 
@@ -217,8 +332,14 @@ hog_threads=$hog_threads
 stale_hog_threads=$stale_hog_threads
 burst_count=$burst_count
 burst_at_ms=$burst_at_ms
+e3_hog_threads=$e3_hog_threads
+e3_normal_budget_us=$e3_normal_budget_us
+e3_low_budget_us=$e3_low_budget_us
+e3_vision_work_us=$e3_vision_work_us
+e3_vision_deadline_us=$e3_vision_deadline_us
 ext_policy=$ext_policy
 repetitions=$repetitions
+eval_scope=$eval_scope
 git_commit=$(git -C "$repo_dir" rev-parse HEAD)
 git_dirty=$(if [[ -n $(git -C "$repo_dir" status --porcelain) ]]; then echo yes; else echo no; fi)
 demo_sha256=$(sha256sum "$demo_bin" | awk '{print $1}')
@@ -226,14 +347,16 @@ loader_sha256=$(sha256sum "$loader_bin" | awk '{print $1}')
 bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{print $1}')
 EOF
 
-for repetition in $(seq 1 "$repetitions"); do
-    for mode in light mid heavy; do
-        run_case "cfs-sweep-$mode-$repetition" 0 "$mode" "$sweep_duration" --no-hints
-    done
-    check_e0_sweep "$repetition"
+if [[ $eval_scope == all ]]; then
+    for repetition in $(seq 1 "$repetitions"); do
+        for mode in light mid heavy; do
+            run_case "cfs-sweep-$mode-$repetition" 0 "$mode" "$sweep_duration" --no-hints
+        done
+        check_e0_sweep "$repetition"
 
-    run_case "cfs-isolation-$repetition" "$hog_threads" heavy "$duration" --no-hints
-done
+        run_case "cfs-isolation-$repetition" "$hog_threads" heavy "$duration" --no-hints
+    done
+fi
 
 mkdir -p -- "$pin_dir"
 stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" >>"$output_dir/loader.txt" 2>&1 &
@@ -241,13 +364,14 @@ loader_pid=$!
 wait_for_scheduler
 
 for repetition in $(seq 1 "$repetitions"); do
-    if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
-        echo "error: sched_ext stopped before scx run $repetition" >&2
-        tail -n 40 "$output_dir/loader.txt" >&2 || true
-        exit 1
-    fi
-    echo "=== scx-isolation-$repetition ===" >>"$output_dir/loader.txt"
-    run_case "scx-isolation-$repetition" "$hog_threads" heavy "$duration" --pin "$pin_dir" --ext-policy "$ext_policy"
+    if [[ $eval_scope == all ]]; then
+        if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
+            echo "error: sched_ext stopped before scx run $repetition" >&2
+            tail -n 40 "$output_dir/loader.txt" >&2 || true
+            exit 1
+        fi
+        echo "=== scx-isolation-$repetition ===" >>"$output_dir/loader.txt"
+        run_case "scx-isolation-$repetition" "$hog_threads" heavy "$duration" --pin "$pin_dir" --ext-policy "$ext_policy"
 
     if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
         echo "error: sched_ext stopped before stale-keeping run $repetition" >&2
@@ -338,10 +462,39 @@ for repetition in $(seq 1 "$repetitions"); do
         exit 1
     fi
 
-    if (( drop_burst_latest_age >= keep_burst_latest_age )); then
-        echo "error: burst stale dropping did not reduce newest-frame recovery age" >&2
+        if (( drop_burst_latest_age >= keep_burst_latest_age )); then
+            echo "error: burst stale dropping did not reduce newest-frame recovery age" >&2
+            exit 1
+        fi
+    fi
+
+    if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
+        echo "error: sched_ext stopped before normal-budget run $repetition" >&2
+        tail -n 40 "$output_dir/loader.txt" >&2 || true
         exit 1
     fi
+    echo "=== scx-budget-normal-$repetition ===" >>"$output_dir/loader.txt"
+    run_case "scx-budget-normal-$repetition" "$e3_hog_threads" off "$duration" \
+        --pin "$pin_dir" --ext-policy "$ext_policy" \
+        --vision-budget-us "$e3_normal_budget_us" \
+        --vision-work-us "$e3_vision_work_us" \
+        --vision-deadline-us "$e3_vision_deadline_us"
+    sleep 0.2
+
+    if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
+        echo "error: sched_ext stopped before low-budget run $repetition" >&2
+        tail -n 40 "$output_dir/loader.txt" >&2 || true
+        exit 1
+    fi
+    echo "=== scx-budget-low-$repetition ===" >>"$output_dir/loader.txt"
+    run_case "scx-budget-low-$repetition" "$e3_hog_threads" off "$duration" \
+        --pin "$pin_dir" --ext-policy "$ext_policy" \
+        --vision-budget-us "$e3_low_budget_us" \
+        --vision-work-us "$e3_vision_work_us" \
+        --vision-deadline-us "$e3_vision_deadline_us"
+    sleep 0.2
+    echo "=== scx-budget-end-$repetition ===" >>"$output_dir/loader.txt"
+    check_e3_budget "$repetition"
 done
 
 echo

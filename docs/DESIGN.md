@@ -60,7 +60,7 @@ flowchart LR
 
   subgraph User["Userspace control/monitor"]
     Loader["scx_slam_fresh_user\n(load/attach, pin maps)"]
-    Events["ringbuf\n(deadline miss, budget overrun, stale)"]
+    Events["ringbuf\n(deadline miss, budget overrun/demotion, stale)"]
     Loader <--> Events
   end
 

@@ -30,6 +30,9 @@
  *   --hog <N>            number of hog threads (default 1)
  *   --camera-burst-count <N>  delay N camera frames, then release together
  *   --camera-burst-at-ms <N>  burst delivery offset (default 3000)
+ *   --vision-budget-us <N>     vision FE per-job CPU budget (default 12000)
+ *   --vision-work-us <N>       fixed vision FE work; 0 keeps 6-10ms pattern
+ *   --vision-deadline-us <N>   vision FE relative deadline (default 33000)
  *
  * Recommended runs:
  *   # baseline (CFS):
@@ -435,7 +438,7 @@ static uint64_t dropped_stale_total(const StageStats &stats)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N] [--camera-burst-count N] [--camera-burst-at-ms N]\n",
+        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N] [--camera-burst-count N] [--camera-burst-at-ms N] [--vision-budget-us N] [--vision-work-us N] [--vision-deadline-us N]\n",
         argv0);
 }
 
@@ -476,6 +479,9 @@ int main(int argc, char **argv)
     int hog_n = 1;
     int camera_burst_count = 0;
     int camera_burst_at_ms = 3000;
+    uint64_t vision_budget_us = 12'000;
+    uint64_t vision_work_us = 0;
+    uint64_t vision_deadline_us = 33'000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
@@ -496,6 +502,37 @@ int main(int argc, char **argv)
             camera_burst_count = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--camera-burst-at-ms") && i + 1 < argc) {
             camera_burst_at_ms = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--vision-budget-us") && i + 1 < argc) {
+            char *end = nullptr;
+            errno = 0;
+            unsigned long long value = strtoull(argv[++i], &end, 10);
+            if (errno || !end || *end != '\0') {
+                fprintf(stderr, "error: vision budget must be an integer number of microseconds\n");
+                return 1;
+            }
+            if (value > UINT64_MAX / 1'000ULL) {
+                fprintf(stderr, "error: vision budget is too large\n");
+                return 1;
+            }
+            vision_budget_us = (uint64_t)value;
+        } else if (!strcmp(argv[i], "--vision-work-us") && i + 1 < argc) {
+            char *end = nullptr;
+            errno = 0;
+            unsigned long long value = strtoull(argv[++i], &end, 10);
+            if (errno || !end || *end != '\0') {
+                fprintf(stderr, "error: vision work must be an integer number of microseconds\n");
+                return 1;
+            }
+            vision_work_us = (uint64_t)value;
+        } else if (!strcmp(argv[i], "--vision-deadline-us") && i + 1 < argc) {
+            char *end = nullptr;
+            errno = 0;
+            unsigned long long value = strtoull(argv[++i], &end, 10);
+            if (errno || !end || *end != '\0' || value > UINT64_MAX / 1'000ULL) {
+                fprintf(stderr, "error: vision deadline must be a valid number of microseconds\n");
+                return 1;
+            }
+            vision_deadline_us = (uint64_t)value;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -551,7 +588,8 @@ int main(int argc, char **argv)
                        5'000'000ULL, 10'000'000ULL, 300'000ULL, 0, 0 };
 
     StageCfg cfg_vis { "vision_fe",  SLAM_STAGE_VISION_FE,   SLAM_SCX_CLASS_FE,
-                       33'000'000ULL, 66'000'000ULL, 12'000'000ULL, 0, 0 };
+                       vision_deadline_us * 1'000ULL, 66'000'000ULL,
+                       vision_budget_us * 1'000ULL, 0, 0 };
 
     StageCfg cfg_est { "state_est",  SLAM_STAGE_STATE_EST,   SLAM_SCX_CLASS_FE,
                        33'000'000ULL, 66'000'000ULL, 12'000'000ULL, 0, 0 };
@@ -594,7 +632,9 @@ int main(int argc, char **argv)
                       duration_s, &workload_start_ns, &pid_imu);
 
     std::thread t_vis(stage_worker, &q_cam, &q_vis, cfg_vis, ext_policy, drop_stale, &running, &st_vis,
-                      [](const WorkItem &w) -> uint64_t {
+                      [vision_work_us](const WorkItem &w) -> uint64_t {
+                          if (vision_work_us)
+                              return vision_work_us;
                           return 6000 + (w.seq % 5) * 1000; /* 6-10ms */
                       },
                       &pid_vis);
@@ -768,6 +808,10 @@ int main(int argc, char **argv)
            (unsigned long long)(camera_burst_count > 0
                ? camera_burst_delivery_index * camera_period_ns / 1'000'000ULL
                : 0));
+    printf("configuration: vision_budget_us=%llu vision_work_us=%llu vision_deadline_us=%llu\n",
+           (unsigned long long)vision_budget_us,
+           (unsigned long long)vision_work_us,
+           (unsigned long long)vision_deadline_us);
     printf("imu_prop:   processed=%llu late=%llu (%.1f%%)\n",
            (unsigned long long)st_imu.processed,
            (unsigned long long)st_imu.late,
@@ -846,6 +890,7 @@ int main(int argc, char **argv)
         printf("  sudo taskset -c 0 ./build/slam_pipeline_demo --pin %s --lidar heavy --hog 2 --duration %d --ext-policy 7\n", pin_dir, duration_s);
     printf("Test stale shedding separately with --hog 0, with and without --drop-stale 1.\n");
     printf("Test burst recovery with --camera-burst-count 12 --camera-burst-at-ms 3000.\n");
+    printf("Test budget demotion with --vision-work-us 18000 --vision-deadline-us 20000 --vision-budget-us 1000.\n");
 
     slamqos_close(&pub);
     return 0;

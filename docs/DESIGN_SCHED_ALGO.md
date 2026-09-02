@@ -77,9 +77,12 @@ In `stopping(p, runnable)`:
 - `delta = now - last_start_ns`
 - `exec_ns_in_job += delta`
 
-If `exec_ns_in_job > budget_ns` and `budget_ns != 0`, set `overrun=1` and emit an event.
+If `exec_ns_in_job > budget_ns` and `budget_ns != 0`, set `overrun=1` and emit
+a budget-overrun event.
 
-Then on the next `enqueue` for this task/job we demote it to DSQ_BE.
+Then on the next `enqueue` for this task/job, demote it to DSQ_BE and emit a
+separate budget-demotion event. The two events distinguish detecting an
+overrun at a scheduling boundary from applying the lower-priority route.
 
 ---
 

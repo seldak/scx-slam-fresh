@@ -67,6 +67,7 @@ enum slam_evt_kind : uint32_t {
     SLAM_EVT_DEADLINE_MISS   = 1,
     SLAM_EVT_BUDGET_OVERRUN  = 2,
     SLAM_EVT_STALE_DEMOTION  = 3,
+    SLAM_EVT_BUDGET_DEMOTION = 4,
 };
 
 struct slam_evt {

@@ -96,6 +96,10 @@ This pins (at least) the following maps:
 - `--camera-burst-count N` delays `N` camera frames and releases them together
   with their original timestamps
 - `--camera-burst-at-ms N` selects the approximate burst delivery offset
+- `--vision-budget-us N` sets the vision front-end CPU budget
+- `--vision-work-us N` selects a fixed vision compute cost; `0` keeps the
+  default 6-10ms pattern
+- `--vision-deadline-us N` sets the vision relative deadline
 - `--duration S` controls run length
 
 
@@ -150,12 +154,18 @@ Run the complete matrix, capture its environment, and save each run's output wit
 sudo scripts/run_single_core_eval.sh
 ```
 
+Run only the focused E3 budget-misconfiguration pair with:
+```bash
+sudo env EVAL_SCOPE=e3 scripts/run_single_core_eval.sh
+```
+
 The scheduler now has a dedicated `DSQ_IMU` lane. Results from before that change are not quoted here because they are not comparable to the current policy. Re-run the matrix above before reporting miss-rate improvements. Compare:
 - `imu_prop`, `vision_fe`, and `state_est` deadline-miss percentages
 - `lidar_reg` and `mapping_be` consumer-dropped and queue-evicted stale counts
 - pending backlogs in the matched stale-keeping and stale-dropping runs
 - work completed by stale back-end stages with and without `--drop-stale 1`
 - burst frames processed, newest burst sequence, and newest-frame completion age
+- vision budget-overrun and budget-demotion events under the E3 workload
 
 Known limitation: the dedicated IMU lane has strict dispatch priority and can starve lower lanes if IMU utilization is misconfigured. The overload matrix is intended to quantify that tradeoff.
 
