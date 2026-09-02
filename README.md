@@ -98,7 +98,7 @@ This pins (at least) the following maps:
 - `--camera-burst-at-ms N` selects the approximate burst delivery offset
 - `--vision-budget-us N` sets the vision front-end CPU budget
 - `--vision-work-us N` selects a fixed vision compute cost; `0` keeps the
-  default 6-10ms pattern
+  default 3-5ms pattern
 - `--vision-deadline-us N` sets the vision relative deadline
 - `--duration S` controls run length
 
@@ -129,15 +129,18 @@ sudo ./build/slam_pipeline_demo --pin /sys/fs/bpf/scx_slam_fresh
 ## Evaluation (single-core overload)
 The harness first sweeps LiDAR light, mid, and heavy under identical single-core
 CFS conditions and asserts sustainable, borderline, and overloaded registration
-regimes. It then runs three matched single-core workloads. The deadline-isolation
+regimes. Synthetic compute consumes the requested per-thread CPU time; release,
+deadline, and freshness timestamps remain on `CLOCK_MONOTONIC`. The harness then
+runs four matched single-core workloads. The deadline-isolation
 pair uses LiDAR heavy (300k pts @10Hz), camera (30Hz), IMU (200Hz), and two CPU
 hogs to compare CFS with scx_slam_fresh. The stale-shedding pair uses the same
 sensor load under scx_slam_fresh with zero hogs, comparing stale retention
 against `--drop-stale 1`. Zero hogs leaves enough back-end progress for stale
 shedding to be observable. The burst-recovery pair delays 12 camera frames, then
 verifies that stale dropping preserves the newest frame while reducing obsolete
-work and newest-frame completion age. Results depend on the kernel, hardware,
-and Git revision; the benchmark script records all three.
+work and newest-frame completion age. The budget pair compares correctly sized
+and undersized vision budgets. Results depend on the kernel, hardware, and Git
+revision; the benchmark script records all three.
 
 Commands:
 ```bash
@@ -154,6 +157,11 @@ Run the complete matrix, capture its environment, and save each run's output wit
 sudo scripts/run_single_core_eval.sh
 ```
 
+Run only the E0 LiDAR calibration sweep with:
+```bash
+sudo env EVAL_SCOPE=e0 scripts/run_single_core_eval.sh
+```
+
 Run only the focused E3 budget-misconfiguration pair with:
 ```bash
 sudo env EVAL_SCOPE=e3 scripts/run_single_core_eval.sh
@@ -161,6 +169,7 @@ sudo env EVAL_SCOPE=e3 scripts/run_single_core_eval.sh
 
 The scheduler now has a dedicated `DSQ_IMU` lane. Results from before that change are not quoted here because they are not comparable to the current policy. Re-run the matrix above before reporting miss-rate improvements. Compare:
 - `imu_prop`, `vision_fe`, and `state_est` deadline-miss percentages
+- per-stage `cpu_us`, which is accumulated with `CLOCK_THREAD_CPUTIME_ID`
 - `lidar_reg` and `mapping_be` consumer-dropped and queue-evicted stale counts
 - pending backlogs in the matched stale-keeping and stale-dropping runs
 - work completed by stale back-end stages with and without `--drop-stale 1`

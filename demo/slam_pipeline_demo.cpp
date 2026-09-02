@@ -31,7 +31,7 @@
  *   --camera-burst-count <N>  delay N camera frames, then release together
  *   --camera-burst-at-ms <N>  burst delivery offset (default 3000)
  *   --vision-budget-us <N>     vision FE per-job CPU budget (default 12000)
- *   --vision-work-us <N>       fixed vision FE work; 0 keeps 6-10ms pattern
+ *   --vision-work-us <N>       fixed vision FE work; 0 keeps 3-5ms pattern
  *   --vision-deadline-us <N>   vision FE relative deadline (default 33000)
  *
  * Recommended runs:
@@ -75,6 +75,13 @@ static uint64_t now_ns()
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static uint64_t thread_cpu_ns()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 static void sleep_until_ns(uint64_t target_ns)
 {
     struct timespec ts;
@@ -86,9 +93,9 @@ static void sleep_until_ns(uint64_t target_ns)
 
 static void busy_work_us(uint64_t us)
 {
-    uint64_t start = now_ns();
+    uint64_t start = thread_cpu_ns();
     uint64_t dur = us * 1000ULL;
-    while (now_ns() - start < dur) {
+    while (thread_cpu_ns() - start < dur) {
         asm volatile("" ::: "memory");
     }
 }
@@ -136,6 +143,7 @@ struct StageCfg {
 struct StageStats {
     uint64_t processed{0};
     uint64_t late{0};
+    uint64_t cpu_ns{0};
     uint64_t stale_seen{0};
     uint64_t dropped_stale{0};
     uint64_t queue_evicted_stale{0};
@@ -324,8 +332,11 @@ static void stage_worker(BlockingQueue<WorkItem> *in,
         }
 
         uint64_t work_us = compute_us_fn ? compute_us_fn(w) : 0;
-        if (work_us)
+        if (work_us) {
+            uint64_t cpu_start_ns = thread_cpu_ns();
             busy_work_us(work_us);
+            stats->cpu_ns += thread_cpu_ns() - cpu_start_ns;
+        }
 
         uint64_t t1 = now_ns();
         stats->processed++;
@@ -387,10 +398,11 @@ static void imu_thread(const StageCfg &cfg,
         /* Sleep until the next tick (absolute). */
         sleep_until_ns(next);
 
-        uint64_t start = now_ns();
         uint64_t dl_abs = (cfg.deadline_rel_ns) ? (next + cfg.deadline_rel_ns) : 0;
 
+        uint64_t cpu_start_ns = thread_cpu_ns();
         busy_work_us(150); /* ~0.15ms */
+        stats->cpu_ns += thread_cpu_ns() - cpu_start_ns;
 
         uint64_t end = now_ns();
         stats->processed++;
@@ -455,7 +467,7 @@ static void wait_for_pid(std::atomic<uint64_t> &pid, const char *name)
 static double lidar_reg_k_for_mode(const std::string &mode)
 {
     if (mode == "light") return 0.01;
-    if (mode == "mid")   return 0.02;
+    if (mode == "mid")   return 0.017;
     if (mode == "heavy") return 0.05;
     return 0.0; // off/unknown
 }
@@ -635,13 +647,13 @@ int main(int argc, char **argv)
                       [vision_work_us](const WorkItem &w) -> uint64_t {
                           if (vision_work_us)
                               return vision_work_us;
-                          return 6000 + (w.seq % 5) * 1000; /* 6-10ms */
+                          return 3000 + (w.seq % 5) * 500; /* 3-5ms */
                       },
                       &pid_vis);
 
     std::thread t_est(stage_worker, &q_vis, &q_map, cfg_est, ext_policy, drop_stale, &running, &st_est,
                       [](const WorkItem &w) -> uint64_t {
-                          return 5000 + (w.seq % 5) * 1000; /* 5-9ms */
+                          return 2000 + (w.seq % 5) * 500; /* 2-4ms */
                       },
                       &pid_est);
 
@@ -668,8 +680,7 @@ int main(int argc, char **argv)
 
     std::thread t_map(stage_worker, &q_map, nullptr, cfg_map, ext_policy, drop_stale, &running, &st_map,
                       [](const WorkItem &w) -> uint64_t {
-                          (void)w;
-                          return 20000 + (w.seq % 9) * 5000; /* 20-60ms */
+                          return 1000 + (w.seq % 5) * 500; /* 1-3ms */
                       },
                       &pid_map);
 
@@ -812,16 +823,18 @@ int main(int argc, char **argv)
            (unsigned long long)vision_budget_us,
            (unsigned long long)vision_work_us,
            (unsigned long long)vision_deadline_us);
-    printf("imu_prop:   processed=%llu late=%llu (%.1f%%)\n",
+    printf("imu_prop:   processed=%llu late=%llu (%.1f%%) cpu_us=%llu\n",
            (unsigned long long)st_imu.processed,
            (unsigned long long)st_imu.late,
-           pct(st_imu.late, st_imu.processed));
+           pct(st_imu.late, st_imu.processed),
+           (unsigned long long)(st_imu.cpu_ns / 1000ULL));
 
-    printf("vision_fe:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu burst_processed=%llu burst_latest_seq=%llu burst_latest_age_us=%llu\n",
+    printf("vision_fe:  dequeued=%llu processed=%llu late=%llu (%.1f%%) cpu_us=%llu stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu burst_processed=%llu burst_latest_seq=%llu burst_latest_age_us=%llu\n",
            (unsigned long long)(st_vis.processed + st_vis.dropped_stale),
            (unsigned long long)st_vis.processed,
            (unsigned long long)st_vis.late,
            pct(st_vis.late, st_vis.processed),
+           (unsigned long long)(st_vis.cpu_ns / 1000ULL),
            (unsigned long long)stale_seen_total(st_vis),
            (unsigned long long)dropped_stale_total(st_vis),
            (unsigned long long)st_vis.dropped_stale,
@@ -831,11 +844,12 @@ int main(int argc, char **argv)
            (unsigned long long)st_vis.burst_latest_seq,
            (unsigned long long)(st_vis.burst_latest_age_ns / 1000ULL));
 
-    printf("state_est:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu burst_processed=%llu burst_latest_seq=%llu burst_latest_age_us=%llu\n",
+    printf("state_est:  dequeued=%llu processed=%llu late=%llu (%.1f%%) cpu_us=%llu stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu burst_processed=%llu burst_latest_seq=%llu burst_latest_age_us=%llu\n",
            (unsigned long long)(st_est.processed + st_est.dropped_stale),
            (unsigned long long)st_est.processed,
            (unsigned long long)st_est.late,
            pct(st_est.late, st_est.processed),
+           (unsigned long long)(st_est.cpu_ns / 1000ULL),
            (unsigned long long)stale_seen_total(st_est),
            (unsigned long long)dropped_stale_total(st_est),
            (unsigned long long)st_est.dropped_stale,
@@ -846,11 +860,12 @@ int main(int argc, char **argv)
            (unsigned long long)(st_est.burst_latest_age_ns / 1000ULL));
 
     if (lidar_points) {
-        printf("lidar_pre:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u\n",
+        printf("lidar_pre:  dequeued=%llu processed=%llu late=%llu (%.1f%%) cpu_us=%llu stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u\n",
                (unsigned long long)(st_lpre.processed + st_lpre.dropped_stale),
                (unsigned long long)st_lpre.processed,
                (unsigned long long)st_lpre.late,
                pct(st_lpre.late, st_lpre.processed),
+               (unsigned long long)(st_lpre.cpu_ns / 1000ULL),
                (unsigned long long)stale_seen_total(st_lpre),
                (unsigned long long)dropped_stale_total(st_lpre),
                (unsigned long long)st_lpre.dropped_stale,
@@ -858,11 +873,12 @@ int main(int argc, char **argv)
                pending_lpre,
                lidar_points);
 
-        printf("lidar_reg:  dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u reg_k=%.3f reg_job_us=%llu\n",
+        printf("lidar_reg:  dequeued=%llu processed=%llu late=%llu (%.1f%%) cpu_us=%llu stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu points=%u reg_k=%.3f reg_job_us=%llu\n",
                (unsigned long long)(st_lreg.processed + st_lreg.dropped_stale),
                (unsigned long long)st_lreg.processed,
                (unsigned long long)st_lreg.late,
                pct(st_lreg.late, st_lreg.processed),
+               (unsigned long long)(st_lreg.cpu_ns / 1000ULL),
                (unsigned long long)stale_seen_total(st_lreg),
                (unsigned long long)dropped_stale_total(st_lreg),
                (unsigned long long)st_lreg.dropped_stale,
@@ -873,11 +889,12 @@ int main(int argc, char **argv)
                (unsigned long long)lidar_reg_work_us(lidar_points, lidar_k));
     }
 
-    printf("mapping_be: dequeued=%llu processed=%llu late=%llu (%.1f%%) stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",
+    printf("mapping_be: dequeued=%llu processed=%llu late=%llu (%.1f%%) cpu_us=%llu stale_seen=%llu dropped_stale=%llu consumer_dropped_stale=%llu queue_evicted_stale=%llu pending=%zu\n",
            (unsigned long long)(st_map.processed + st_map.dropped_stale),
            (unsigned long long)st_map.processed,
            (unsigned long long)st_map.late,
            pct(st_map.late, st_map.processed),
+           (unsigned long long)(st_map.cpu_ns / 1000ULL),
            (unsigned long long)stale_seen_total(st_map),
            (unsigned long long)dropped_stale_total(st_map),
            (unsigned long long)st_map.dropped_stale,
@@ -890,7 +907,7 @@ int main(int argc, char **argv)
         printf("  sudo taskset -c 0 ./build/slam_pipeline_demo --pin %s --lidar heavy --hog 2 --duration %d --ext-policy 7\n", pin_dir, duration_s);
     printf("Test stale shedding separately with --hog 0, with and without --drop-stale 1.\n");
     printf("Test burst recovery with --camera-burst-count 12 --camera-burst-at-ms 3000.\n");
-    printf("Test budget demotion with --vision-work-us 18000 --vision-deadline-us 20000 --vision-budget-us 1000.\n");
+    printf("Test budget demotion with --vision-work-us 12000 --vision-deadline-us 30000 --vision-budget-us 1000.\n");
 
     slamqos_close(&pub);
     return 0;

@@ -15,10 +15,10 @@ stale_hog_threads=${STALE_HOG_THREADS:-0}
 burst_count=${BURST_COUNT:-12}
 burst_at_ms=${BURST_AT_MS:-3000}
 e3_hog_threads=${E3_HOG_THREADS:-2}
-e3_normal_budget_us=${E3_NORMAL_BUDGET_US:-24000}
+e3_normal_budget_us=${E3_NORMAL_BUDGET_US:-16000}
 e3_low_budget_us=${E3_LOW_BUDGET_US:-1000}
-e3_vision_work_us=${E3_VISION_WORK_US:-18000}
-e3_vision_deadline_us=${E3_VISION_DEADLINE_US:-20000}
+e3_vision_work_us=${E3_VISION_WORK_US:-12000}
+e3_vision_deadline_us=${E3_VISION_DEADLINE_US:-30000}
 ext_policy=${EXT_POLICY:-7}
 repetitions=${REPETITIONS:-1}
 eval_scope=${EVAL_SCOPE:-all}
@@ -32,10 +32,10 @@ Usage: sudo scripts/run_single_core_eval.sh
 
 Optional environment variables:
   CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 STALE_HOG_THREADS=0 BURST_COUNT=12
-  BURST_AT_MS=3000 E3_HOG_THREADS=2 E3_NORMAL_BUDGET_US=24000 E3_LOW_BUDGET_US=1000
-  E3_VISION_WORK_US=18000
-  E3_VISION_DEADLINE_US=20000
-  EXT_POLICY=7 REPETITIONS=1 EVAL_SCOPE=all|e3
+  BURST_AT_MS=3000 E3_HOG_THREADS=2 E3_NORMAL_BUDGET_US=16000 E3_LOW_BUDGET_US=1000
+  E3_VISION_WORK_US=12000
+  E3_VISION_DEADLINE_US=30000
+  EXT_POLICY=7 REPETITIONS=1 EVAL_SCOPE=all|e0|e3
   OUTPUT_DIR=/path/to/results
 EOF
 }
@@ -108,7 +108,7 @@ read_metric() {
 
 check_e0_sweep() {
     local repetition=$1
-    local mode result_file generated processed pending stale reg_job_us
+    local mode result_file generated processed pending stale reg_job_us cpu_us expected_cpu_us
     local light_reg_job_us mid_reg_job_us heavy_reg_job_us
 
     for mode in light mid heavy; do
@@ -118,13 +118,21 @@ check_e0_sweep() {
         pending=$(read_metric lidar_reg pending "$result_file")
         stale=$(read_metric lidar_reg stale_seen "$result_file")
         reg_job_us=$(read_metric lidar_reg reg_job_us "$result_file")
+        cpu_us=$(read_metric lidar_reg cpu_us "$result_file")
 
-        for metric in "$generated" "$processed" "$pending" "$stale" "$reg_job_us"; do
+        for metric in "$generated" "$processed" "$pending" "$stale" \
+                      "$reg_job_us" "$cpu_us"; do
             if [[ ! $metric =~ ^[0-9]+$ ]]; then
                 echo "error: could not parse E0 $mode sweep metrics" >&2
                 return 1
             fi
         done
+
+        expected_cpu_us=$((processed * reg_job_us))
+        if (( cpu_us < expected_cpu_us || cpu_us > expected_cpu_us * 105 / 100 )); then
+            echo "error: E0 $mode registration did not consume its requested thread CPU time" >&2
+            return 1
+        fi
 
         case $mode in
             light)
@@ -270,8 +278,8 @@ if (( $# != 0 )); then
     exit 2
 fi
 
-if [[ $eval_scope != all && $eval_scope != e3 ]]; then
-    echo "error: EVAL_SCOPE must be 'all' or 'e3'" >&2
+if [[ $eval_scope != all && $eval_scope != e0 && $eval_scope != e3 ]]; then
+    echo "error: EVAL_SCOPE must be 'all', 'e0', or 'e3'" >&2
     exit 2
 fi
 
@@ -315,6 +323,9 @@ trap cleanup EXIT INT TERM
 if [[ $eval_scope == all ]]; then
     case_count=$((repetitions * 11))
     workload_seconds=$((repetitions * (8 * duration + 3 * sweep_duration)))
+elif [[ $eval_scope == e0 ]]; then
+    case_count=$((repetitions * 3))
+    workload_seconds=$((repetitions * 3 * sweep_duration))
 else
     case_count=$((repetitions * 2))
     workload_seconds=$((repetitions * 2 * duration))
@@ -347,15 +358,23 @@ loader_sha256=$(sha256sum "$loader_bin" | awk '{print $1}')
 bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{print $1}')
 EOF
 
-if [[ $eval_scope == all ]]; then
+if [[ $eval_scope == all || $eval_scope == e0 ]]; then
     for repetition in $(seq 1 "$repetitions"); do
         for mode in light mid heavy; do
             run_case "cfs-sweep-$mode-$repetition" 0 "$mode" "$sweep_duration" --no-hints
         done
         check_e0_sweep "$repetition"
 
-        run_case "cfs-isolation-$repetition" "$hog_threads" heavy "$duration" --no-hints
+        if [[ $eval_scope == all ]]; then
+            run_case "cfs-isolation-$repetition" "$hog_threads" heavy "$duration" --no-hints
+        fi
     done
+fi
+
+if [[ $eval_scope == e0 ]]; then
+    echo
+    echo "Benchmark complete. Results: $output_dir"
+    exit 0
 fi
 
 mkdir -p -- "$pin_dir"

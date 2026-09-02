@@ -6,13 +6,16 @@
 - deadline miss rate
 - stale processing rate (age > stale_ns)
 - dropped stale rate (`dropped_stale / stale_seen`)
-- CPU time spent
+- CPU time spent (`cpu_us`)
 
 `processed` excludes expired items. `consumer_dropped_stale` counts items rejected
 after dequeue, while `queue_evicted_stale` counts expired backlog removed under the
 queue lock by a producer. The reported `dropped_stale` is their sum, and
 `dequeued = processed + consumer_dropped_stale`. `pending` exposes work left in
-the queue when the measurement ends.
+the queue when the measurement ends. Synthetic compute waits on
+`CLOCK_THREAD_CPUTIME_ID`, and `cpu_us` sums that thread CPU time around each
+job. Release time, deadlines, staleness, and completion latency remain wall-age
+measurements on `CLOCK_MONOTONIC`, matching BPF `bpf_ktime_get_ns()`.
 
 ### System level
 - total throughput (frames/s)
@@ -52,6 +55,10 @@ Sensor generators share one absolute start epoch, use absolute release times, an
   and pending registration work.
 
 The root benchmark runs and enforces this sweep before attaching sched_ext.
+Run only this calibration with:
+```bash
+sudo env EVAL_SCOPE=e0 scripts/run_single_core_eval.sh
+```
 
 ### ~~E1: Heavy LiDAR overload~~ — completed
 
@@ -103,29 +110,32 @@ One root run on 2026-09-02 using kernel `7.0.0-30-generic`, CPU 0, 15-second
 cases, and one repetition produced:
 
 - E0 sweep: light and mid completed 80/80 registration jobs with no stale or
-  pending work; heavy completed 29/80, observed 27 stale jobs, and left 51
-  pending. Nominal registration costs were 15804us, 59583us, and 280919us.
-- E1 isolation: state-estimator deadline misses were 47.7% under CFS and 0.0%
+  pending work; heavy completed 15/80, observed 14 stale jobs, and left 65
+  pending. Nominal registration costs were 15804us, 51846us, and 280919us.
+- E1 isolation: state-estimator deadline misses were 58.8% under CFS and 0.0%
   under scx_slam_fresh.
-- E1 stale shedding: LiDAR-registration pending backlog fell from 97 to 3;
-  64 expired queued jobs were evicted.
+- E1 stale shedding: LiDAR-registration pending backlog fell from 122 to 3;
+  96 expired queued jobs were evicted.
 - E2 burst recovery: both policies preserved newest burst frame 92. Stale
   dropping processed 2 rather than 12 burst frames and reduced its
-  state-estimate completion age from 109322us to 25149us.
-- E3 budget validation: with fixed 18ms vision work and a 20ms deadline, the
-  correctly sized 24ms budget missed 5/455 deadlines; a 1ms budget produced
-  455 overrun events, 455 confirmed BE-demotion events, and 126/455 misses.
+  state-estimate completion age from 114387us to 15374us.
+- E3 budget validation: with fixed 12ms vision CPU and a 30ms deadline, the
+  correctly sized 16ms budget completed 455/455 jobs with no misses. A 1ms
+  budget produced 14 overrun events, 14 confirmed BE-demotion events, completed
+  14/455 jobs with 2 misses, and left 441 pending.
 
-These figures are a development verification snapshot, not a multi-run
-performance claim. Reproduce them with the benchmark command above; the script
-records the environment, revision, binary hashes, and per-case output in its
-chosen results directory.
+This snapshot supersedes all results produced before synthetic work switched
+from elapsed wall time to thread CPU time; the two workload models are not
+comparable. These figures remain a development verification snapshot, not a
+multi-run performance claim. Reproduce them with the benchmark command above;
+the script records the environment, revision, binary hashes, and per-case
+output in its chosen results directory.
 
 ### ~~E3: Budget misconfiguration~~ — completed
 
-- Compare matched scx_slam_fresh runs with fixed 18ms vision work and a 20ms
+- Compare matched scx_slam_fresh runs with fixed 12ms vision CPU and a 30ms
   relative deadline.
-- Require the 24ms control budget to produce no overrun or demotion events.
+- Require the 16ms control budget to produce no overrun or demotion events.
 - Require a 1ms budget to produce both overrun and confirmed BE-demotion
   events, while increasing vision deadline misses.
 - Require the control run to drain every offered vision job so startup
