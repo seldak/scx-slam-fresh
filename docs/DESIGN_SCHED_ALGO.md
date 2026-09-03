@@ -22,7 +22,7 @@ For each runnable task `p`, userspace provides `hint(p)`:
 - `deadline_ts`: absolute deadline
 - `stale_ns`: freshness window
 - `budget_ns`: compute budget for this job
-- `slice_ns`: requested slice
+- `slice_ns`: requested slice; API `0` resolves to `SCX_SLICE_DFL` (20 ms), not kernel `slice=0` (keep residual, or 1 ns if exhausted).
 
 ### Scheduler-maintained state
 For each task `p`, we keep:

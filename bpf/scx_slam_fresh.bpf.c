@@ -133,6 +133,16 @@ static __always_inline bool scx_move_to_local(u64 dsq_id)
 /* Demote tasks that are already past their deadline by this grace period. */
 #define DEADLINE_GRACE_NS 1000000ULL /* 1ms */
 
+static __always_inline u64 enqueue_slice_ns(const struct slam_task_hint *h)
+{
+    /* Kernel insertion with slice=0 keeps the residual, or uses 1ns if it
+     * is exhausted. Translate our API's 0=default to an explicit finite
+     * SCX_SLICE_DFL; passing zero does not refill the kernel default.
+     * A missing hint uses the same default, including the no-state fallback.
+     */
+    return h && h->slice_ns ? h->slice_ns : SCX_SLICE_DFL;
+}
+
 
 /* -----------------------------
  * Maps
@@ -281,7 +291,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
 
     if (!st) {
         /* Should be rare (state is created in init_task), but never stall. */
-        scx_insert_vtime(p, DSQ_BE, 0, now_ns, enq_flags);
+        scx_insert_vtime(p, DSQ_BE, enqueue_slice_ns(h), now_ns, enq_flags);
         return;
     }
 
@@ -303,7 +313,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
         st->last_job_id = h->job_id;
     }
 
-    u64 slice = h->slice_ns; /* 0 => kernel default */
+    u64 slice = enqueue_slice_ns(h);
 
     /*
      * Tier-0 lane: IMU / propagation thread.
