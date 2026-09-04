@@ -248,7 +248,13 @@ starting 3% control for the same repetition and preemption variant. There is no
 combined BE ratio: cheap mapping completions must not conceal lost registration
 service. A zero-progress control has an undefined ratio.
 
-#### IMU preemption probe — hypothesis test, not policy selection
+#### Diagnostic chronology — retained, not current work
+
+The probe subsections below preserve the investigation that led to the validated
+regimes. Their “next” steps are historical sequencing, not recommendations to
+rerun probes before E1–E3. All diagnostic switches remain default-off.
+
+#### IMU preemption probe — historical hypothesis test
 
 The first, drain-inclusive pilot showed roughly 50% whole-run IMU CPU share
 once IMU became persistently late. That is not proof that 60% offered IMU work
@@ -288,19 +294,20 @@ over the **whole case**. Do not mistake sample counts for enqueue frequencies
 or whole-case counters for fixed-window counts. Loss is explicit; tracing is
 disabled outside the opt-in probe.
 
-Compare `imu_window_cpu_pct`, `imu_total_cpu_pct` (total compute / elapsed since
-epoch), fixed-window misses, split BE rates and late enqueue routes. If always
+The comparison used `imu_window_cpu_pct`, `imu_total_cpu_pct` (total compute /
+elapsed since epoch), fixed-window misses, split BE rates and late enqueue routes. If always
 preempt changes the 60% row, that supports the slice-sharing hypothesis; if it
 does not, inspect other causes rather than selecting admission control. No
 thresholds are frozen, no regime is assigned, and no slack stealing, lower-lane
-floor or admission knob is introduced. E4 remains open pending the probe and
-fresh-repetition validation. Older drain-inclusive logs are rejected by the
-new fixed-window parser rather than silently reinterpreted.
+floor or admission knob was introduced. E4 remained open at this point in the
+investigation; the later seeded grid validated the observational regimes. Older
+drain-inclusive logs are rejected by the fixed-window parser rather than silently
+reinterpreted.
 
-#### Execution probe — blocked time versus runnable waiting
+#### Execution probe — historical blocked-versus-runnable diagnosis
 
-If the enqueue-path A/B does not recover IMU service, the next observation is
-execution, not another policy mechanism:
+When the enqueue-path A/B did not recover IMU service, the next observation in
+the investigation was execution, not another policy mechanism:
 
 ```bash
 sudo python3 scripts/run_e4_eval.py --execution-probe
@@ -360,7 +367,7 @@ ambiguous wake/switch races invalidate attribution; raw evidence is retained.
 The trace consumer is pinned to allowed CPUs other than the measured CPU, and
 its command/affinity is recorded. Instrumentation still has overhead: compare
 the newly traced controls and do not treat this as a replacement performance
-baseline. No cause label, E4 pass, threshold, or admission verdict is generated.
+baseline. No cause label, E4 pass, threshold, or admission verdict was generated.
 
 #### Zero-slice translation A/B — implementation check only
 
@@ -395,10 +402,10 @@ translation correction, not a recovered service band or E4 pass. Any follow-up
 thresholds on the old 1ns matrix. This is not a commitment to retain custom
 tracing: prefer `perf sched`/standard switch tracing for subsequent gap analysis.
 
-#### Post-fix refinement — repetitions without tracing
+#### Post-fix refinement — historical repetitions without tracing
 
-After the slice translation A/B, refine the critical-stage transition with
-60/65/70/75/80% IMU work and three repetitions:
+After the slice translation A/B, the investigation refined the critical-stage
+transition with 60/65/70/75/80% IMU work and three repetitions:
 
 ```bash
 sudo python3 scripts/run_e4_eval.py --costs 150,3000,3250,3500,3750,4000 --repetitions 3
@@ -415,9 +422,9 @@ Read IMU, vision and estimator completed/late/unfinished counts together with
 per-stage CPU. Keep registration and mapping ratios separate, and include
 LiDAR preprocessing completed/late counts. At 80%, compare estimator arrivals
 and pending/in-flight work against vision output: a queued estimator job is
-not a missing handoff. These repetitions remain exploratory, not independent
+not a missing handoff. These repetitions were exploratory, not independent
 validation of frozen thresholds. No safe band, mechanism choice, or E4 pass
-is implied.
+was implied.
 
 #### Estimator transition probe — standard scheduler timeline plus lane records
 
@@ -470,10 +477,10 @@ scheduler events do not have a loss counter, so “first observed” is delibera
 not called “proven earliest.” All instrumentation is default-off. This probe
 changes no hints, dispatch logic, lane policy, workload, threshold, or E4 status.
 
-#### Grace A/B — first-miss falsification probe
+#### Grace A/B — historical first-miss falsification probe
 
-The separate 65/70 capture is superseded once that transition has reproduced.
-The next falsification probe is the global late-demotion grace A/B:
+Once the separate 65/70 capture reproduced the transition, the next
+falsification probe was the global late-demotion grace A/B:
 
 ```bash
 sudo python3 scripts/run_e4_eval.py --grace-probe
@@ -494,16 +501,17 @@ estimator's recovery after its first miss.
 
 The A/B does not define success as a lower aggregate miss count. It asks two
 narrow questions: whether estimator job 4 remains FE and finishes by its
-deadline, and whether later estimator jobs remain FE. If job 4 still misses,
-zero grace is insufficient to falsify or establish the upstream budget-tripwire
-model; the next isolated probe is an earlier LiDAR-preintegration budget
-demotion. No dispatch, lane-classification, preemption, lower-lane floor,
-admission, threshold, or E4 status change is part of this run.
+deadline, and whether later estimator jobs remain FE. Job 4 still missed, so
+zero grace was insufficient to falsify or establish the upstream budget-tripwire
+model; that result led to the earlier LiDAR-preintegration budget-demotion
+probe. No dispatch, lane-classification, preemption, lower-lane floor,
+admission, threshold, or E4 status change was part of this run.
 
 #### LiDAR-pre budget A/B — upstream tripwire isolation
 
-If zero grace changes the collapse but estimator job 4 still misses, retain the
-default 1ms grace and isolate how long LiDAR preprocessing remains in FE:
+Because zero grace changed the collapse but estimator job 4 still missed, the
+investigation retained the default 1ms grace and isolated how long LiDAR
+preprocessing remained in FE:
 
 ```bash
 sudo python3 scripts/run_e4_eval.py --lidar-pre-budget-probe
@@ -534,15 +542,15 @@ route without another custom lane tracer.
 Evidence for the upstream tripwire requires vision job 4 to move toward the
 approximately 16ms 65% path, estimator job 4 to finish within 33ms while staying
 FE, observed jobs 5 onward to remain FE, and estimator unfinished work to return
-to zero. A remaining job-4 miss points to another source of the prefix delay and
-makes LiDAR-pre classification the next isolated question. The probe does not
-change the 10ms default and makes no dispatch, floor, admission, threshold, or
-E4 pass decision.
+to zero. The remaining job-4 miss pointed to another source of the prefix delay
+and made LiDAR-pre classification the subsequent isolated question. The probe
+did not change the 10ms default and made no dispatch, floor, admission,
+threshold, or E4 pass decision.
 
 #### LiDAR-pre class A/B — prefix-delay isolation
 
 Because a verified pre-deadline budget demotion did not prevent estimator job
-4's first miss, the next isolated probe changes only LiDAR-pre's initial hint
+4's first miss, the investigation next changed only LiDAR-pre's initial hint
 class:
 
 ```bash

@@ -196,46 +196,28 @@ Run only the focused E3 budget-misconfiguration pair with:
 sudo env EVAL_SCOPE=e3 scripts/run_single_core_eval.sh
 ```
 
-Prepare and run the separate exploratory E4 IMU-cost sweep with:
+Reproduce the validated E4 IMU-cost grid with:
 ```bash
 make test-e4
-python3 scripts/run_e4_eval.py --dry-run
-sudo python3 scripts/run_e4_eval.py
+sudo python3 scripts/run_e4_eval.py \
+  --costs 150,500,750,1000,3000,3250,3500,4750,5000 \
+  --repetitions 3 \
+  --seed 17
 ```
 
-It uses heavy LiDAR, no hogs, stale dropping off, and bracketing 3% IMU controls.
-It saves fixed-window per-stage rates and separate LiDAR-registration/mapping
-ratios in CSV, with post-window completions and CPU in `drain.csv`.
+The grid uses heavy LiDAR, one pinned CPU, no hogs, stale dropping off, fixed
+15-second windows, and bracketing 3% controls. On the validated kernel/pin,
+critical stages remain healthy through 65%, registration service declines
+monotonically, estimator backlog begins at 70%, and IMU saturation appears at
+95–100%. Heavy-LiDAR registration is already unsustainable in the control, so
+this is not a whole-pipeline safe band. See the
+[validated E4 regimes](docs/DESIGN_EVALUATION.md#validated-observational-regimes)
+for exact definitions, results, limitations, and the retained diagnostic history.
+Opt-in preemption, execution, perf, grace, budget, and class probes remain in the
+harness for reproduction; they are not current next steps and change no defaults.
 
-To diagnose IMU late-regime behavior without changing the default policy:
-```bash
-python3 scripts/run_e4_eval.py --preempt-probe --dry-run
-sudo python3 scripts/run_e4_eval.py --preempt-probe
-```
-
-This pairs wakeup-only and every-enqueue preemption at 150, 2000, and 3000us,
-using the same binaries and tracing both variants. The loader option
-`--imu-preempt always` is an opt-in probe, not a new policy default. No thresholds
-or admission-control verdict are implied; see [the E4 evaluation plan](docs/DESIGN_EVALUATION.md#e4-imu-lane-isolation).
-
-To measure who runs while IMU is off-CPU, with the same 15-second window:
-
-```bash
-make -j
-make test-e4 test-scheduler-mode
-sudo python3 scripts/run_e4_eval.py --execution-probe
-```
-
-This records CPU-wide switches, IMU wakeups and running/stopping callbacks,
-plus the active syscall at switch-out. It pairs 150/3000us wakeup/always runs
-with bracketing controls (six cases). Per-case `execution-summary.json` splits
-scheduled residency, blocked time, and runnable waiting; `cpu-occupancy.csv`
-identifies the tasks running in each state. Raw events, interval timelines,
-and immediate-successor slice observations are retained separately. Ring loss
-or incomplete coverage invalidates the diagnostic. No extra policy path is
-added; ordinary runs do not attach these tracepoints.
-
-The scheduler now has a dedicated `DSQ_IMU` lane. Results from before that change are not quoted here because they are not comparable to the current policy. Re-run the matrix above before reporting miss-rate improvements. Compare:
+E1–E3 results predate the corrected partial-switch build and remain withdrawn.
+Rerun that matrix before reporting those miss-rate improvements. Compare:
 - `imu_prop`, `vision_fe`, and `state_est` deadline-miss percentages
 - per-stage `cpu_us`, which is accumulated with `CLOCK_THREAD_CPUTIME_ID`
 - `lidar_reg` and `mapping_be` consumer-dropped and queue-evicted stale counts
