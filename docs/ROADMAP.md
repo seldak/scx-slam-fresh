@@ -14,8 +14,8 @@ Not planned:
   for work selection; duplicating its queue in BPF would create divergent state.
 
 ## Better pipeline integration
-- ROS2: validate the single-worker dispatcher/handoff executor against a
-  message-aware workload and bag replay.
+- ROS2: replay recorded timestamped sensor topics through the message-aware
+  fixed-worker pipeline.
 - Generalize the documented executor hint contract beyond the demo's 1:1 FIFO workers.
 
 ## Power / perf (still non-proprietary)
