@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/u_int64_multi_array.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace
@@ -191,4 +193,65 @@ TEST(FreshnessExecutor, ReplacesOnlyCompletedJobsWhileDraining)
 
   EXPECT_EQ(callback_count.load(), 3U);
   EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 0, 2, 0, 3, 0}));
+}
+
+TEST(FreshnessExecutor, TakesMessageMetadataBeforeWakingSubscriptionWorker)
+{
+  using Message = std_msgs::msg::UInt64MultiArray;
+
+  int argc = 0;
+  char ** argv = nullptr;
+  rclcpp::init(argc, argv);
+
+  auto node = std::make_shared<rclcpp::Node>("freshness_executor_message_test");
+  auto group = node->create_callback_group(
+    rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  auto sink = std::make_shared<RecordingHintSink>();
+  scx_slam_executor::FreshnessExecutor executor(sink);
+
+  std::atomic<uint64_t> callback_thread{0};
+  rclcpp::SubscriptionOptions options;
+  options.callback_group = group;
+  auto subscription = node->create_subscription<Message>(
+    "freshness_executor_message", rclcpp::QoS(10),
+    [&](const Message::SharedPtr message) {
+      EXPECT_EQ(message->data.at(0), 77U);
+      callback_thread.store(slamqos_pid_tgid_self());
+      executor.cancel();
+    },
+    options);
+
+  scx_slam_executor::CallbackProfile profile;
+  profile.stage_id = SLAM_STAGE_STATE_EST;
+  profile.class_id = SLAM_SCX_CLASS_FE;
+  profile.relative_deadline_ns = 20000000ULL;
+  std::atomic<uint64_t> extractor_thread{0};
+  executor.add_subscription_callback_group_with_profile<Message>(
+    group, node->get_node_base_interface(), profile,
+    [&](const Message & message) {
+      extractor_thread.store(slamqos_pid_tgid_self());
+      return scx_slam_executor::MessageMetadata{message.data.at(0), message.data.at(1)};
+    });
+
+  auto publisher = node->create_publisher<Message>("freshness_executor_message", rclcpp::QoS(10));
+  Message message;
+  message.data = {77, 123456789ULL};
+  std::thread publisher_thread([&]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      publisher->publish(message);
+    });
+
+  executor.spin();
+  publisher_thread.join();
+  rclcpp::shutdown();
+
+  ASSERT_EQ(sink->hints().size(), 1U);
+  const auto hint = sink->hints().front();
+  EXPECT_EQ(hint.job_id, 77U);
+  EXPECT_EQ(hint.release_ts_ns, 123456789ULL);
+  EXPECT_EQ(hint.deadline_ts_ns, 143456789ULL);
+  EXPECT_EQ(hint.stage_id, SLAM_STAGE_STATE_EST);
+  EXPECT_EQ(callback_thread.load(), executor.worker_pid_tgid());
+  EXPECT_NE(extractor_thread.load(), callback_thread.load());
+  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{77, 0}));
 }

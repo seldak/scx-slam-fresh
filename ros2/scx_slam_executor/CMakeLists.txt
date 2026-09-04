@@ -76,11 +76,12 @@ install(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(std_msgs REQUIRED)
   ament_add_gtest(test_slamqos test/test_slamqos.cpp)
   target_link_libraries(test_slamqos slamqos)
 
   ament_add_gtest(test_freshness_executor test/test_freshness_executor.cpp)
-  target_link_libraries(test_freshness_executor freshness_executor)
+  target_link_libraries(test_freshness_executor freshness_executor std_msgs::std_msgs)
 endif()
 
 ament_export_targets(export_scx_slam_executor HAS_LIBRARY_TARGET)

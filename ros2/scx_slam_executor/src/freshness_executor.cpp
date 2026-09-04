@@ -129,10 +129,18 @@ void PinnedMapHintSink::clear(uint64_t worker_pid_tgid)
 
 struct FreshnessExecutor::Impl
 {
+  struct ProfileBinding
+  {
+    CallbackProfile profile;
+    MessageMetadataExtractor metadata_extractor;
+  };
+
   struct PendingWork
   {
     rclcpp::AnyExecutable executable;
     slam_task_hint hint{};
+    std::shared_ptr<void> message;
+    std::unique_ptr<rclcpp::MessageInfo> message_info;
   };
 
   explicit Impl(std::shared_ptr<HintSink> sink, WorkerConfig config)
@@ -152,27 +160,29 @@ struct FreshnessExecutor::Impl
   std::exception_ptr worker_error;
 
   std::mutex profiles_mutex;
-  std::unordered_map<const rclcpp::CallbackGroup *, CallbackProfile> profiles;
+  std::unordered_map<const rclcpp::CallbackGroup *, ProfileBinding> profiles;
   uint64_t next_job_id{1};
 
-  CallbackProfile profile_for(const rclcpp::AnyExecutable & executable)
+  ProfileBinding binding_for(const rclcpp::AnyExecutable & executable)
   {
     if (!executable.callback_group) {
       return {};
     }
     std::lock_guard<std::mutex> lock(profiles_mutex);
     const auto found = profiles.find(executable.callback_group.get());
-    return found == profiles.end() ? CallbackProfile{} : found->second;
+    return found == profiles.end() ? ProfileBinding{} : found->second;
   }
 
-  slam_task_hint make_hint(const CallbackProfile & profile)
+  slam_task_hint make_hint(
+    const CallbackProfile & profile,
+    const std::optional<MessageMetadata> & metadata = std::nullopt)
   {
-    const uint64_t release_ns = monotonic_now_ns();
+    const uint64_t release_ns = metadata ? metadata->release_ts_ns : monotonic_now_ns();
     slam_task_hint hint{};
     hint.api_version = SLAM_SCX_API_VERSION;
     hint.stage_id = profile.stage_id;
     hint.class_id = profile.class_id;
-    hint.job_id = next_job_id++;
+    hint.job_id = metadata ? metadata->job_id : next_job_id++;
     hint.release_ts_ns = release_ns;
     hint.deadline_ts_ns = profile.relative_deadline_ns == 0 ?
       0 : add_saturating(release_ns, profile.relative_deadline_ns);
@@ -181,6 +191,34 @@ struct FreshnessExecutor::Impl
     hint.slice_ns = profile.slice_ns;
     hint.weight = profile.weight;
     return hint;
+  }
+
+  static void release_callback_group(rclcpp::AnyExecutable & executable)
+  {
+    if (executable.callback_group) {
+      executable.callback_group->can_be_taken_from().store(true);
+    }
+  }
+
+  static void return_taken_message(PendingWork & work)
+  {
+    if (work.message && work.executable.subscription) {
+      work.executable.subscription->return_message(work.message);
+      work.message.reset();
+    }
+  }
+
+  static void execute_taken_subscription(PendingWork & work)
+  {
+    try {
+      work.executable.subscription->handle_message(work.message, *work.message_info);
+    } catch (...) {
+      return_taken_message(work);
+      release_callback_group(work.executable);
+      throw;
+    }
+    return_taken_message(work);
+    release_callback_group(work.executable);
   }
 };
 
@@ -217,7 +255,22 @@ void FreshnessExecutor::add_callback_group_with_profile(
 
   rclcpp::Executor::add_callback_group(group, node, notify);
   std::lock_guard<std::mutex> lock(impl_->profiles_mutex);
-  impl_->profiles[group.get()] = profile;
+  impl_->profiles[group.get()] = Impl::ProfileBinding{profile, {}};
+}
+
+void FreshnessExecutor::add_subscription_callback_group_with_erased_metadata(
+  const rclcpp::CallbackGroup::SharedPtr & group,
+  const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+  const CallbackProfile & profile,
+  MessageMetadataExtractor metadata_extractor,
+  bool notify)
+{
+  if (!metadata_extractor) {
+    throw std::invalid_argument("subscription metadata extractor must be callable");
+  }
+  add_callback_group_with_profile(group, node, profile, notify);
+  std::lock_guard<std::mutex> lock(impl_->profiles_mutex);
+  impl_->profiles[group.get()].metadata_extractor = std::move(metadata_extractor);
 }
 
 void FreshnessExecutor::remove_callback_group(
@@ -275,7 +328,11 @@ void FreshnessExecutor::spin()
           }
 
           try {
-            execute_any_executable(work->executable);
+            if (work->message) {
+              Impl::execute_taken_subscription(*work);
+            } else {
+              execute_any_executable(work->executable);
+            }
           } catch (...) {
             // The callback is no longer in flight even when it throws. Do not
             // leave its identity in the worker's single-slot hint map.
@@ -335,13 +392,54 @@ void FreshnessExecutor::spin()
         continue;
       }
 
-      auto hint = impl_->make_hint(impl_->profile_for(executable));
-      impl_->hint_sink->publish(impl_->worker_id, hint);
+      auto binding = impl_->binding_for(executable);
+      Impl::PendingWork work;
+      work.executable = std::move(executable);
+
+      try {
+        if (binding.metadata_extractor) {
+          if (!work.executable.subscription) {
+            throw std::runtime_error(
+                    "message metadata extractor registered for a non-subscription callback");
+          }
+          if (work.executable.subscription->get_delivered_message_kind() !=
+            rclcpp::DeliveredMessageKind::ROS_MESSAGE)
+          {
+            throw std::runtime_error(
+                    "message-aware handoff supports normal ROS messages only");
+          }
+
+          work.message = work.executable.subscription->create_message();
+          work.message_info = std::make_unique<rclcpp::MessageInfo>();
+          if (!work.executable.subscription->take_type_erased(
+              work.message.get(), *work.message_info))
+          {
+            Impl::return_taken_message(work);
+            Impl::release_callback_group(work.executable);
+            continue;
+          }
+
+          const auto metadata = binding.metadata_extractor(work.message);
+          if (metadata.job_id == 0 || metadata.release_ts_ns == 0) {
+            throw std::runtime_error(
+                    "message metadata must contain nonzero job_id and release_ts_ns");
+          }
+          work.hint = impl_->make_hint(binding.profile, metadata);
+        } else {
+          work.hint = impl_->make_hint(binding.profile);
+        }
+
+        impl_->hint_sink->publish(impl_->worker_id, work.hint);
+      } catch (...) {
+        Impl::return_taken_message(work);
+        Impl::release_callback_group(work.executable);
+        throw;
+      }
 
       {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->worker_idle = false;
-        impl_->pending.emplace(Impl::PendingWork{std::move(executable), hint});
+        impl_->pending.emplace(std::move(work));
       }
       impl_->condition.notify_all();
     }

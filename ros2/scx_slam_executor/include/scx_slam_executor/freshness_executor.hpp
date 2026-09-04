@@ -5,8 +5,10 @@
 #include <scx_slam_executor/scx_slam_fresh_shared.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace scx_slam_executor
 {
@@ -28,6 +30,15 @@ struct WorkerConfig
   int sched_ext_policy{-1};
   int cpu{-1};
 };
+
+struct MessageMetadata
+{
+  uint64_t job_id{0};
+  uint64_t release_ts_ns{0};
+};
+
+using MessageMetadataExtractor =
+  std::function<MessageMetadata(const std::shared_ptr<void> & message)>;
 
 class HintSink
 {
@@ -81,6 +92,30 @@ public:
     const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
     const CallbackProfile & profile,
     bool notify = true);
+
+  void add_subscription_callback_group_with_erased_metadata(
+    const rclcpp::CallbackGroup::SharedPtr & group,
+    const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+    const CallbackProfile & profile,
+    MessageMetadataExtractor metadata_extractor,
+    bool notify = true);
+
+  template<typename MessageT, typename ExtractorT>
+  void add_subscription_callback_group_with_profile(
+    const rclcpp::CallbackGroup::SharedPtr & group,
+    const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
+    const CallbackProfile & profile,
+    ExtractorT && metadata_extractor,
+    bool notify = true)
+  {
+    add_subscription_callback_group_with_erased_metadata(
+      group, node, profile,
+      [extractor = std::forward<ExtractorT>(metadata_extractor)](
+        const std::shared_ptr<void> & message) {
+        return extractor(*std::static_pointer_cast<MessageT>(message));
+      },
+      notify);
+  }
 
   void remove_callback_group(
     const rclcpp::CallbackGroup::SharedPtr & group,

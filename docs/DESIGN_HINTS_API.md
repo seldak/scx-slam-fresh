@@ -140,11 +140,13 @@ then publishes the selected callback group's profile for that worker before
 waking it. The worker does not steal or migrate work and clears its hint after
 the callback returns or throws.
 
-The generic ROS executor does not inspect subscription payloads before callback
-execution. Its initial `release_ts_ns` is therefore callback selection time,
-not a sensor timestamp. This implementation validates wake-safe worker
-classification; a message-aware workload adapter is still required before the
-timestamp can represent end-to-end sensor age.
+For ordinary callback groups, `release_ts_ns` is callback selection time. A
+message-aware subscription registration changes the handoff: the dispatcher
+takes one normal ROS message directly from DDS, extracts its `job_id` and
+monotonic source timestamp, publishes that exact hint, and gives the same
+message to the worker. It does not mirror DDS state in another queue. The v1
+message path intentionally excludes serialized, dynamic, and intra-process
+delivery.
 
 ---
 
