@@ -42,19 +42,20 @@ public:
     const auto imu_output = declare_parameter<std::string>("imu_output", "/imu/jobs");
     const auto camera_output = declare_parameter<std::string>("camera_output", "/camera/jobs");
 
-    const auto output_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable();
+    const auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable().durability_volatile();
+    const auto output_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable().durability_volatile();
     imu_jobs_ = create_publisher<Job>(imu_output, output_qos);
     camera_jobs_ = create_publisher<Job>(camera_output, output_qos);
 
     imu_subscription_ = create_subscription<sensor_msgs::msg::Imu>(
-      imu_input, rclcpp::SensorDataQoS(),
+      imu_input, sensor_qos,
       [this](const sensor_msgs::msg::Imu::ConstSharedPtr message) {
-        publish_job(imu_jobs_, ++imu_job_id_, message->header.stamp, "IMU");
+        publish_job(imu_jobs_, imu_counts_, message->header.stamp, "IMU");
       });
     camera_subscription_ = create_subscription<sensor_msgs::msg::Image>(
-      camera_input, rclcpp::SensorDataQoS(),
+      camera_input, sensor_qos,
       [this](const sensor_msgs::msg::Image::ConstSharedPtr message) {
-        publish_job(camera_jobs_, ++camera_job_id_, message->header.stamp, "camera");
+        publish_job(camera_jobs_, camera_counts_, message->header.stamp, "camera");
       });
 
     RCLCPP_INFO(
@@ -62,21 +63,49 @@ public:
       imu_input.c_str(), camera_input.c_str());
   }
 
+  void log_summary() const
+  {
+    log_stream_summary("imu", imu_counts_);
+    log_stream_summary("camera", camera_counts_);
+  }
+
 private:
+  struct StreamCounts
+  {
+    uint64_t received{0};
+    uint64_t published{0};
+    uint64_t dropped{0};
+  };
+
   void publish_job(
-    const rclcpp::Publisher<Job>::SharedPtr & publisher, uint64_t job_id,
+    const rclcpp::Publisher<Job>::SharedPtr & publisher, StreamCounts & counts,
     const builtin_interfaces::msg::Time & source_stamp, const char * stream)
   {
+    const uint64_t job_id = ++counts.received;
     try {
       publisher->publish(
         scx_slam_workload::make_stamped_job(job_id, monotonic_ns(), source_stamp));
+      counts.published++;
     } catch (const std::exception & error) {
-      RCLCPP_ERROR(get_logger(), "dropping %s message: %s", stream, error.what());
+      counts.dropped++;
+      RCLCPP_ERROR(
+        get_logger(), "dropping %s job %llu: %s", stream,
+        static_cast<unsigned long long>(job_id), error.what());
     }
   }
 
-  uint64_t imu_job_id_{0};
-  uint64_t camera_job_id_{0};
+  void log_stream_summary(const char * stream, const StreamCounts & counts) const
+  {
+    RCLCPP_INFO(
+      get_logger(),
+      "adapter_%s: received=%llu published=%llu dropped=%llu",
+      stream, static_cast<unsigned long long>(counts.received),
+      static_cast<unsigned long long>(counts.published),
+      static_cast<unsigned long long>(counts.dropped));
+  }
+
+  StreamCounts imu_counts_;
+  StreamCounts camera_counts_;
   rclcpp::Publisher<Job>::SharedPtr imu_jobs_;
   rclcpp::Publisher<Job>::SharedPtr camera_jobs_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_subscription_;
@@ -89,7 +118,9 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   try {
-    rclcpp::spin(std::make_shared<BagAdapter>());
+    const auto adapter = std::make_shared<BagAdapter>();
+    rclcpp::spin(adapter);
+    adapter->log_summary();
     rclcpp::shutdown();
     return 0;
   } catch (const std::exception & error) {

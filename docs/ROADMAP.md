@@ -19,8 +19,8 @@ Not planned:
   shielded confirmation required no scheduler-policy change.
 - Run the matched ROS 2 CFS/scx callback-compute evaluation and document the
   validated scope before changing scheduler policy.
-- ROS2: validate a recorded sensor bag through the implemented message-aware
-  adapter and fixed-worker pipeline, then add matched offered-count accounting.
+- ROS2: validate a recorded sensor bag with the matched CFS/hinted harness and
+  freeze bag-window offered-count rules from the captured job-id spans.
 - Generalize the documented executor hint contract beyond the demo's 1:1 FIFO workers.
 
 ## Power / perf (still non-proprietary)

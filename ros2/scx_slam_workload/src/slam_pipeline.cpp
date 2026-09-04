@@ -20,6 +20,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -37,6 +38,7 @@ using Executor = scx_slam_executor::FreshnessExecutor;
 struct Options
 {
   int duration_s{3};
+  int warmup_s{0};
   int worker_cpu{-1};
   int ext_policy{-1};
   int hog_threads{0};
@@ -53,6 +55,10 @@ struct StageStats
   uint64_t late{0};
   uint64_t stale{0};
   uint64_t cpu_ns{0};
+  uint64_t first_job_id{0};
+  uint64_t last_job_id{0};
+  uint64_t first_source_ts_ns{0};
+  uint64_t last_source_ts_ns{0};
   std::vector<uint64_t> start_ages_ns;
   std::vector<uint64_t> completion_ages_ns;
 };
@@ -63,6 +69,10 @@ struct StageSnapshot
   uint64_t late{0};
   uint64_t stale{0};
   uint64_t cpu_ns{0};
+  uint64_t first_job_id{0};
+  uint64_t last_job_id{0};
+  uint64_t first_source_ts_ns{0};
+  uint64_t last_source_ts_ns{0};
   uint64_t p99_start_age_ns{0};
   uint64_t max_start_age_ns{0};
   uint64_t p99_age_ns{0};
@@ -124,15 +134,30 @@ uint64_t percentile_99(std::vector<uint64_t> values)
 
 void account_job(
   StageStats & stats, const Message & message, uint64_t work_us,
-  uint64_t deadline_ns, uint64_t stale_ns)
+  uint64_t deadline_ns, uint64_t stale_ns, uint64_t window_start_ns,
+  uint64_t window_end_ns)
 {
   const uint64_t start = monotonic_ns();
   const uint64_t start_age = start > message.release_ts_ns ? start - message.release_ts_ns : 0;
+  const bool measured =
+    message.release_ts_ns >= window_start_ns && message.release_ts_ns < window_end_ns;
+  if (measured) {
+    std::lock_guard<std::mutex> lock(stats.mutex);
+    if (stats.first_job_id == 0) {
+      stats.first_job_id = message.job_id;
+      stats.first_source_ts_ns = message.source_ts_ns;
+    }
+    stats.last_job_id = message.job_id;
+    stats.last_source_ts_ns = message.source_ts_ns;
+  }
   const uint64_t cpu_start = thread_cpu_ns();
   busy_work_us(work_us);
   const uint64_t cpu_ns = thread_cpu_ns() - cpu_start;
 
   const uint64_t now = monotonic_ns();
+  if (!measured) {
+    return;
+  }
   const uint64_t age = now > message.release_ts_ns ? now - message.release_ts_ns : 0;
   std::lock_guard<std::mutex> lock(stats.mutex);
   stats.completed++;
@@ -175,6 +200,11 @@ Options parse_options(int argc, char ** argv)
       if (options.duration_s < 1) {
         throw std::invalid_argument("--duration must be at least one second");
       }
+    } else if (argument == "--warmup") {
+      options.warmup_s = parse_integer(require_value("--warmup"), "--warmup");
+      if (options.warmup_s < 0) {
+        throw std::invalid_argument("--warmup must be non-negative");
+      }
     } else if (argument == "--worker-cpu") {
       options.worker_cpu = parse_integer(require_value("--worker-cpu"), "--worker-cpu");
     } else if (argument == "--ext-policy") {
@@ -205,7 +235,7 @@ Options parse_options(int argc, char ** argv)
       std::cout <<
         "usage: scx_slam_pipeline [--duration S] [--worker-cpu N] "
         "[--ext-policy N] [--pin DIR] [--hint-mode MODE] "
-        "[--input synthetic|external] [--hog N] [--window-stats]\n";
+        "[--input synthetic|external] [--warmup S] [--hog N] [--window-stats]\n";
       std::exit(0);
     } else if (argument != "--ros-args" && argument.rfind("__", 0) != 0) {
       throw std::invalid_argument("unknown argument: " + argument);
@@ -279,6 +309,10 @@ StageSnapshot snapshot(StageStats & stats)
   result.late = stats.late;
   result.stale = stats.stale;
   result.cpu_ns = stats.cpu_ns;
+  result.first_job_id = stats.first_job_id;
+  result.last_job_id = stats.last_job_id;
+  result.first_source_ts_ns = stats.first_source_ts_ns;
+  result.last_source_ts_ns = stats.last_source_ts_ns;
   result.p99_start_age_ns = percentile_99(stats.start_ages_ns);
   result.max_start_age_ns = stats.start_ages_ns.empty() ?
     0 : *std::max_element(stats.start_ages_ns.begin(), stats.start_ages_ns.end());
@@ -299,6 +333,10 @@ void print_stats(
     " started_stale=" << stats.stale <<
     " unfinished=" << unfinished <<
     " cpu_us=" << stats.cpu_ns / 1000ULL <<
+    " first_job_id=" << stats.first_job_id <<
+    " last_job_id=" << stats.last_job_id <<
+    " first_source_ts_ns=" << stats.first_source_ts_ns <<
+    " last_source_ts_ns=" << stats.last_source_ts_ns <<
     " p99_start_age_us=" << stats.p99_start_age_ns / 1000ULL <<
     " max_start_age_us=" << stats.max_start_age_ns / 1000ULL <<
     " p99_age_us=" << stats.p99_age_ns / 1000ULL <<
@@ -402,7 +440,7 @@ int main(int argc, char ** argv)
     }
     const scx_slam_executor::WorkerConfig worker_config{
       options.ext_policy, options.worker_cpu};
-    const auto qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable();
+    const auto qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable().durability_volatile();
 
     auto source_node = std::make_shared<rclcpp::Node>("slam_source");
     auto imu_node = std::make_shared<rclcpp::Node>("imu_propagation");
@@ -432,6 +470,8 @@ int main(int argc, char ** argv)
     StageStats vision_stats;
     StageStats estimator_stats;
     StageStats mapping_stats;
+    std::atomic<uint64_t> measurement_start_ns{std::numeric_limits<uint64_t>::max()};
+    std::atomic<uint64_t> measurement_end_ns{0};
     std::atomic<uint64_t> imu_taken{0};
     std::atomic<uint64_t> vision_taken{0};
     std::atomic<uint64_t> estimator_taken{0};
@@ -442,8 +482,14 @@ int main(int argc, char ** argv)
     auto imu_subscription = imu_node->create_subscription<Message>(
       "imu/jobs", qos,
       [&](const Message::SharedPtr message) {
-        imu_taken.fetch_add(1, std::memory_order_relaxed);
-        account_job(imu_stats, *message, 150, 5000000ULL, 10000000ULL);
+        const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
+        const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
+        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+          imu_taken.fetch_add(1, std::memory_order_relaxed);
+        }
+        account_job(
+          imu_stats, *message, 150, 5000000ULL, 10000000ULL,
+          window_start, window_end);
       },
       imu_subscription_options);
 
@@ -452,9 +498,15 @@ int main(int argc, char ** argv)
     auto vision_subscription = vision_node->create_subscription<Message>(
       "camera/jobs", qos,
       [&](const Message::SharedPtr message) {
-        vision_taken.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
+        const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
+        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+          vision_taken.fetch_add(1, std::memory_order_relaxed);
+        }
         const uint64_t work_us = 3000ULL + (message->job_id % 5ULL) * 500ULL;
-        account_job(vision_stats, *message, work_us, 33000000ULL, 66000000ULL);
+        account_job(
+          vision_stats, *message, work_us, 33000000ULL, 66000000ULL,
+          window_start, window_end);
         vision_output->publish(*message);
       },
       vision_subscription_options);
@@ -464,9 +516,15 @@ int main(int argc, char ** argv)
     auto estimator_subscription = estimator_node->create_subscription<Message>(
       "vision/jobs", qos,
       [&](const Message::SharedPtr message) {
-        estimator_taken.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
+        const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
+        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+          estimator_taken.fetch_add(1, std::memory_order_relaxed);
+        }
         const uint64_t work_us = 2000ULL + (message->job_id % 5ULL) * 250ULL;
-        account_job(estimator_stats, *message, work_us, 33000000ULL, 66000000ULL);
+        account_job(
+          estimator_stats, *message, work_us, 33000000ULL, 66000000ULL,
+          window_start, window_end);
         estimator_output->publish(*message);
       },
       estimator_subscription_options);
@@ -476,8 +534,12 @@ int main(int argc, char ** argv)
     auto mapping_subscription = mapping_node->create_subscription<Message>(
       "estimator/jobs", qos,
       [&](const Message::SharedPtr message) {
-        mapping_taken.fetch_add(1, std::memory_order_relaxed);
-        account_job(mapping_stats, *message, 2000, 0, 0);
+        const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
+        const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
+        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+          mapping_taken.fetch_add(1, std::memory_order_relaxed);
+        }
+        account_job(mapping_stats, *message, 2000, 0, 0, window_start, window_end);
       },
       mapping_subscription_options);
 
@@ -539,8 +601,12 @@ int main(int argc, char ** argv)
         options.ext_policy, std::ref(error_mutex), std::ref(background_error));
     }
 
-    const uint64_t start_ns = monotonic_ns() + 100000000ULL;
+    const uint64_t lead_ns = options.input_mode == "synthetic" ?
+      100000000ULL : static_cast<uint64_t>(options.warmup_s) * 1000000000ULL;
+    const uint64_t start_ns = monotonic_ns() + lead_ns;
     const uint64_t end_ns = start_ns + static_cast<uint64_t>(options.duration_s) * 1000000000ULL;
+    measurement_start_ns.store(start_ns, std::memory_order_release);
+    measurement_end_ns.store(end_ns, std::memory_order_release);
     std::thread imu_generator;
     std::thread camera_generator;
     if (options.input_mode == "synthetic") {
@@ -592,6 +658,7 @@ int main(int argc, char ** argv)
     }
 
     std::cout << "configuration: duration_s=" << options.duration_s <<
+      " warmup_s=" << options.warmup_s <<
       " worker_cpu=" << options.worker_cpu <<
       " ext_policy=" << options.ext_policy <<
       " hog_threads=" << options.hog_threads <<

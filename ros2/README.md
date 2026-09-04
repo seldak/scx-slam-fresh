@@ -182,6 +182,12 @@ make test-demo test-e4 test-scheduler-mode test-window test-slice
 sensor message. The original ROS header timestamp is preserved separately as
 `source_ts_ns`; it is not used as a kernel timestamp.
 
+Both bag-player inputs and stamped-job outputs use an explicit reliable,
+volatile, keep-last QoS profile with depth 1000. The bag harness supplies the
+matching rosbag2 playback override and captures `ros2 topic info -v` for both
+sensor topics before running a case. The adapter prints received, published,
+and dropped totals for IMU and camera when it shuts down.
+
 The default input topics are `/imu` and `/camera/image_raw`. Override them with
 ROS parameters to match a bag, for example:
 
@@ -201,8 +207,14 @@ ros2 run scx_slam_workload scx_slam_pipeline \
 Then start playback in a third terminal:
 
 ```bash
-ros2 bag play /path/to/bag
+ros2 bag play /path/to/bag \
+  --qos-profile-overrides-path /path/to/qos-overrides.yaml
 ```
+
+The override file must set both selected sensor topics to `reliable`,
+`volatile`, `keep_last`, depth 1000. The matched harness below generates this
+file and verifies both endpoints with `ros2 topic info -v`; use the manual
+three-terminal form only for plumbing checks.
 
 Start the adapter and pipeline before playback, and choose a pipeline duration
 longer than the selected bag interval. External-mode `offered` fields count
@@ -210,3 +222,19 @@ callbacks taken by the measurement cutoff; messages still queued inside DDS
 are not observable by this first adapter. Consequently this phase establishes
 the bag-to-executor path but does not yet provide a matched scheduling result,
 bag-level offered-count accounting, or estimator accuracy.
+
+For a matched 15-second CFS-versus-hinted capture, keep the bag outside the
+repository and use the dedicated harness:
+
+```bash
+sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 \
+  REPETITIONS=3 IMU_TOPIC=/imu0 CAMERA_TOPIC=/cam0/image_raw \
+  scripts/run_ros2_bag_eval.sh /absolute/path/to/ros2-bag
+```
+
+The adapter, rosbag player, pipeline dispatchers, and loader remain on the
+housekeeping CPU; only callback workers and optional matched hogs use the
+experimental CPU. Playback is fixed at rate 1.0. The result directory records
+the bag-file hash manifest, topics, QoS inspection, playback contract, kernel
+command line, source revision, dirty state, and binary hashes. A successful
+plumbing run is still exploratory and does not create a performance snapshot.
