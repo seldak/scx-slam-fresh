@@ -133,6 +133,23 @@ sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
 The clean loaded result and its scope are recorded in
 [`DESIGN_EVALUATION.md`](../docs/DESIGN_EVALUATION.md#loaded-ros-2-callback-scheduling-snapshot).
 
+The loaded snapshot does not close the separate zero-hog maximum-tail anomaly.
+Capture exactly the `f01e3f9` binary set with standard scheduler tracepoints:
+
+```bash
+sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 REPETITIONS=3 \
+  scripts/run_ros2_zero_hog_perf.sh
+```
+
+This fixed diagnostic runs only hinted SCX with zero hogs. It records
+`sched_switch`, `sched_wakeup`, new wakeups, forks, and migrations on CPUs 0 and
+1; `sched_stat_runtime` and custom BPF execution tracing are not enabled. The
+perf recorder stays on the housekeeping CPU. Raw `perf.data`, decoded events,
+workload metrics, and `perf sched timehist` are retained per repetition.
+Standard scheduler tracepoints do not expose the incoming `scx.slice`, so the
+report can show an observed successor run interval but must not call it the
+task's requested or remaining slice.
+
 The default build remains ROS-independent:
 
 ```bash

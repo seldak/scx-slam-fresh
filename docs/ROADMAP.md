@@ -14,6 +14,8 @@ Not planned:
   for work selection; duplicating its queue in BPF would create divergent state.
 
 ## Better pipeline integration
+- Classify the loaded ROS snapshot's zero-hog maximum-tail anomaly using only
+  the pinned standard-perf capture; leave it unresolved if it does not recur.
 - Run the matched ROS 2 CFS/scx callback-compute evaluation and document the
   validated scope before changing scheduler policy.
 - ROS2: replay recorded timestamped sensor topics through the message-aware
