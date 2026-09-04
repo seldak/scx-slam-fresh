@@ -28,7 +28,7 @@ Packages:
   Ament consumers and provides the first `FreshnessExecutor` implementation.
 - `scx_slam_msgs` defines the stamped work item shared by the ROS pipeline.
 - `scx_slam_workload` provides a downstream executor smoke node and a bounded
-  ROS pub/sub pipeline. Bag replay is not implemented yet.
+  ROS pub/sub pipeline plus the Phase 4 sensor-to-job adapter.
 
 ## FreshnessExecutor v1
 
@@ -172,3 +172,41 @@ The default build remains ROS-independent:
 make
 make test-demo test-e4 test-scheduler-mode test-window test-slice
 ```
+
+## Phase 4 bag-backed input
+
+`scx_slam_bag_adapter` accepts standard `sensor_msgs/msg/Imu` and
+`sensor_msgs/msg/Image` topics from `ros2 bag play` and publishes the existing
+`StampedJob` inputs on `/imu/jobs` and `/camera/jobs`. The scheduler-facing
+`release_ts_ns` is sampled from `CLOCK_MONOTONIC` when the adapter takes the
+sensor message. The original ROS header timestamp is preserved separately as
+`source_ts_ns`; it is not used as a kernel timestamp.
+
+The default input topics are `/imu` and `/camera/image_raw`. Override them with
+ROS parameters to match a bag, for example:
+
+```bash
+ros2 run scx_slam_workload scx_slam_bag_adapter --ros-args \
+  -p imu_input:=/imu0 -p camera_input:=/cam0/image_raw
+```
+
+Run the existing pipeline without its periodic synthetic publishers in a
+second terminal:
+
+```bash
+ros2 run scx_slam_workload scx_slam_pipeline \
+  --duration 30 --input external --window-stats
+```
+
+Then start playback in a third terminal:
+
+```bash
+ros2 bag play /path/to/bag
+```
+
+Start the adapter and pipeline before playback, and choose a pipeline duration
+longer than the selected bag interval. External-mode `offered` fields count
+callbacks taken by the measurement cutoff; messages still queued inside DDS
+are not observable by this first adapter. Consequently this phase establishes
+the bag-to-executor path but does not yet provide a matched scheduling result,
+bag-level offered-count accounting, or estimator accuracy.

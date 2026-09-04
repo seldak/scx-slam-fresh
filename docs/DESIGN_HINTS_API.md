@@ -148,6 +148,11 @@ message to the worker. It does not mirror DDS state in another queue. The v1
 message path intentionally excludes serialized, dynamic, and intra-process
 delivery.
 
+For bag-backed input, the adapter samples `CLOCK_MONOTONIC` when it takes each
+sensor message and places that value in `release_ts_ns`. The recorded ROS
+header stamp is retained separately as `source_ts_ns` for dataset correlation;
+it is never passed to BPF as a release or deadline time.
+
 ---
 
 ## Hint fields and invariants

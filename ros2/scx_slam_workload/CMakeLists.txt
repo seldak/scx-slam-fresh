@@ -2,9 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 project(scx_slam_workload VERSION 0.1.0 LANGUAGES CXX)
 
 find_package(ament_cmake REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(scx_slam_executor REQUIRED)
 find_package(scx_slam_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 add_executable(scx_slam_workload_smoke src/workload_smoke.cpp)
 target_compile_features(scx_slam_workload_smoke PRIVATE cxx_std_17)
@@ -29,8 +31,37 @@ target_link_libraries(
 
 install(TARGETS scx_slam_pipeline DESTINATION lib/${PROJECT_NAME})
 
+add_executable(scx_slam_bag_adapter src/bag_adapter.cpp)
+target_compile_features(scx_slam_bag_adapter PRIVATE cxx_std_17)
+target_include_directories(
+  scx_slam_bag_adapter PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(
+  scx_slam_bag_adapter
+  PRIVATE
+    rclcpp::rclcpp
+    scx_slam_msgs::scx_slam_msgs
+    sensor_msgs::sensor_msgs
+)
+
+install(TARGETS scx_slam_bag_adapter DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_test REQUIRED)
+  ament_add_gtest(test_bag_adapter test/test_bag_adapter.cpp)
+  target_compile_features(test_bag_adapter PRIVATE cxx_std_17)
+  target_include_directories(
+    test_bag_adapter PRIVATE
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  target_link_libraries(
+    test_bag_adapter
+    builtin_interfaces::builtin_interfaces
+    scx_slam_msgs::scx_slam_msgs
+  )
+
   ament_add_test(test_slam_pipeline
     COMMAND $<TARGET_FILE:scx_slam_pipeline> --duration 1
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO

@@ -43,6 +43,7 @@ struct Options
   bool window_stats{false};
   std::string pin_dir;
   std::string hint_mode{"auto"};
+  std::string input_mode{"synthetic"};
 };
 
 struct StageStats
@@ -195,11 +196,16 @@ Options parse_options(int argc, char ** argv)
         throw std::invalid_argument(
                 "--hint-mode must be full, none, imu-only, or fe-only");
       }
+    } else if (argument == "--input") {
+      options.input_mode = require_value("--input");
+      if (options.input_mode != "synthetic" && options.input_mode != "external") {
+        throw std::invalid_argument("--input must be synthetic or external");
+      }
     } else if (argument == "--help") {
       std::cout <<
         "usage: scx_slam_pipeline [--duration S] [--worker-cpu N] "
         "[--ext-policy N] [--pin DIR] [--hint-mode MODE] "
-        "[--hog N] [--window-stats]\n";
+        "[--input synthetic|external] [--hog N] [--window-stats]\n";
       std::exit(0);
     } else if (argument != "--ros-args" && argument.rfind("__", 0) != 0) {
       throw std::invalid_argument("unknown argument: " + argument);
@@ -360,6 +366,22 @@ void wait_for_graph(
   throw std::runtime_error("ROS graph did not connect the pipeline within two seconds");
 }
 
+void wait_for_external_sources(
+  const rclcpp::Subscription<Message>::SharedPtr & imu_subscription,
+  const rclcpp::Subscription<Message>::SharedPtr & camera_subscription)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (imu_subscription->get_publisher_count() > 0 &&
+      camera_subscription->get_publisher_count() > 0)
+    {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  throw std::runtime_error("external IMU and camera job publishers did not connect");
+}
+
 }  // namespace
 
 int main(int argc, char ** argv)
@@ -397,8 +419,12 @@ int main(int argc, char ** argv)
     auto mapping_group = mapping_node->create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive, false);
 
-    auto camera_source = source_node->create_publisher<Message>("camera/jobs", qos);
-    auto imu_source = source_node->create_publisher<Message>("imu/jobs", qos);
+    rclcpp::Publisher<Message>::SharedPtr camera_source;
+    rclcpp::Publisher<Message>::SharedPtr imu_source;
+    if (options.input_mode == "synthetic") {
+      camera_source = source_node->create_publisher<Message>("camera/jobs", qos);
+      imu_source = source_node->create_publisher<Message>("imu/jobs", qos);
+    }
     auto vision_output = vision_node->create_publisher<Message>("vision/jobs", qos);
     auto estimator_output = estimator_node->create_publisher<Message>("estimator/jobs", qos);
 
@@ -406,12 +432,17 @@ int main(int argc, char ** argv)
     StageStats vision_stats;
     StageStats estimator_stats;
     StageStats mapping_stats;
+    std::atomic<uint64_t> imu_taken{0};
+    std::atomic<uint64_t> vision_taken{0};
+    std::atomic<uint64_t> estimator_taken{0};
+    std::atomic<uint64_t> mapping_taken{0};
 
     rclcpp::SubscriptionOptions imu_subscription_options;
     imu_subscription_options.callback_group = imu_group;
     auto imu_subscription = imu_node->create_subscription<Message>(
       "imu/jobs", qos,
       [&](const Message::SharedPtr message) {
+        imu_taken.fetch_add(1, std::memory_order_relaxed);
         account_job(imu_stats, *message, 150, 5000000ULL, 10000000ULL);
       },
       imu_subscription_options);
@@ -421,6 +452,7 @@ int main(int argc, char ** argv)
     auto vision_subscription = vision_node->create_subscription<Message>(
       "camera/jobs", qos,
       [&](const Message::SharedPtr message) {
+        vision_taken.fetch_add(1, std::memory_order_relaxed);
         const uint64_t work_us = 3000ULL + (message->job_id % 5ULL) * 500ULL;
         account_job(vision_stats, *message, work_us, 33000000ULL, 66000000ULL);
         vision_output->publish(*message);
@@ -432,6 +464,7 @@ int main(int argc, char ** argv)
     auto estimator_subscription = estimator_node->create_subscription<Message>(
       "vision/jobs", qos,
       [&](const Message::SharedPtr message) {
+        estimator_taken.fetch_add(1, std::memory_order_relaxed);
         const uint64_t work_us = 2000ULL + (message->job_id % 5ULL) * 250ULL;
         account_job(estimator_stats, *message, work_us, 33000000ULL, 66000000ULL);
         estimator_output->publish(*message);
@@ -443,6 +476,7 @@ int main(int argc, char ** argv)
     auto mapping_subscription = mapping_node->create_subscription<Message>(
       "estimator/jobs", qos,
       [&](const Message::SharedPtr message) {
+        mapping_taken.fetch_add(1, std::memory_order_relaxed);
         account_job(mapping_stats, *message, 2000, 0, 0);
       },
       mapping_subscription_options);
@@ -490,7 +524,12 @@ int main(int argc, char ** argv)
         });
     }
 
-    wait_for_graph({imu_source, camera_source, vision_output, estimator_output});
+    if (options.input_mode == "synthetic") {
+      wait_for_graph({imu_source, camera_source, vision_output, estimator_output});
+    } else {
+      wait_for_graph({vision_output, estimator_output});
+      wait_for_external_sources(imu_subscription, vision_subscription);
+    }
     std::atomic<bool> contenders_running{true};
     std::vector<std::thread> contenders;
     contenders.reserve(static_cast<size_t>(options.hog_threads));
@@ -502,17 +541,30 @@ int main(int argc, char ** argv)
 
     const uint64_t start_ns = monotonic_ns() + 100000000ULL;
     const uint64_t end_ns = start_ns + static_cast<uint64_t>(options.duration_s) * 1000000000ULL;
-    std::thread imu_generator(
-      publish_periodic, imu_source, 200ULL, static_cast<uint64_t>(options.duration_s), start_ns);
-    std::thread camera_generator(
-      publish_periodic, camera_source, 30ULL, static_cast<uint64_t>(options.duration_s), start_ns);
-
-    imu_generator.join();
-    camera_generator.join();
+    std::thread imu_generator;
+    std::thread camera_generator;
+    if (options.input_mode == "synthetic") {
+      imu_generator = std::thread(
+        publish_periodic, imu_source, 200ULL,
+        static_cast<uint64_t>(options.duration_s), start_ns);
+      camera_generator = std::thread(
+        publish_periodic, camera_source, 30ULL,
+        static_cast<uint64_t>(options.duration_s), start_ns);
+      imu_generator.join();
+      camera_generator.join();
+    }
     sleep_until_ns(end_ns);
 
-    const uint64_t expected_imu = static_cast<uint64_t>(options.duration_s) * 200ULL;
-    const uint64_t expected_camera = static_cast<uint64_t>(options.duration_s) * 30ULL;
+    const uint64_t expected_imu = options.input_mode == "synthetic" ?
+      static_cast<uint64_t>(options.duration_s) * 200ULL :
+      imu_taken.load(std::memory_order_relaxed);
+    const uint64_t expected_vision = options.input_mode == "synthetic" ?
+      static_cast<uint64_t>(options.duration_s) * 30ULL :
+      vision_taken.load(std::memory_order_relaxed);
+    const uint64_t expected_estimator = options.input_mode == "synthetic" ?
+      expected_vision : estimator_taken.load(std::memory_order_relaxed);
+    const uint64_t expected_mapping = options.input_mode == "synthetic" ?
+      expected_vision : mapping_taken.load(std::memory_order_relaxed);
     const auto window_imu = snapshot(imu_stats);
     const auto window_vision = snapshot(vision_stats);
     const auto window_estimator = snapshot(estimator_stats);
@@ -544,13 +596,20 @@ int main(int argc, char ** argv)
       " ext_policy=" << options.ext_policy <<
       " hog_threads=" << options.hog_threads <<
       " hint_mode=" << hint_mode <<
+      " input=" << options.input_mode <<
       " window_stats=" << (options.window_stats ? 1 : 0) << '\n';
+
+    if (options.input_mode == "external") {
+      std::cout <<
+        "external_counts: offered fields count callbacks taken by the measurement cutoff; "
+        "messages still queued in DDS are not observable here\n";
+    }
 
     if (options.window_stats) {
       print_stats("window_", "imu_prop", expected_imu, window_imu);
-      print_stats("window_", "vision_fe", expected_camera, window_vision);
-      print_stats("window_", "state_est", expected_camera, window_estimator);
-      print_stats("window_", "mapping_be", expected_camera, window_mapping);
+      print_stats("window_", "vision_fe", expected_vision, window_vision);
+      print_stats("window_", "state_est", expected_estimator, window_estimator);
+      print_stats("window_", "mapping_be", expected_mapping, window_mapping);
       return 0;
     }
 
@@ -559,14 +618,15 @@ int main(int argc, char ** argv)
     const auto final_estimator = snapshot(estimator_stats);
     const auto final_mapping = snapshot(mapping_stats);
     print_stats("", "imu_prop", expected_imu, final_imu);
-    print_stats("", "vision_fe", expected_camera, final_vision);
-    print_stats("", "state_est", expected_camera, final_estimator);
-    print_stats("", "mapping_be", expected_camera, final_mapping);
+    print_stats("", "vision_fe", expected_vision, final_vision);
+    print_stats("", "state_est", expected_estimator, final_estimator);
+    print_stats("", "mapping_be", expected_mapping, final_mapping);
 
-    if (final_imu.completed != expected_imu ||
-      final_vision.completed != expected_camera ||
-      final_estimator.completed != expected_camera ||
-      final_mapping.completed != expected_camera)
+    if (options.input_mode == "synthetic" &&
+      (final_imu.completed != expected_imu ||
+      final_vision.completed != expected_vision ||
+      final_estimator.completed != expected_estimator ||
+      final_mapping.completed != expected_mapping))
     {
       std::cerr << "pipeline did not drain every offered message\n";
       return 2;
