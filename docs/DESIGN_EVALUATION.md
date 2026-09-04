@@ -33,7 +33,8 @@ The demo is multi-rate: IMU at 200Hz, camera at 30Hz, and LiDAR at 10Hz. LiDAR m
 - `--lidar mid`: borderline load
 - `--lidar heavy`: intentionally unsustainable; creates a registration backlog
 
-Additional controls are `--hog N`, `--drop-stale 1`, `--duration S`, and the
+Additional controls are `--hog N`, `--drop-stale 1`, `--duration S`,
+`--imu-work-us N` (default 150us per fixed 5ms period), and the
 vision-stage `--vision-budget-us`, `--vision-work-us`, and
 `--vision-deadline-us` knobs.
 
@@ -60,7 +61,7 @@ Run only this calibration with:
 sudo env EVAL_SCOPE=e0 scripts/run_single_core_eval.sh
 ```
 
-### ~~E1: Heavy LiDAR overload~~ — completed
+### E1: Heavy LiDAR overload — implemented; partial-switch revalidation pending
 
 Use two matched sub-experiments because strict priority plus two hogs can fully
 starve the back-end. A consumer that never runs cannot demonstrate
@@ -93,7 +94,7 @@ sudo env CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 \
   scripts/run_single_core_eval.sh
 ```
 
-### ~~E2: Sensor burst / backlog~~ — completed
+### E2: Sensor burst / backlog — implemented; partial-switch revalidation pending
 
 - Inject a deterministic delayed-delivery camera burst while preserving every
   frame's original sensor timestamp.
@@ -104,7 +105,16 @@ sudo env CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 \
 The root benchmark enforces all three conditions. Use `BURST_COUNT` and
 `BURST_AT_MS` to change the default 12-frame burst delivered near 3000 ms.
 
-#### Latest local verification snapshot
+#### Historical verification snapshot — partial-switch baseline withdrawn
+
+The E4 preflight exposed a build bug on 2026-09-03: an `#ifdef` tested
+`SCX_OPS_SWITCH_PARTIAL`, which is an enum constant rather than a macro. It
+silently omitted the partial-switch flag; the inspected object had `flags=0`
+(full switch). The flag is now required directly in the default build, and the
+loader can report its embedded flags without attaching. E1–E3 must be rerun
+with the corrected build before quoting a partial-switch baseline. The CFS-only
+E0 sweep is unaffected by this switch-mode defect. The figures below are kept
+as historical observations, not current validation.
 
 One root run on 2026-09-02 using kernel `7.0.0-30-generic`, CPU 0, 15-second
 cases, and one repetition produced:
@@ -124,14 +134,14 @@ cases, and one repetition produced:
   budget produced 14 overrun events, 14 confirmed BE-demotion events, completed
   14/455 jobs with 2 misses, and left 441 pending.
 
-This snapshot supersedes all results produced before synthetic work switched
-from elapsed wall time to thread CPU time; the two workload models are not
-comparable. These figures remain a development verification snapshot, not a
-multi-run performance claim. Reproduce them with the benchmark command above;
+This snapshot used thread CPU time rather than the earlier elapsed-wall-time
+compute model; those two workload models are not comparable. It also predates
+the corrected partial-switch build and is not a multi-run performance claim.
+Generate a replacement with the benchmark command above;
 the script records the environment, revision, binary hashes, and per-case
 output in its chosen results directory.
 
-### ~~E3: Budget misconfiguration~~ — completed
+### E3: Budget misconfiguration — implemented; partial-switch revalidation pending
 
 - Compare matched scx_slam_fresh runs with fixed 12ms vision CPU and a 30ms
   relative deadline.
@@ -146,10 +156,511 @@ Run E3 alone with:
 sudo env EVAL_SCOPE=e3 scripts/run_single_core_eval.sh
 ```
 
-### E4: IMU-lane isolation
+### ~~E4: IMU-lane isolation~~ — observational regimes validated
 - Sweep IMU compute cost while holding the heavy-LiDAR workload constant.
 - Goal: quantify the range in which DSQ_IMU protects propagation without starving FE and BE lanes.
 - Report IMU, vision, and estimator misses together; an IMU-only improvement is insufficient.
+
+#### Capture protocol and exploratory diagnostics
+
+```bash
+make
+make test-demo test-e4 test-scheduler-mode test-window
+python3 scripts/run_e4_eval.py --dry-run
+sudo python3 scripts/run_e4_eval.py
+```
+
+The separate runner leaves the E0–E3 workloads unchanged. Defaults are one CPU
+(CPU 0), 15 seconds of sensor releases, heavy LiDAR, zero hogs, stale dropping
+off, default vision compute/deadline/budget, and the existing partial-switch
+scheduler policy. Only IMU compute cost changes. Zero hogs leaves a measurable
+BE reference; this is not the two-hog E1 isolation workload.
+
+Costs are 150, 500, 1000, 2000, 3000, 4000, 4500, 4750, 5000, 5500, and 6000us
+(3–120% of the 5ms period). Each repetition starts and ends with a 150us control;
+the interior points are shuffled reproducibly with seed 4. The end control
+checks drift, not a second denominator. Use `--cpu`, `--duration`, `--costs`,
+`--repetitions`, and `--seed` to override these settings. `--output` must name a
+new directory; otherwise the runner creates a temporary results directory.
+
+Artifacts include raw per-case output, loader events, commands, environment and
+binary hashes, the runner/header sources, a tracked-source diff, `cases.json`,
+`matrix.csv`, `stages.csv`, and `drain.csv`. Results are saved after each successful case.
+Embedded full-switch flags are rejected before attachment. After attachment,
+live guards report the loader exit code, state, enable sequence, and switch mode.
+Timeout, attach loss/change, full-switch mode, hint-publication errors, and
+inconsistent input/accounting mark the capture incomplete, never a pass. Cleanup
+terminates only the processes and removes only the BPF pins created by this run.
+
+#### Fixed window and drain
+
+E4 enables `--window-stats`. The observation interval is the generators' shared
+`CLOCK_MONOTONIC` epoch through epoch + duration, **not process exit**. Counters
+are reconstructed from timestamped events, not read by a potentially delayed
+observer thread. Queue operations are timestamped under their queue lock;
+completions and stale-at-start observations are timestamped by the worker.
+An event at the cutoff belongs to drain. Underloaded runs stay alive at least
+until the cutoff; overloaded IMU ticks still drain, preserving the behavior
+being diagnosed.
+
+`window_STAGE` / `stages.csv` report offered, completed, late completions,
+stale-at-start/evicted work, dropped work, pending queue entries, in-flight work,
+compute CPU, and rate (`window completions / window seconds`). Queued stages'
+offered count is **actually delivered to that stage before the cutoff**, not
+future upstream outputs. The implicit IMU queue offers every tick scheduled in
+the window. Source sensor counts and source deliveries delayed past the cutoff
+are retained separately. The identity is:
+
+`offered = completed + dropped_stale + pending + in_flight`
+
+The console, `matrix.csv`, and `stages.csv` also report
+`unfinished = pending + in_flight` for each stage. This counts work already
+delivered, not upstream work that has yet to arrive. The matrix retains raw
+offered/completed/late counts, queue/in-flight counts, and CPU for every stage.
+`vision_to_estimator_not_delivered_at_cutoff` is vision window completions
+minus estimator window arrivals; it is separate from the estimator backlog.
+The console shows vision output and estimator arrival rates alongside it.
+
+Late counts apply to completed jobs, not outstanding jobs; read them alongside
+pending and in-flight counts. A zero-completion miss fraction is undefined,
+not 0%. IMU stale observations are now counted at job start as for other stages;
+the IMU still never drops these jobs. Vision CPU and lateness are separate fields.
+
+**CPU boundary precision:** compute loops bracket thread-CPU clock reads with
+monotonic reads. A sample wholly before the cutoff updates a lower CPU bound;
+the first sample provably after the cutoff bounds the missing CPU above. There
+is no proportional interpolation across preemption. `cpu_ns` (and truncated
+`cpu_us`) in the window is the lower bound; `cpu_uncertainty_ns` exposes its
+remaining interval. This includes in-flight job compute. CPU refers to synthetic
+compute, not all hint/queue bookkeeping. Instrumentation is opt-in and enabled
+identically for both probe variants; all release/deadline/freshness clocks stay
+monotonic. Inspect uncertainty before treating differences as meaningful.
+
+`drain_STAGE` / `drain.csv` hold post-cutoff completions, lateness and CPU, never
+classifier inputs. Drain CPU is total minus the window lower bound, hence an
+upper bound with the same uncertainty. Window plus drain CPU nanoseconds and
+completion counts reconcile with totals. `measurement` records exact intended
+epochs and elapsed/drain wall time through worker shutdown; process elapsed
+also includes startup overhead and is reported separately.
+
+LiDAR-registration and mapping get **separate** fixed-window rate ratios to the
+starting 3% control for the same repetition and preemption variant. There is no
+combined BE ratio: cheap mapping completions must not conceal lost registration
+service. A zero-progress control has an undefined ratio.
+
+#### IMU preemption probe — hypothesis test, not policy selection
+
+The first, drain-inclusive pilot showed roughly 50% whole-run IMU CPU share
+once IMU became persistently late. That is not proof that 60% offered IMU work
+exceeds capacity. One hypothesis is a change from wakeup preemption to
+non-wakeup slice sharing; the actual enqueue flags must establish whether that
+transition occurs. In particular, do not assume an expired absolute sleep
+does or does not produce a wakeup.
+
+```bash
+sudo python3 scripts/run_e4_eval.py --preempt-probe
+```
+
+The default diagnostic grid is 150, 2000 and 3000us, on one CPU with the same
+heavy-LiDAR offered load. It brackets paired `wakeup` and `always` variants with
+their own 3% controls, shuffles cost/mode order using the recorded seed, and
+starts a fresh loader per case. `--costs` can override this grid. Both variants
+use the **same demo and embedded BPF binary**: loader-set read-only BPF options
+select the probe before attachment. Default `--imu-preempt wakeup` retains
+wakeup-only direct-local preemption and non-wakeup `DSQ_IMU` insertion;
+`--imu-preempt always` sends every hinted IMU enqueue to local preemption.
+Nothing changes the default policy, budgets, stale handling, or sleep behavior.
+
+Both probe variants enable `--trace-imu`. Enqueue records include monotonic
+timestamp, worker pid_tgid, job/stage, hint presence, scheduler policy, raw
+enqueue flags, wakeup/late indicators, enqueue-context CPU, and assigned DSQ.
+The IMU worker names itself `imu_prop` for diagnostics, so missing/wrong-stage
+hints are visible too; this name is never a scheduling input. Userspace also
+reports its actual policy after setting `SCHED_EXT`. The harness verifies worker
+identity, policy and CPU, and writes per-case `imu-enqueues.csv` with startup,
+window and drain phases. `DSQ_IMU` is the normal non-wakeup destination; the
+always-preempt probe intentionally routes those enqueues directly to local.
+
+To bound observer overhead, ring events sample at most one enqueue per job and
+(wakeup, late) combination, plus stage changes. Unsampled per-CPU counters track
+all matched enqueues/routes, missing hints, wrong policy/stage, and ring loss
+over the **whole case**. Do not mistake sample counts for enqueue frequencies
+or whole-case counters for fixed-window counts. Loss is explicit; tracing is
+disabled outside the opt-in probe.
+
+Compare `imu_window_cpu_pct`, `imu_total_cpu_pct` (total compute / elapsed since
+epoch), fixed-window misses, split BE rates and late enqueue routes. If always
+preempt changes the 60% row, that supports the slice-sharing hypothesis; if it
+does not, inspect other causes rather than selecting admission control. No
+thresholds are frozen, no regime is assigned, and no slack stealing, lower-lane
+floor or admission knob is introduced. E4 remains open pending the probe and
+fresh-repetition validation. Older drain-inclusive logs are rejected by the
+new fixed-window parser rather than silently reinterpreted.
+
+#### Execution probe — blocked time versus runnable waiting
+
+If the enqueue-path A/B does not recover IMU service, the next observation is
+execution, not another policy mechanism:
+
+```bash
+sudo python3 scripts/run_e4_eval.py --execution-probe
+```
+
+This implies the preemption probe, with default costs 150 and 3000us. Both
+variants retain their starting/ending 3% controls: six cases at the same pin,
+15-second release epoch, heavy LiDAR, zero hogs and no stale dropping. The
+existing `always` diagnostic remains opt-in; wakeup-only remains the default.
+No sleep, budget, dispatch, or slice policy is changed.
+
+The loader's opt-in `--trace-execution-cpu N` attaches raw `sched_switch` and
+`sched_wakeup` tracepoints and records IMU `running`/`stopping` callbacks. Raw
+syscall entry/exit hooks retain only the IMU's active syscall **number**, not
+arguments, user memory, or stacks. A blocked switch-out can therefore be
+associated with `clock_nanosleep`, `nanosleep`, `futex`, another syscall, or no
+observed syscall; this is context, not proof of the precise kernel wait site.
+The four raw tracepoint programs are not loaded/attached in ordinary runs.
+
+All switches on the selected CPU are recorded, including non-EXT tasks and
+idle. Wakeups are captured even when their source CPU differs. Each switch
+includes both tasks' pid_tgid, comm, policy, stage hint, EXT remaining slice,
+last insertion timestamp/destination, and requested slice. The DSQ field is
+**last insertion provenance**, not an independently observed dequeue source;
+a resumed task can reuse its slice without another insertion. `running` and
+`stopping` record the IMU slice and callback residency independently of actual
+switches, including callback cycles without a switch to another thread.
+
+The analysis clips all intervals to the demo's exact monotonic epoch. It uses
+the tracepoint's saved `prev_state` and preemption flag: preemption is runnable
+even if raw state is nonzero. A blocked gap ends at the wakeup; wakeup to
+switch-in is runnable waiting. Off-CPU time in `exit`/`exit_group` is a separate
+termination-path category (the final control tick can finish just before T),
+not sleep starvation. CPU occupancy is intersected with this state
+timeline, so every task in a gap is accounted for, not just its first successor.
+Startup/drain events remain in the raw capture but cannot inflate window rates.
+
+Artifacts per case:
+
+- `execution.csv`: all raw diagnostic records with phase and decoded comm.
+- `execution-intervals.csv`: window-only IMU states joined to CPU occupants.
+- `cpu-occupancy.csv`: window time by IMU state, syscall context, task and policy.
+- `switch-away.csv`: immediate successors, observed run intervals, incoming
+  slice and outgoing IMU start/remaining slice, including phase labels.
+- `execution-summary.json`: window scheduled/blocked/runnable times, independent
+  callback residency, and the demo's compute CPU counter.
+
+Scheduler residency is elapsed scheduled time: it includes non-compute work
+and may include interrupt time. It is not interchangeable with thread CPU
+measured around compute. Requested slice zero and observed remaining slice are
+reported separately; do not interpret a zero request as an observed duration.
+
+The execution stream uses a separate ring and unsampled emitted/lost counters.
+The harness requires matching identity/policy, continuous switch and callback
+coverage, and full window coverage. Loss, identity conflicts, migration, or
+ambiguous wake/switch races invalidate attribution; raw evidence is retained.
+The trace consumer is pinned to allowed CPUs other than the measured CPU, and
+its command/affinity is recorded. Instrumentation still has overhead: compare
+the newly traced controls and do not treat this as a replacement performance
+baseline. No cause label, E4 pass, threshold, or admission verdict is generated.
+
+#### Zero-slice translation A/B — implementation check only
+
+The hint API's `slice_ns=0` means scheduler default. The kernel insertion API's
+zero instead preserves the residual slice, using 1ns when exhausted. Translate
+zero (including missing-hint/state fallbacks) to an explicit `SCX_SLICE_DFL`
+(20ms); preserve every nonzero hint. This fix does not change `dispatch(prev)`,
+preemption defaults, budgets, or introduce a deadline-dependent slice.
+
+For this one comparison, the existing execution probe can check the observed
+IMU `running` slices as well as window compute CPU and split BE rates:
+
+```bash
+sudo python3 scripts/run_e4_eval.py --execution-probe --wakeup-only --costs 150,2000,3000
+```
+
+This selects four cases: 3% control, shuffled 40%/60% points, and a closing 3%
+control, all wakeup-only. Run the **same command and tracing settings** against
+archived pre-fix binaries by adding `--binary-dir /path/to/pre-fix-binaries`.
+That directory must contain the demo, loader (with its embedded BPF object),
+and BPF object. Archived mode intentionally skips source freshness checking;
+live partial-switch checks and per-case binary hash checks remain mandatory.
+The output distinguishes the current source tree from archived binaries and
+copies archived scheduler sources when provided. Ordinary runs still require
+`make -q` and keep all probe flags off.
+
+Verify disappearance of the unintended 1ns refill at fresh IMU starts; residual
+slices after interruption need not equal 20ms. Report window CPU, misses and
+LiDAR rate even if they worsen. Removing the 1ns signature establishes the
+translation correction, not a recovered service band or E4 pass. Any follow-up
+`prev` handling is a separate change after this evidence. Do not freeze
+thresholds on the old 1ns matrix. This is not a commitment to retain custom
+tracing: prefer `perf sched`/standard switch tracing for subsequent gap analysis.
+
+#### Post-fix refinement — repetitions without tracing
+
+After the slice translation A/B, refine the critical-stage transition with
+60/65/70/75/80% IMU work and three repetitions:
+
+```bash
+sudo python3 scripts/run_e4_eval.py --costs 150,3000,3250,3500,3750,4000 --repetitions 3
+```
+
+This is 21 cases: each repetition starts and ends at the 3% control, with the
+five intermediate costs shuffled using the recorded seed. Windows stay at
+15 seconds on one pinned CPU, with heavy LiDAR, no hogs and no stale dropping.
+No probe flags are enabled; wakeup-only preemption and `dispatch(prev)` remain
+unchanged. Each row names its own repetition's starting control; ending-control
+ratios expose drift rather than silently changing the denominator.
+
+Read IMU, vision and estimator completed/late/unfinished counts together with
+per-stage CPU. Keep registration and mapping ratios separate, and include
+LiDAR preprocessing completed/late counts. At 80%, compare estimator arrivals
+and pending/in-flight work against vision output: a queued estimator job is
+not a missing handoff. These repetitions remain exploratory, not independent
+validation of frozen thresholds. No safe band, mechanism choice, or E4 pass
+is implied.
+
+#### Estimator transition probe — standard scheduler timeline plus lane records
+
+The three-repetition refinement located a repeatable transition: 65% IMU kept
+all 455 estimator jobs on time, while 70% completed 240, with 237 late and 215
+unfinished. Existing logs put the first observed estimator deadline miss at
+approximately 135.052, 135.054, and 135.029ms after the three epochs (job 4).
+The first observed stale demotion was job 6 at approximately 255.053, 255.053,
+and 255.029ms. Those old logs printed rounded age rather than exact timestamps;
+they bound the focus window but are not exact event times. The corresponding
+65% runs logged no estimator miss/demotion.
+
+Capture the 65/70 transition without another load sweep:
+
+```bash
+sudo python3 scripts/run_e4_eval.py --perf-sched
+```
+
+This runs four cases: 3% starting control, shuffled 65% and 70%, then the 3%
+ending control. It records only switch, waking, new-wakeup, fork, and migration
+events system-wide so
+off-CPU wake sources remain visible; the benchmark and scheduler stay pinned as
+before, while recorder/loader observers are moved off the measured CPU. Perf
+uses the monotonic clock. The runner reports a common interval for each
+repetition: 100ms before that repetition's first observed 70% estimator miss
+through two seconds after it. Full perf data remains available outside the
+focused report. Do not use `perf sched record` here: it additionally enables
+`sched_stat_runtime`, whose event volume during thread-CPU busy loops is both
+large and intrusive.
+
+All workers and generators set distinct Linux thread names before the workload
+epoch so standard perf records identify stages directly. Naming is diagnostic
+metadata only; scheduler classification continues to use published hints.
+
+`perf sched` supplies switch, runnable-wait, blocked-state and incoming-task
+evidence. It does not expose this scheduler's custom DSQ destination. Therefore
+the same opt-in run records every estimator enqueue in the existing scheduler
+ring: exact monotonic timestamp, pid_tgid/job/hint times, enqueue flags,
+destination DSQ, requested slice, accumulated vruntime, per-job execution,
+overrun, policy and CPU. Per-CPU totals require `emitted == enqueues` and zero
+loss before lane attribution. These are insertion destinations, **not observed
+dequeues**. No new tracepoint BPF program is attached.
+
+Artifacts include the raw `perf.data`, focused decoded perf events, estimator and CPU
+`timehist` views, all estimator lanes/events, a focused estimator-lane CSV, and
+JSON with the exact first-observed event and report bounds. Perf-reported loss,
+missing switch records, estimator-ring loss, identity/policy/CPU changes, or an
+unknown lane make attribution invalid while retaining raw evidence. Ordinary
+scheduler events do not have a loss counter, so “first observed” is deliberately
+not called “proven earliest.” All instrumentation is default-off. This probe
+changes no hints, dispatch logic, lane policy, workload, threshold, or E4 status.
+
+#### Grace A/B — first-miss falsification probe
+
+The separate 65/70 capture is superseded once that transition has reproduced.
+The next falsification probe is the global late-demotion grace A/B:
+
+```bash
+sudo python3 scripts/run_e4_eval.py --grace-probe
+```
+
+This brackets two shuffled 70% IMU cases with 3% controls. Both 70% cases use
+the same current BPF object, wakeup-only IMU preemption, workload, and lean perf
+event set; the loader selects either the unchanged 1ms grace or zero grace in
+read-only BPF configuration before attachment. The default remains 1ms for all
+ordinary runs.
+
+The demo records exact monotonic release, completion age, and lateness for
+vision and estimator job 4. The estimator report also records job 4's observed
+enqueue lanes and whether observed jobs 5 onward remain entirely in `DSQ_FE` or
+touch another lane. This separation matters because grace is global: zero grace
+can alter both the upstream LiDAR-preintegration interference and the victim
+estimator's recovery after its first miss.
+
+The A/B does not define success as a lower aggregate miss count. It asks two
+narrow questions: whether estimator job 4 remains FE and finishes by its
+deadline, and whether later estimator jobs remain FE. If job 4 still misses,
+zero grace is insufficient to falsify or establish the upstream budget-tripwire
+model; the next isolated probe is an earlier LiDAR-preintegration budget
+demotion. No dispatch, lane-classification, preemption, lower-lane floor,
+admission, threshold, or E4 status change is part of this run.
+
+#### LiDAR-pre budget A/B — upstream tripwire isolation
+
+If zero grace changes the collapse but estimator job 4 still misses, retain the
+default 1ms grace and isolate how long LiDAR preprocessing remains in FE:
+
+```bash
+sudo python3 scripts/run_e4_eval.py --lidar-pre-budget-probe
+```
+
+This uses the same four-case shape and lean perf event set: 3% controls bracket
+shuffled 70% IMU cases with the default 10ms LiDAR-pre budget and a 6ms budget.
+All cases retain wakeup-only IMU preemption and 1ms deadline grace. An initial
+7ms exploration demoted 54.886us after the 100ms LiDAR-pre deadline and was
+therefore too close to the approximately 7.35ms observed pre-deadline stop.
+The 6ms point is the predeclared fallback, not a reinterpretation of that run.
+
+The 6ms follow-up cleanly demoted LiDAR-pre job 1 to `DSQ_BE` 4.947ms before
+its deadline, but vision job 4 still completed at 20.107ms and estimator job 4
+still missed at 34.654ms. The estimator remained in `DSQ_FE` afterward and
+drained all 455 jobs with 91 late completions, so early budget demotion prevented
+the stale-lane feedback collapse but did not reproduce the approximately 16ms
+vision prefix or prevent the first miss. This is a negative result for budget
+demotion as the sufficient tripwire, not an E4 regime verdict.
+
+The report preserves exact vision/estimator job-4 timing and estimator lanes for
+jobs 5 onward. It also extracts LiDAR-pre `BUDGET_OVERRUN` and
+`BUDGET_DEMOTION` events, including the demotion's signed time from that job's
+deadline. In the current policy, `BUDGET_DEMOTION` is emitted immediately before
+the same enqueue is inserted into `DSQ_BE`, so this event verifies the budget
+route without another custom lane tracer.
+
+Evidence for the upstream tripwire requires vision job 4 to move toward the
+approximately 16ms 65% path, estimator job 4 to finish within 33ms while staying
+FE, observed jobs 5 onward to remain FE, and estimator unfinished work to return
+to zero. A remaining job-4 miss points to another source of the prefix delay and
+makes LiDAR-pre classification the next isolated question. The probe does not
+change the 10ms default and makes no dispatch, floor, admission, threshold, or
+E4 pass decision.
+
+#### LiDAR-pre class A/B — prefix-delay isolation
+
+Because a verified pre-deadline budget demotion did not prevent estimator job
+4's first miss, the next isolated probe changes only LiDAR-pre's initial hint
+class:
+
+```bash
+sudo python3 scripts/run_e4_eval.py --lidar-pre-class-probe
+```
+
+The same four-case, randomized A/B uses FE controls and compares LiDAR-pre
+starting in `SLAM_SCX_CLASS_FE` with starting in `SLAM_SCX_CLASS_BE` at 70% IMU.
+Every case retains the default 10ms LiDAR-pre budget, 1ms deadline grace,
+wakeup-only IMU preemption, heavy LiDAR input, and lean perf event set. The demo
+prints the selected class id, the runner rejects mismatched output, and the
+report records the initial `DSQ_FE` or `DSQ_BE` destination implied by the
+existing class-routing branch. No additional custom tracer is attached.
+
+Evidence for the classification hypothesis requires vision job 4 to move toward
+the approximately 16ms 65% path, estimator job 4 to finish within 33ms and
+remain FE, observed estimator jobs 5 onward to remain FE, and estimator
+unfinished work to remain zero. A remaining first miss means another source
+creates the prefix delay; it is not evidence for `dispatch(prev)`, a lower-lane
+floor, or admission control. This is a diagnostic override only: LiDAR-pre
+remains FE by default, and the probe makes no mechanism, threshold, or E4 pass
+decision.
+
+The class A/B rejected that hypothesis. Starting LiDAR-pre in BE produced the
+same first-miss shape as the verified 6ms budget demotion: vision job 4 completed
+at 20.098ms and estimator job 4 at 34.648ms. All 455 estimator jobs completed,
+91 late and none outside `DSQ_FE`; LiDAR-pre completed 10 and registration none.
+The default-FE comparison reproduced the feedback collapse (239 estimator
+completions, 236 late, 216 unfinished, and every observed job after job 4
+touching a non-FE lane). Both 3% controls matched.
+
+The 91 BE-case estimator misses are exactly jobs 4, 9, 14, ...: every job whose
+deterministic `seq % 5` compute pattern combines the 5ms vision maximum
+(`3000 + (seq % 5) * 500` us) with the 4ms estimator maximum
+(`2000 + (seq % 5) * 500` us). At 70% nominal IMU load, 23.1ms of IMU demand
+plus those 9ms of critical work leaves only 0.9ms in the shared 33ms deadline
+window for release phase and scheduler/application overhead. At 65%, the
+corresponding nominal margin is 2.55ms. The working model is therefore a
+periodic peak-demand boundary whose first miss is amplified by stale demotion,
+not a LiDAR-pre classification tripwire. No initial-class, grace, budget,
+`dispatch(prev)`, floor, or admission change follows from this diagnostic.
+
+#### Validated observational regimes
+
+The heavy-LiDAR single-core control completes only 27 of 150 offered registration
+jobs, so E4 has no honest whole-pipeline “safe band.” The following descriptions
+were frozen before validation; they describe observations rather than policy
+knobs or pass thresholds:
+
+- **Critical-healthy:** IMU, vision, and estimator each have
+  `offered == completed`, `late == 0`, and `unfinished == 0`.
+- **BE slope:** report LiDAR-preprocess completions and LiDAR-registration
+  completion rate relative to the same repetition's 3% control. This is a
+  monotonic loss across the 10–60% exploratory points, not a fabricated cliff.
+  Keep mapping separate because its short jobs can conceal registration loss.
+- **Estimator cliff:** 65% remains critical-healthy; at 70%, the deterministic
+  peak pair first misses and the unchanged stale-demotion policy produces an
+  estimator backlog. Report the first miss separately from the subsequent
+  feedback collapse.
+- **Saturation:** the 95–100% IMU points approach and then equal the entire
+  15-second CPU window with offered IMU compute alone. Report observed IMU and
+  lower-lane outcomes; do not turn this label into an admission-control knob.
+
+The validation used no tracing or diagnostic policy overrides:
+
+```bash
+sudo python3 scripts/run_e4_eval.py \
+  --costs 150,500,750,1000,3000,3250,3500,4750,5000 \
+  --repetitions 3 \
+  --seed 17
+```
+
+This is 30 cases: each repetition has fresh 3% start/end controls around shuffled
+10, 15, 20, 60, 65, 70, 95, and 100% points. The workload itself is not random:
+vision and estimator work remain the deterministic `seq % 5` patterns above.
+Seed 17 changes only the interior case order, so it detects order/drift effects
+but cannot randomize or erase the every-fifth-job peak. Do not enable grace,
+budget, class, preemption, execution, or perf probes for this capture.
+
+The seeded run completed on 2026-09-04 with kernel `7.0.0-30-generic`, CPU 0,
+15-second fixed windows, partial-switch flags `0x8`, and source-matched binaries
+at Git revision `0252accae58096d98edd3cfd974b23025fc129cf`. The machine-local raw
+capture is `/tmp/scx-e4-_03x7ctx`. All six 3% controls were identical: critical
+stages clean, LiDAR preprocess 150, registration 27, and mapping 482; no closing
+control drifted.
+
+| IMU work | Critical stages | LiDAR preprocess | Registration vs control | Mapping |
+| --- | --- | ---: | ---: | ---: |
+| 3% | healthy | 150 | 27 (1.000x) | 482 |
+| 10% | healthy | 150 | 24 (0.889x) | 479 |
+| 15% | healthy | 150 | 21 (0.778x) | 476 |
+| 20% | healthy | 150 | 18 (0.667x) | 473 |
+| 60% | healthy | 54, all late | 3 (0.111x) | 458 |
+| 65% | healthy | 39, all late | 2 (0.074x) | 338, 119 unfinished |
+
+Every repetition produced each row above exactly. “Healthy” means the frozen
+critical-healthy definition: IMU 3000/0/0, vision 455/0/0, and estimator
+455/0/0 for completed/late/unfinished. Registration declines monotonically;
+mapping's short jobs conceal most of that loss until 65%, confirming that the
+two BE columns cannot be combined.
+
+The estimator cliff also repeated exactly. At 65%, estimator job 4 completed at
+approximately 29.6ms with no lateness or unfinished work. At 70%, every run had
+estimator job 4 late at approximately 94.6ms, then finished the window at
+240 completed, 237 late, and 215 unfinished. Thus the default stale demotion
+still turns the deterministic peak miss into backlog.
+
+At 95%, IMU completed all 3000 jobs with one or two late and approximately
+14.25 seconds of compute, while vision completed 42 and left 413 unfinished. At
+100%, IMU completed 2989, left 11 unfinished, and consumed approximately 14.95
+seconds of the window; vision completed two. Lower lanes receive only the
+residue as offered IMU compute approaches and then fills the core.
+
+These observations validate E4's four regime descriptions only for this
+heavy-LiDAR workload, kernel, and CPU pin. They do not motivate or validate a
+grace, class, budget, `dispatch(prev)`, lower-lane floor, or admission-control
+change. E1–E3 remain on the withdrawn full-switch historical snapshot until
+they are rerun with the corrected partial-switch build.
 
 ---
 
