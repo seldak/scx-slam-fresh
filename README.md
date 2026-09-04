@@ -82,6 +82,23 @@ full-switch build reports `0x0`. The evaluation runners reject embedded
 full-switch flags before attaching SCX. When changing `SLAM_FULL_SWITCH`, use a
 clean build or a separate `BUILD_DIR`; Make does not track command-line flag changes.
 
+### Optional ROS 2 workspace
+
+ROS 2 is an opt-in integration and is not part of the default build. Cloning
+the repository and running `make` or the standalone E0-E4 simulations does not
+require ROS 2, Ament, or Colcon.
+
+With ROS 2 Lyrical installed, build and test the integration explicitly:
+
+```bash
+make ros2
+make test-ros2
+```
+
+This uses an isolated Colcon workspace under `.ros2-*`; it does not write into
+the standalone `build/` directory. See [ros2/README.md](ros2/README.md) for the
+package boundaries and current implementation status.
+
 ---
 
 ## Run

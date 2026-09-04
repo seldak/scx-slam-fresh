@@ -2,7 +2,7 @@
 #pragma once
 
 #include <stdint.h>
-#include "../include/scx_slam_fresh_shared.h"
+#include "scx_slam_fresh_shared.h"
 
 #ifdef __cplusplus
 extern "C" {

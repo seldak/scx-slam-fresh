@@ -80,4 +80,10 @@ test-window: $(BUILD_DIR)/test_window_metrics $(BUILD_DIR)/slam_pipeline_demo
 	$(BUILD_DIR)/test_window_metrics
 	DEMO_BIN="$(abspath $(BUILD_DIR)/slam_pipeline_demo)" $(PYTHON) tests/test_window_stats.py
 
-.PHONY: all clean test-demo test-e4 test-scheduler-mode test-window test-slice
+ros2:
+	scripts/run_ros2.sh build
+
+test-ros2:
+	scripts/run_ros2.sh test
+
+.PHONY: all clean test-demo test-e4 test-scheduler-mode test-window test-slice ros2 test-ros2
