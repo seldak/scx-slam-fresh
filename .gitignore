@@ -5,3 +5,4 @@ build/
 *.skel.h
 .vscode/
 .idea/
+__pycache__/

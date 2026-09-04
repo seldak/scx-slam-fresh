@@ -29,6 +29,10 @@ class DemoCliTests(unittest.TestCase):
         self.assertIn("--imu-work-us", result.stderr)
         self.assertIn("default 150", result.stderr)
         self.assertIn("5ms tick", result.stderr)
+        self.assertIn("--lidar-pre-budget-us", result.stderr)
+        self.assertIn("default 10000", result.stderr)
+        self.assertIn("--lidar-pre-class", result.stderr)
+        self.assertIn("default fe", result.stderr)
 
     def test_invalid_imu_work(self):
         for value in (
@@ -45,6 +49,28 @@ class DemoCliTests(unittest.TestCase):
         result = self.invoke("--no-hints", "--imu-work-us")
         self.assertEqual(result.returncode, 1)
         self.assertIn("Usage:", result.stderr)
+
+    def test_lidar_pre_budget_validation(self):
+        for value in ("", "-1", "+1", " 7000", "7000 ", "7ms", str(MAX_WORK_US + 1)):
+            with self.subTest(value=value):
+                result = self.invoke("--lidar-pre-budget-us", value, "--help")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("LiDAR preprocessing budget", result.stderr)
+        for value in ("0", "7000", "10000", str(MAX_WORK_US)):
+            with self.subTest(value=value):
+                result = self.invoke("--lidar-pre-budget-us", value, "--help")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lidar_pre_class_validation(self):
+        for value in ("", "FE", "frontend", "0"):
+            with self.subTest(value=value):
+                result = self.invoke("--lidar-pre-class", value, "--help")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("LiDAR preprocessing class", result.stderr)
+        for value in ("fe", "be"):
+            with self.subTest(value=value):
+                result = self.invoke("--lidar-pre-class", value, "--help")
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_valid_imu_work_bounds(self):
         for value in ("0", "000150", "5000", "6000", str(MAX_WORK_US)):
@@ -67,6 +93,8 @@ class DemoCliTests(unittest.TestCase):
         self.assertEqual(int(fields["vision_budget_us"]), 12000)
         self.assertEqual(int(fields["vision_work_us"]), 0)
         self.assertEqual(int(fields["vision_deadline_us"]), 33000)
+        self.assertEqual(int(fields["lidar_pre_budget_us"]), 10000)
+        self.assertEqual(int(fields["lidar_pre_class_id"]), 1)
         imu = re.search(
             r"^imu_prop:\s+processed=(\d+) late=(\d+) \([^)]*\) cpu_us=(\d+)$",
             result.stdout, re.MULTILINE,

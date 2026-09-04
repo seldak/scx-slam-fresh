@@ -130,8 +130,17 @@ static __always_inline bool scx_move_to_local(u64 dsq_id)
 #define DSQ_BE     0xBE01ULL
 #define DSQ_STALE  0x5A1EULL
 
-/* Demote tasks that are already past their deadline by this grace period. */
-#define DEADLINE_GRACE_NS 1000000ULL /* 1ms */
+/* Demote tasks that are already past their deadline by this grace period.
+ * The loader may set this to zero for a default-off diagnostic A/B.
+ */
+const volatile __u64 deadline_grace_ns = 1000000ULL; /* 1ms */
+
+/* Opt-in diagnostic A/B probe, selected by the loader before attachment.
+ * Default policy is unchanged. Both variants use the same BPF binary.
+ */
+const volatile bool imu_preempt_always = false;
+const volatile bool trace_imu_enqueues = false;
+const volatile bool trace_est_enqueues = false;
 
 static __always_inline u64 enqueue_slice_ns(const struct slam_task_hint *h)
 {
@@ -161,6 +170,12 @@ struct task_state {
     u64 last_reported_budget_overrun_job;
     u64 last_reported_budget_demotion_job;
     u64 last_reported_stale_job;
+    u64 imu_trace_job;
+    u32 imu_trace_stage;
+    u32 imu_trace_mask;
+    u64 trace_insert_dsq;
+    u64 trace_insert_ns;
+    u64 trace_requested_slice;
 };
 
 struct {
@@ -181,6 +196,20 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 20); /* 1 MiB */
 } events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct slam_imu_trace_stats);
+} imu_trace_stats SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct slam_est_trace_stats);
+} est_trace_stats SEC(".maps");
 
 /* -----------------------------
  * Helpers
@@ -266,6 +295,134 @@ static __always_inline u64 effective_deadline_ns(const struct slam_task_hint *h,
     return eff;
 }
 
+#include "execution_trace.bpf.h"
+
+/* A lane record only: perf supplies the execution/wait timeline. Unsampled
+ * enqueue records expose loss explicitly; this never changes routing or hints.
+ */
+static __always_inline void trace_est_enqueue(struct task_struct *p,
+                                              struct task_state *st,
+                                              u64 flags, u64 dsq)
+{
+    if (!trace_est_enqueues)
+        return;
+    u64 key = task_pid_tgid(p);
+    struct slam_task_hint *h = get_hint(key);
+    if (!h || h->stage_id != SLAM_STAGE_STATE_EST)
+        return;
+    u32 zero = 0;
+    struct slam_est_trace_stats *s = bpf_map_lookup_elem(&est_trace_stats, &zero);
+    if (!s)
+        return;
+    s->enqueues++;
+    struct slam_est_enqueue_evt *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        s->lost++;
+        return;
+    }
+    __builtin_memset(e, 0, sizeof(*e));
+    e->base.kind = SLAM_EVT_EST_ENQUEUE;
+    e->base.ts_ns = scx_now_ns();
+    e->base.pid_tgid = key;
+    e->base.stage_id = h->stage_id;
+    e->base.class_id = h->class_id;
+    e->base.job_id = h->job_id;
+    e->base.release_ts_ns = h->release_ts_ns;
+    e->base.deadline_ts_ns = h->deadline_ts_ns;
+    e->base.age_ns = safe_age_ns(e->base.ts_ns, h->release_ts_ns);
+    e->base.exec_ns_in_job = st ? st->exec_ns_in_job : 0;
+    e->enq_flags = flags;
+    e->dsq_id = dsq;
+    e->slice_ns = enqueue_slice_ns(h);
+    e->vruntime = st ? st->vruntime : 0;
+    e->policy = BPF_CORE_READ(p, policy);
+    e->cpu = bpf_get_smp_processor_id();
+    e->overrun = st ? st->overrun : 0;
+    e->state_present = !!st;
+    bpf_ringbuf_submit(e, 0);
+    s->emitted++;
+}
+
+static __always_inline void trace_imu_enqueue(struct task_struct *p,
+                                              struct task_state *st,
+                                              u64 flags, u64 dsq)
+{
+    execution_enqueue(p, st, dsq);
+    trace_est_enqueue(p, st, flags, dsq);
+    if (!trace_imu_enqueues)
+        return;
+    const u64 key = task_pid_tgid(p);
+    struct slam_task_hint *h = get_hint(key);
+    if (!h || h->stage_id != SLAM_STAGE_IMU_PREINT) {
+        char comm[16] = {};
+        bpf_core_read_str(comm, sizeof(comm), &p->comm);
+        if (__builtin_memcmp(comm, "imu_prop", 9))
+            return;
+    }
+    u32 zero = 0;
+    struct slam_imu_trace_stats *s = bpf_map_lookup_elem(&imu_trace_stats, &zero);
+    if (!s)
+        return;
+    const u64 now = scx_now_ns();
+    bool wakeup = !!(flags & SCX_ENQ_WAKEUP);
+    bool late = h && h->deadline_ts_ns && now > h->deadline_ts_ns;
+    u32 policy = BPF_CORE_READ(p, policy);
+    u32 stage = h ? h->stage_id : SLAM_STAGE_MISC;
+    u64 job = h ? h->job_id : 0;
+    s->enqueues++;
+    if (wakeup) {
+        s->wakeup++;
+        if (late) s->late_wakeup++;
+    } else {
+        s->nonwakeup++;
+        if (late) s->late_nonwakeup++;
+    }
+    if (dsq == SCX_DSQ_LOCAL) s->local_preempt++;
+    if (dsq == DSQ_IMU) s->dsq_imu++;
+    if (!h) s->missing_hint++;
+    else if (stage != SLAM_STAGE_IMU_PREINT) s->wrong_stage++;
+    if (policy != 7) s->wrong_policy++; /* Linux SCHED_EXT */
+
+    /* Unsampled counters above; at most one ring event per job and
+     * (wakeup, late) combination, plus stage changes. Never silently hide loss.
+     */
+    u32 bit = 1U << ((wakeup ? 1 : 0) + (late ? 2 : 0));
+    if (st) {
+        if (st->imu_trace_job != job || st->imu_trace_stage != stage) {
+            st->imu_trace_job = job;
+            st->imu_trace_stage = stage;
+            st->imu_trace_mask = 0;
+        }
+        if (st->imu_trace_mask & bit)
+            return;
+        st->imu_trace_mask |= bit;
+    }
+    struct slam_imu_enqueue_evt *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        s->lost++;
+        return;
+    }
+    __builtin_memset(e, 0, sizeof(*e));
+    e->base.kind = SLAM_EVT_IMU_ENQUEUE;
+    e->base.ts_ns = now;
+    e->base.pid_tgid = key;
+    e->base.stage_id = stage;
+    e->base.job_id = job;
+    e->base.release_ts_ns = h ? h->release_ts_ns : 0;
+    e->base.deadline_ts_ns = h ? h->deadline_ts_ns : 0;
+    e->base.class_id = h ? h->class_id : SLAM_SCX_CLASS_BE;
+    e->base.age_ns = h ? safe_age_ns(now, h->release_ts_ns) : 0;
+    e->enq_flags = flags;
+    e->dsq_id = dsq;
+    e->policy = policy;
+    e->cpu = bpf_get_smp_processor_id();
+    e->wakeup = wakeup;
+    e->late = late;
+    e->hint_present = !!h;
+    s->emitted++;
+    bpf_ringbuf_submit(e, 0);
+}
+
 /* -----------------------------
  * sched_ext ops
  * ----------------------------- */
@@ -291,6 +448,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
 
     if (!st) {
         /* Should be rare (state is created in init_task), but never stall. */
+        trace_imu_enqueue(p, st, enq_flags, DSQ_BE);
         scx_insert_vtime(p, DSQ_BE, enqueue_slice_ns(h), now_ns, enq_flags);
         return;
     }
@@ -326,12 +484,14 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
     if (h->stage_id == SLAM_STAGE_IMU_PREINT) {
         u64 vtime = effective_deadline_ns(h, now_ns);
 
-        if (enq_flags & SCX_ENQ_WAKEUP) {
+        if (imu_preempt_always || (enq_flags & SCX_ENQ_WAKEUP)) {
+            trace_imu_enqueue(p, st, enq_flags, SCX_DSQ_LOCAL);
             scx_insert(p, SCX_DSQ_LOCAL, slice,
                        enq_flags | SCX_ENQ_PREEMPT);
             return;
         }
 
+        trace_imu_enqueue(p, st, enq_flags, DSQ_IMU);
         scx_insert_vtime(p, DSQ_IMU, slice, vtime, enq_flags);
         return;
     }
@@ -349,6 +509,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
             emit_evt(SLAM_EVT_STALE_DEMOTION, key, h, st, now_ns);
             st->last_reported_stale_job = h->job_id;
         }
+        trace_imu_enqueue(p, st, enq_flags, DSQ_STALE);
         scx_insert_vtime(p, DSQ_STALE, slice, st->vruntime, enq_flags);
         return;
     }
@@ -358,19 +519,23 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
      * If already past deadline, treat as stale/low priority.
      * (IMU is exempt above.)
      *
-     * Grace: 1ms to avoid flapping around boundary.
+     * Grace avoids flapping around the boundary. Keep the subtraction after
+     * now > deadline so the comparison cannot overflow near U64_MAX.
      */
-    if (h->deadline_ts_ns && now_ns > h->deadline_ts_ns + DEADLINE_GRACE_NS) {
+    if (h->deadline_ts_ns && now_ns > h->deadline_ts_ns &&
+        now_ns - h->deadline_ts_ns > deadline_grace_ns) {
         if (st->last_reported_deadline_miss_job != h->job_id) {
             emit_evt(SLAM_EVT_DEADLINE_MISS, key, h, st, now_ns);
             st->last_reported_deadline_miss_job = h->job_id;
         }
+        trace_imu_enqueue(p, st, enq_flags, DSQ_STALE);
         scx_insert_vtime(p, DSQ_STALE, slice, st->vruntime, enq_flags);
         return;
     }
 
     if (h->class_id == SLAM_SCX_CLASS_FE) {
         if (!st->overrun) {
+            trace_imu_enqueue(p, st, enq_flags, DSQ_FE);
             u64 vtime = effective_deadline_ns(h, now_ns);
             scx_insert_vtime(p, DSQ_FE, slice, vtime, enq_flags);
             return;
@@ -383,6 +548,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
     }
 
     /* BE or FE-overrun => DSQ_BE */
+    trace_imu_enqueue(p, st, enq_flags, DSQ_BE);
     scx_insert_vtime(p, DSQ_BE, slice, st->vruntime, enq_flags);
 }
 
@@ -409,6 +575,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_running, struct task_struct *p)
         return;
 
     st->last_start_ns = scx_now_ns();
+    execution_callback(p, SLAM_EXEC_RUNNING, true, 0);
 }
 
 void BPF_STRUCT_OPS(scx_slam_fresh_stopping, struct task_struct *p, bool runnable)
@@ -426,6 +593,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_stopping, struct task_struct *p, bool runnabl
         return;
 
     u64 delta = now_ns - st->last_start_ns;
+    execution_callback(p, SLAM_EXEC_STOPPING, runnable, delta);
 
     st->exec_ns_in_job += delta;
     st->vruntime += delta;
@@ -503,7 +671,8 @@ void BPF_STRUCT_OPS(scx_slam_fresh_exit_task, struct task_struct *p,
  * sched_ext ops table.
  *
  * Default: partial switch (safer). Full switch can be selected by building with SLAM_FULL_SWITCH=1.
- * Some kernels might not expose SCX_OPS_SWITCH_PARTIAL in BTF; guard it.
+ * SCX_OPS_SWITCH_PARTIAL is an enum constant, not a preprocessor macro.
+ * Require it at compile time instead of silently falling back to full switch.
  */
 SCX_OPS_DEFINE(scx_slam_fresh_ops,
     .select_cpu  = (void *)scx_slam_fresh_select_cpu,
@@ -517,8 +686,6 @@ SCX_OPS_DEFINE(scx_slam_fresh_ops,
     .exit_task   = (void *)scx_slam_fresh_exit_task,
     .name        = "scx_slam_fresh",
 #if !SLAM_FULL_SWITCH
-#ifdef SCX_OPS_SWITCH_PARTIAL
     .flags       = (u64)SCX_OPS_SWITCH_PARTIAL,
-#endif
 #endif
 );

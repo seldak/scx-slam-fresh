@@ -29,11 +29,14 @@
  *   --drop-stale <0|1>   discard expired queued/dequeued jobs (default 0)
  *   --hog <N>            number of hog threads (default 1)
  *   --imu-work-us <N>    IMU compute CPU time per 5ms tick (default 150; 0 disables compute)
+ *   --window-stats      separate fixed-window metrics from post-window drain
  *   --camera-burst-count <N>  delay N camera frames, then release together
  *   --camera-burst-at-ms <N>  burst delivery offset (default 3000)
  *   --vision-budget-us <N>     vision FE per-job CPU budget (default 12000)
  *   --vision-work-us <N>       fixed vision FE work; 0 keeps 3-5ms pattern
  *   --vision-deadline-us <N>   vision FE relative deadline (default 33000)
+ *   --lidar-pre-budget-us <N>   LiDAR preprocessing CPU budget (default 10000)
+ *   --lidar-pre-class <fe|be>   LiDAR preprocessing hint class (default fe)
  *
  * Recommended runs:
  *   # baseline (CFS):
@@ -58,10 +61,13 @@
 #include <thread>
 #include <vector>
 #include <cmath>
+#include "window_metrics.h"
 
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
+#include <sched.h>
 
 extern "C" {
 #include "../src/slamqos.h"
@@ -74,6 +80,17 @@ static uint64_t now_ns()
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Published once, before the common workload epoch. Zero disables the opt-in
+ * instrumentation so existing E0-E3 compute loops retain their old overhead.
+ */
+static std::atomic<uint64_t> metrics_end_ns{0};
+
+static bool inside_window(uint64_t timestamp)
+{
+    uint64_t cutoff = metrics_end_ns.load(std::memory_order_relaxed);
+    return cutoff && timestamp < cutoff;
 }
 
 static uint64_t thread_cpu_ns()
@@ -101,6 +118,36 @@ static void busy_work_us(uint64_t us)
     }
 }
 
+static uint64_t measured_work_us(uint64_t us, WindowStageStats &window)
+{
+    const uint64_t cutoff = metrics_end_ns.load(std::memory_order_relaxed);
+    if (!cutoff) {
+        uint64_t start = thread_cpu_ns();
+        busy_work_us(us);
+        return thread_cpu_ns() - start;
+    }
+
+    CpuWindowBounds bounds{cutoff};
+    uint64_t before = now_ns();
+    const uint64_t start = thread_cpu_ns();
+    bounds.sample(0, before, now_ns());
+    uint64_t elapsed = 0;
+    do {
+        if (!bounds.closed) {
+            before = now_ns();
+            elapsed = thread_cpu_ns() - start;
+            bounds.sample(elapsed, before, now_ns());
+        } else {
+            elapsed = thread_cpu_ns() - start;
+        }
+        asm volatile("" ::: "memory");
+    } while (elapsed < us * 1000ULL);
+    bounds.finish(elapsed);
+    window.cpu_ns += bounds.lower_ns;
+    window.cpu_uncertainty_ns += bounds.upper_ns - bounds.lower_ns;
+    return elapsed;
+}
+
 static int set_sched_ext_policy(int policy)
 {
     if (policy < 0)
@@ -120,6 +167,12 @@ static int set_sched_ext_policy(int policy)
         _exit(EXIT_FAILURE); /* Never report a mislabeled partial/CFS run. */
     }
     return 0;
+}
+
+static void set_thread_name(const char *name)
+{
+    if (pthread_setname_np(pthread_self(), name) != 0)
+        _exit(EXIT_FAILURE); /* Perf attribution must never be silently ambiguous. */
 }
 
 struct WorkItem {
@@ -151,6 +204,11 @@ struct StageStats {
     uint64_t burst_processed{0};
     uint64_t burst_latest_seq{0};
     uint64_t burst_latest_age_ns{0};
+    uint64_t focus_job{0};
+    uint64_t focus_release_ns{0};
+    uint64_t focus_completion_ns{0};
+    WindowStageStats window;
+    int actual_policy{-1};
 };
 
 static inline uint64_t deadline_abs(const WorkItem &w, const StageCfg &cfg)
@@ -195,7 +253,10 @@ public:
          * Let producers prune only expired queued items. The item currently
          * being processed is no longer in q_ and its active hint is untouched.
          */
-        evict_stale_locked(now_ns());
+        uint64_t timestamp = now_ns();
+        evict_stale_locked(timestamp);
+        if (inside_window(timestamp))
+            window_.offered++;
 
         /* Only publish from the producer when it is about to wake a sleeping
          * consumer. Publishing every queued item would overwrite the hint for
@@ -223,6 +284,8 @@ public:
             return false;
 
         out = q_.front();
+        if (inside_window(now_ns()))
+            window_.dequeued++;
         q_.pop_front();
 
         /* Synchronize the map with the exact FIFO item now being processed.
@@ -251,6 +314,12 @@ public:
         return q_.size();
     }
 
+    WindowQueueStats window_stats()
+    {
+        std::unique_lock<std::mutex> lk(mu_);
+        return window_;
+    }
+
 private:
     void evict_stale_locked(uint64_t now)
     {
@@ -261,6 +330,8 @@ private:
             if (is_stale(now, *it, *ht_.cfg)) {
                 it = q_.erase(it);
                 queue_evicted_stale_++;
+                if (inside_window(now))
+                    window_.evicted++;
             } else {
                 ++it;
             }
@@ -298,6 +369,7 @@ private:
     bool waiting_{false};
     bool evict_stale_{false};
     uint64_t queue_evicted_stale_{0};
+    WindowQueueStats window_;
     HintTarget ht_{};
 };
 
@@ -311,6 +383,7 @@ static void stage_worker(BlockingQueue<WorkItem> *in,
                          const std::function<uint64_t(const WorkItem&)> &compute_us_fn,
                          std::atomic<uint64_t> *pid_out)
 {
+    set_thread_name(cfg.name);
     (void)set_sched_ext_policy(ext_policy);
     if (pid_out)
         pid_out->store(slamqos_pid_tgid_self(), std::memory_order_release);
@@ -324,25 +397,42 @@ static void stage_worker(BlockingQueue<WorkItem> *in,
         uint64_t dl = deadline_abs(w, cfg);
         bool stale = is_stale(t0, w, cfg);
 
+        if (inside_window(t0)) {
+            stats->window.started++;
+            if (stale)
+                stats->window.stale_seen++;
+        }
+
         if (stale)
             stats->stale_seen++;
 
         if (stale && drop_stale) {
             stats->dropped_stale++;
+            if (inside_window(t0))
+                stats->window.dropped_stale++;
             continue;
         }
 
         uint64_t work_us = compute_us_fn ? compute_us_fn(w) : 0;
         if (work_us) {
-            uint64_t cpu_start_ns = thread_cpu_ns();
-            busy_work_us(work_us);
-            stats->cpu_ns += thread_cpu_ns() - cpu_start_ns;
+            stats->cpu_ns += measured_work_us(work_us, stats->window);
         }
 
         uint64_t t1 = now_ns();
         stats->processed++;
         if (dl && t1 > dl)
             stats->late++;
+        if (inside_window(t1)) {
+            stats->window.completed++;
+            if (dl && t1 > dl)
+                stats->window.late++;
+        }
+
+        if (w.seq == 4) {
+            stats->focus_job = w.seq;
+            stats->focus_release_ns = w.ts_ns;
+            stats->focus_completion_ns = t1;
+        }
 
         if (w.burst_id) {
             stats->burst_processed++;
@@ -365,7 +455,14 @@ static void imu_thread(const StageCfg &cfg,
                        std::atomic<uint64_t> *workload_start_ns,
                        std::atomic<uint64_t> *pid_out)
 {
+    /* The optional BPF probe can identify this worker even before its first
+     * hint, or if a later hint is missing/misclassified. Not a policy input.
+     */
+    set_thread_name("imu_prop");
     (void)set_sched_ext_policy(ext_policy);
+    stats->actual_policy = sched_getscheduler(0);
+    if (stats->actual_policy < 0 || (ext_policy >= 0 && stats->actual_policy != ext_policy))
+        _exit(EXIT_FAILURE);
 
     uint64_t self = slamqos_pid_tgid_self();
     if (pid_out)
@@ -402,14 +499,26 @@ static void imu_thread(const StageCfg &cfg,
 
         uint64_t dl_abs = (cfg.deadline_rel_ns) ? (next + cfg.deadline_rel_ns) : 0;
 
-        uint64_t cpu_start_ns = thread_cpu_ns();
-        busy_work_us(work_us);
-        stats->cpu_ns += thread_cpu_ns() - cpu_start_ns;
+        uint64_t t0 = now_ns();
+        bool stale = t0 > next && t0 - next > cfg.stale_ns;
+        if (stale)
+            stats->stale_seen++;
+        if (inside_window(t0)) {
+            stats->window.started++;
+            if (stale)
+                stats->window.stale_seen++;
+        }
+        stats->cpu_ns += measured_work_us(work_us, stats->window);
 
         uint64_t end = now_ns();
         stats->processed++;
         if (dl_abs && end > dl_abs)
             stats->late++;
+        if (inside_window(end)) {
+            stats->window.completed++;
+            if (dl_abs && end > dl_abs)
+                stats->window.late++;
+        }
 
         seq++;
         next += period_ns;
@@ -419,6 +528,7 @@ static void imu_thread(const StageCfg &cfg,
 
 static void hog_thread(std::atomic<bool> *running, int ext_policy)
 {
+    set_thread_name("cpu_hog");
     (void)set_sched_ext_policy(ext_policy);
     while (running->load()) {
         busy_work_us(20000);
@@ -452,9 +562,52 @@ static uint64_t dropped_stale_total(const StageStats &stats)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N] [--imu-work-us N] [--camera-burst-count N] [--camera-burst-at-ms N] [--vision-budget-us N] [--vision-work-us N] [--vision-deadline-us N]\n"
-        "  --imu-work-us N: IMU compute CPU microseconds per 5ms tick (default 150; 0 disables compute)\n",
+        "Usage: %s (--pin <dir> | --no-hints) [--ext-policy N] [--duration S] [--lidar off|light|mid|heavy] [--drop-stale 0|1] [--hog N] [--imu-work-us N] [--camera-burst-count N] [--camera-burst-at-ms N] [--vision-budget-us N] [--vision-work-us N] [--vision-deadline-us N] [--lidar-pre-budget-us N] [--lidar-pre-class fe|be]\n"
+        "  --imu-work-us N: IMU compute CPU microseconds per 5ms tick (default 150; 0 disables compute)\n"
+        "  --lidar-pre-budget-us N: LiDAR preprocessing CPU budget (default 10000)\n"
+        "  --lidar-pre-class fe|be: LiDAR preprocessing hint class (default fe)\n"
+        "  --window-stats: timestamp fixed-window counters and separate drain metrics\n",
         argv0);
+}
+
+static void print_window_stage(const char *name, const StageStats &stats,
+                               const WindowQueueStats &queue)
+{
+    const auto &w = stats.window;
+    const uint64_t inflight = queue.dequeued - w.completed - w.dropped_stale;
+    printf("window_%s: offered=%llu completed=%llu late=%llu stale_seen=%llu "
+           "dropped_stale=%llu pending=%llu in_flight=%llu cpu_us=%llu "
+           "cpu_ns=%llu cpu_uncertainty_ns=%llu\n", name,
+           (unsigned long long)queue.offered, (unsigned long long)w.completed,
+           (unsigned long long)w.late, (unsigned long long)(w.stale_seen + queue.evicted),
+           (unsigned long long)(w.dropped_stale + queue.evicted),
+           (unsigned long long)queue.pending(), (unsigned long long)inflight,
+           (unsigned long long)(w.cpu_ns / 1000), (unsigned long long)w.cpu_ns,
+           (unsigned long long)w.cpu_uncertainty_ns);
+    /* Window CPU is a lower bound, so its exact complement is a drain upper
+     * bound with the same uncertainty. Nanoseconds reconcile without rounding.
+     */
+    printf("drain_%s: completed=%llu late=%llu cpu_us=%llu cpu_ns=%llu "
+           "cpu_uncertainty_ns=%llu\n", name,
+           (unsigned long long)(stats.processed - w.completed),
+           (unsigned long long)(stats.late - w.late),
+           (unsigned long long)((stats.cpu_ns - w.cpu_ns) / 1000),
+           (unsigned long long)(stats.cpu_ns - w.cpu_ns),
+           (unsigned long long)w.cpu_uncertainty_ns);
+}
+
+static void print_focus_job(const char *name, const StageStats &stats,
+                            const StageCfg &cfg)
+{
+    if (stats.focus_job != 4 || !stats.focus_completion_ns)
+        return;
+    const uint64_t age_ns = stats.focus_completion_ns - stats.focus_release_ns;
+    const bool late = cfg.deadline_rel_ns && age_ns > cfg.deadline_rel_ns;
+    printf("focus_%s: job=%llu release_ns=%llu completion_ns=%llu age_ns=%llu late=%u\n",
+           name, (unsigned long long)stats.focus_job,
+           (unsigned long long)stats.focus_release_ns,
+           (unsigned long long)stats.focus_completion_ns,
+           (unsigned long long)age_ns, (unsigned int)late);
 }
 
 static void wait_for_pid(std::atomic<uint64_t> &pid, const char *name)
@@ -487,6 +640,7 @@ int main(int argc, char **argv)
 {
     const char *pin_dir = nullptr;
     bool no_hints = false;
+    bool window_stats = false;
     int ext_policy = -1;
     int duration_s = 10;
     std::string lidar_mode = "off";
@@ -498,12 +652,16 @@ int main(int argc, char **argv)
     uint64_t vision_budget_us = 12'000;
     uint64_t vision_work_us = 0;
     uint64_t vision_deadline_us = 33'000;
+    uint64_t lidar_pre_budget_us = 10'000;
+    std::string lidar_pre_class = "fe";
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
             pin_dir = argv[++i];
         } else if (!strcmp(argv[i], "--no-hints")) {
             no_hints = true;
+        } else if (!strcmp(argv[i], "--window-stats")) {
+            window_stats = true;
         } else if (!strcmp(argv[i], "--ext-policy") && i + 1 < argc) {
             ext_policy = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--duration") && i + 1 < argc) {
@@ -560,6 +718,23 @@ int main(int argc, char **argv)
                 return 1;
             }
             vision_deadline_us = (uint64_t)value;
+        } else if (!strcmp(argv[i], "--lidar-pre-budget-us") && i + 1 < argc) {
+            const char *arg = argv[++i];
+            char *end = nullptr;
+            errno = 0;
+            unsigned long long value = strtoull(arg, &end, 10);
+            if (!*arg || strspn(arg, "0123456789") != strlen(arg) ||
+                errno || !end || *end != '\0' || value > UINT64_MAX / 1'000ULL) {
+                fprintf(stderr, "error: LiDAR preprocessing budget must be a non-negative integer number of microseconds that fits in nanoseconds\n");
+                return 1;
+            }
+            lidar_pre_budget_us = (uint64_t)value;
+        } else if (!strcmp(argv[i], "--lidar-pre-class") && i + 1 < argc) {
+            lidar_pre_class = argv[++i];
+            if (lidar_pre_class != "fe" && lidar_pre_class != "be") {
+                fprintf(stderr, "error: LiDAR preprocessing class must be fe or be\n");
+                return 1;
+            }
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -621,8 +796,10 @@ int main(int argc, char **argv)
     StageCfg cfg_est { "state_est",  SLAM_STAGE_STATE_EST,   SLAM_SCX_CLASS_FE,
                        33'000'000ULL, 66'000'000ULL, 12'000'000ULL, 0, 0 };
 
-    StageCfg cfg_lpre{ "lidar_pre",  SLAM_STAGE_LIDAR_PREINT,SLAM_SCX_CLASS_FE,
-                       100'000'000ULL, 150'000'000ULL, 10'000'000ULL, 0, 0 };
+    const uint32_t lidar_pre_class_id = lidar_pre_class == "fe" ? SLAM_SCX_CLASS_FE : SLAM_SCX_CLASS_BE;
+    StageCfg cfg_lpre{ "lidar_pre",  SLAM_STAGE_LIDAR_PREINT,lidar_pre_class_id,
+                       100'000'000ULL, 150'000'000ULL,
+                       lidar_pre_budget_us * 1'000ULL, 0, 0 };
 
     StageCfg cfg_lreg{ "lidar_reg",  SLAM_STAGE_LIDAR_REG,   SLAM_SCX_CLASS_BE,
                        200'000'000ULL, 250'000'000ULL, 0, 0, 0 };
@@ -716,6 +893,9 @@ int main(int argc, char **argv)
     }
 
     const uint64_t workload_start = now_ns() + 100'000'000ULL;
+    const uint64_t workload_end = workload_start + (uint64_t)duration_s * 1'000'000'000ULL;
+    if (window_stats)
+        metrics_end_ns.store(workload_end, std::memory_order_relaxed);
     workload_start_ns.store(workload_start, std::memory_order_release);
 
     uint64_t cam_generated = 0;
@@ -726,6 +906,7 @@ int main(int argc, char **argv)
      * instead of silently lowering the sensor rate.
      */
     std::thread cam_gen([&]{
+        set_thread_name("camera_gen");
         uint64_t seq = 1;
         const uint64_t period_ns = camera_period_ns;
         const uint64_t start = workload_start;
@@ -767,6 +948,7 @@ int main(int argc, char **argv)
     });
 
     std::thread lidar_gen([&]{
+        set_thread_name("lidar_gen");
         if (!lidar_points)
             return;
         uint64_t seq = 1;
@@ -789,6 +971,9 @@ int main(int argc, char **argv)
     lidar_gen.join();
     t_imu.join();
 
+    if (window_stats)
+        sleep_until_ns(workload_end); /* Never end an underloaded window early. */
+
     running.store(false);
 
     q_cam.stop();
@@ -805,6 +990,7 @@ int main(int argc, char **argv)
     }
     t_map.join();
     for (auto &t : hogs) t.join();
+    const uint64_t finished_ns = now_ns();
 
     st_vis.queue_evicted_stale = q_cam.queue_evicted_stale();
     st_est.queue_evicted_stale = q_vis.queue_evicted_stale();
@@ -819,6 +1005,26 @@ int main(int argc, char **argv)
     const size_t pending_map = q_map.pending();
 
     printf("\n=== Results ===\n");
+    if (window_stats) {
+        printf("measurement: start_ns=%llu end_ns=%llu window_ns=%llu elapsed_ns=%llu drain_elapsed_ns=%llu\n",
+               (unsigned long long)workload_start, (unsigned long long)workload_end,
+               (unsigned long long)(workload_end - workload_start),
+               (unsigned long long)(finished_ns - workload_start),
+               (unsigned long long)(finished_ns > workload_end ? finished_ns - workload_end : 0));
+        printf("imu_identity: pid_tgid=%llu policy=%d stage_id=%u\n",
+               (unsigned long long)pid_imu.load(), st_imu.actual_policy, cfg_imu.stage_id);
+        WindowQueueStats imu_queue{(uint64_t)duration_s * 200ULL, st_imu.window.started, 0};
+        print_window_stage("imu_prop", st_imu, imu_queue);
+        print_window_stage("vision_fe", st_vis, q_cam.window_stats());
+        print_window_stage("state_est", st_est, q_vis.window_stats());
+        print_focus_job("vision_fe", st_vis, cfg_vis);
+        print_focus_job("state_est", st_est, cfg_est);
+        if (lidar_points) {
+            print_window_stage("lidar_pre", st_lpre, q_lidar0.window_stats());
+            print_window_stage("lidar_reg", st_lreg, q_lidar1.window_stats());
+        }
+        print_window_stage("mapping_be", st_map, q_map.window_stats());
+    }
     printf("generated:  imu=%llu camera=%llu lidar=%llu\n",
            (unsigned long long)st_imu.processed,
            (unsigned long long)cam_generated,
@@ -834,11 +1040,13 @@ int main(int argc, char **argv)
            (unsigned long long)(camera_burst_count > 0
                ? camera_burst_delivery_index * camera_period_ns / 1'000'000ULL
                : 0));
-    printf("configuration: vision_budget_us=%llu vision_work_us=%llu vision_deadline_us=%llu imu_work_us=%llu\n",
+    printf("configuration: vision_budget_us=%llu vision_work_us=%llu vision_deadline_us=%llu "
+           "imu_work_us=%llu lidar_pre_budget_us=%llu lidar_pre_class_id=%u\n",
            (unsigned long long)vision_budget_us,
            (unsigned long long)vision_work_us,
            (unsigned long long)vision_deadline_us,
-           (unsigned long long)imu_work_us);
+           (unsigned long long)imu_work_us,
+           (unsigned long long)lidar_pre_budget_us, lidar_pre_class_id);
     printf("imu_prop:   processed=%llu late=%llu (%.1f%%) cpu_us=%llu\n",
            (unsigned long long)st_imu.processed,
            (unsigned long long)st_imu.late,

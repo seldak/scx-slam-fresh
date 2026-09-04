@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: GPL-2.0
+"""Compile the production slice helper on the host; no BPF privileges needed."""
+
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import tempfile
+import unittest
+
+
+REPO = Path(__file__).resolve().parents[1]
+SOURCE = REPO / "bpf/scx_slam_fresh.bpf.c"
+
+
+class SliceTests(unittest.TestCase):
+    def test_actual_helper_preserves_explicit_hints_and_refills_zero(self):
+        source = SOURCE.read_text()
+        helper = re.search(r"static __always_inline u64 enqueue_slice_ns\([^)]*\)\n\{.*?\n\}",
+                           source, re.S)
+        self.assertIsNotNone(helper)
+        vmlinux = Path(os.environ.get("VMLINUX_H", REPO / "build/vmlinux.h")).read_text()
+        default = re.search(r"\bSCX_SLICE_DFL = (\d+)", vmlinux)
+        self.assertIsNotNone(default)
+        self.assertEqual(int(default[1]), 20_000_000)
+        program = '''
+#include <assert.h>
+#include <stddef.h>
+#include "scx_slam_fresh_shared.h"
+typedef uint64_t u64;
+enum { SCX_SLICE_DFL = DEFAULT_NS };
+HELPER
+int main(void) {
+    struct slam_task_hint hint = {};
+    assert(enqueue_slice_ns(NULL) == SCX_SLICE_DFL);
+    assert(enqueue_slice_ns(&hint) == SCX_SLICE_DFL);
+    assert(hint.slice_ns == 0); // Translation never mutates userspace metadata.
+    const uint64_t explicit_slices[] = {1, 150000, 5000000, 20000000, UINT64_MAX};
+    for (size_t i = 0; i < sizeof(explicit_slices) / sizeof(explicit_slices[0]); i++) {
+        uint64_t slice = explicit_slices[i];
+        hint.slice_ns = slice;
+        assert(enqueue_slice_ns(&hint) == slice);
+    }
+    // A zero hint refills on EVERY enqueue, independent of prior residual.
+    hint.slice_ns = 0;
+    const uint64_t residuals[] = {0, 1, 1000, SCX_SLICE_DFL};
+    for (size_t i = 0; i < sizeof(residuals) / sizeof(residuals[0]); i++) {
+        uint64_t residual = residuals[i];
+        const uint64_t request = enqueue_slice_ns(&hint);
+        // Model the documented kernel insertion rule, not a benchmark.
+        const uint64_t next = request ? request : (residual ? residual : 1);
+        assert(next == SCX_SLICE_DFL);
+    }
+}
+'''.replace("DEFAULT_NS", default[1]).replace("HELPER", helper[0])
+        with tempfile.TemporaryDirectory(prefix="scx-slice-test-") as directory:
+            binary = Path(directory) / "test"
+            subprocess.run([*shlex.split(os.environ.get("CC", "cc")), "-std=gnu2x", "-Wall", "-Wextra",
+                            "-Werror", "-I", str(REPO / "include"), "-x", "c", "-", "-o", str(binary)],
+                           input=program, text=True, check=True)
+            subprocess.run([str(binary)], check=True)
+
+    def test_every_enqueue_route_uses_translation(self):
+        source = SOURCE.read_text()
+        body = source.split("void BPF_STRUCT_OPS(scx_slam_fresh_enqueue,", 1)[1].split(
+            "void BPF_STRUCT_OPS(scx_slam_fresh_dispatch,", 1)[0]
+        self.assertIn("u64 slice = enqueue_slice_ns(h);", body)
+        calls = re.findall(r"\bscx_insert(?:_vtime)?\(p, [^,]+, (slice|enqueue_slice_ns\(h\))[,)]", body)
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(calls.count("enqueue_slice_ns(h)"), 1)  # No-state fallback.
+        self.assertEqual(len(re.findall(r"\bscx_insert(?:_vtime)?\(", body)), len(calls))
+
+    def test_estimator_probe_observes_every_route_without_changing_it(self):
+        source = SOURCE.read_text()
+        enqueue = source.split("void BPF_STRUCT_OPS(scx_slam_fresh_enqueue,", 1)[1].split(
+            "void BPF_STRUCT_OPS(scx_slam_fresh_dispatch,", 1)[0]
+        helper = source.split("static __always_inline void trace_imu_enqueue(", 1)[1].split(
+            "/* -----------------------------\n * sched_ext ops", 1)[0]
+        self.assertEqual(helper.count("trace_est_enqueue(p, st, flags, dsq);"), 1)
+        self.assertEqual(enqueue.count("trace_imu_enqueue(p, st,"), 7)
+        self.assertEqual(enqueue.count("scx_insert(p,"), 1)
+        self.assertEqual(enqueue.count("scx_insert_vtime(p,"), 6)
+        self.assertIn("if (!trace_est_enqueues)\n        return;", source)
+
+    def test_deadline_grace_is_runtime_selected_without_overflow(self):
+        source = SOURCE.read_text()
+        self.assertIn("const volatile __u64 deadline_grace_ns = 1000000ULL;", source)
+        self.assertIn("now_ns > h->deadline_ts_ns &&\n        now_ns - h->deadline_ts_ns > deadline_grace_ns", source)
+        self.assertNotIn("now_ns > h->deadline_ts_ns +", source)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -71,6 +71,17 @@ What `make` does:
 3) generates a libbpf skeleton header `build/scx_slam_fresh.skel.h`  
 4) builds the user-space loader and the demo
 
+Check the embedded scheduler mode without root or BPF attachment:
+```bash
+./build/scx_slam_fresh_user --print-ops-flags
+make test-scheduler-mode
+```
+
+The default build must report `0x8` (`SCX_OPS_SWITCH_PARTIAL`), while an explicit
+full-switch build reports `0x0`. The evaluation runners reject embedded
+full-switch flags before attaching SCX. When changing `SLAM_FULL_SWITCH`, use a
+clean build or a separate `BUILD_DIR`; Make does not track command-line flag changes.
+
 ---
 
 ## Run
@@ -107,6 +118,8 @@ This pins (at least) the following maps:
   default 3-5ms pattern
 - `--vision-deadline-us N` sets the vision relative deadline
 - `--duration S` controls run length
+- `--window-stats` separates metrics at the common monotonic cutoff from
+  post-window drain. E4 enables it automatically; ordinary runs keep legacy totals.
 
 The results' `configuration` line records `imu_work_us`. For example, a
 non-root smoke run with 30% nominal IMU utilization is:
@@ -115,7 +128,7 @@ non-root smoke run with 30% nominal IMU utilization is:
 ./build/slam_pipeline_demo --no-hints --lidar off --hog 0 --duration 2 --imu-work-us 1500
 ```
 
-Run the non-root CLI and IMU CPU-accounting regression tests with `make test-demo`
+Run the non-root CLI and IMU CPU-accounting regression tests with `make test-demo test-window`
 (requires Python 3 and `taskset`). This is not the E4 isolation sweep.
 
 
@@ -182,6 +195,45 @@ Run only the focused E3 budget-misconfiguration pair with:
 ```bash
 sudo env EVAL_SCOPE=e3 scripts/run_single_core_eval.sh
 ```
+
+Prepare and run the separate exploratory E4 IMU-cost sweep with:
+```bash
+make test-e4
+python3 scripts/run_e4_eval.py --dry-run
+sudo python3 scripts/run_e4_eval.py
+```
+
+It uses heavy LiDAR, no hogs, stale dropping off, and bracketing 3% IMU controls.
+It saves fixed-window per-stage rates and separate LiDAR-registration/mapping
+ratios in CSV, with post-window completions and CPU in `drain.csv`.
+
+To diagnose IMU late-regime behavior without changing the default policy:
+```bash
+python3 scripts/run_e4_eval.py --preempt-probe --dry-run
+sudo python3 scripts/run_e4_eval.py --preempt-probe
+```
+
+This pairs wakeup-only and every-enqueue preemption at 150, 2000, and 3000us,
+using the same binaries and tracing both variants. The loader option
+`--imu-preempt always` is an opt-in probe, not a new policy default. No thresholds
+or admission-control verdict are implied; see [the E4 evaluation plan](docs/DESIGN_EVALUATION.md#e4-imu-lane-isolation).
+
+To measure who runs while IMU is off-CPU, with the same 15-second window:
+
+```bash
+make -j
+make test-e4 test-scheduler-mode
+sudo python3 scripts/run_e4_eval.py --execution-probe
+```
+
+This records CPU-wide switches, IMU wakeups and running/stopping callbacks,
+plus the active syscall at switch-out. It pairs 150/3000us wakeup/always runs
+with bracketing controls (six cases). Per-case `execution-summary.json` splits
+scheduled residency, blocked time, and runnable waiting; `cpu-occupancy.csv`
+identifies the tasks running in each state. Raw events, interval timelines,
+and immediate-successor slice observations are retained separately. Ring loss
+or incomplete coverage invalidates the diagnostic. No extra policy path is
+added; ordinary runs do not attach these tracepoints.
 
 The scheduler now has a dedicated `DSQ_IMU` lane. Results from before that change are not quoted here because they are not comparable to the current policy. Re-run the matrix above before reporting miss-rate improvements. Compare:
 - `imu_prop`, `vision_fe`, and `state_est` deadline-miss percentages

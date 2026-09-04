@@ -56,6 +56,10 @@ wait_for_scheduler() {
         if [[ -e "$pin_dir/task_hints" ]] &&
            [[ -r /sys/kernel/sched_ext/state ]] &&
            [[ $(< /sys/kernel/sched_ext/state) == enabled ]]; then
+            if [[ $(< /sys/kernel/sched_ext/switch_all) != 0 ]]; then
+                echo "error: scheduler attached in full-switch mode; partial mode is required" >&2
+                return 1
+            fi
             return 0
         fi
 
@@ -317,6 +321,16 @@ if [[ $(< /sys/kernel/sched_ext/state) != disabled ]]; then
     exit 1
 fi
 
+ops_flags=$("$loader_bin" --print-ops-flags)
+if [[ ! $ops_flags =~ ^0x[0-9a-fA-F]+$ ]]; then
+    echo "error: could not inspect embedded scheduler flags; rebuild the loader" >&2
+    exit 1
+fi
+if [[ $eval_scope != e0 ]] && (( (ops_flags & 8) == 0 )); then
+    echo "error: embedded ops_flags=$ops_flags lacks SCX_OPS_SWITCH_PARTIAL; refusing to attach" >&2
+    exit 1
+fi
+
 mkdir -p -- "$output_dir"
 trap cleanup EXIT INT TERM
 
@@ -349,6 +363,7 @@ e3_low_budget_us=$e3_low_budget_us
 e3_vision_work_us=$e3_vision_work_us
 e3_vision_deadline_us=$e3_vision_deadline_us
 ext_policy=$ext_policy
+ops_flags=$ops_flags
 repetitions=$repetitions
 eval_scope=$eval_scope
 git_commit=$(git -C "$repo_dir" rev-parse HEAD)

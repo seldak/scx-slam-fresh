@@ -12,9 +12,12 @@
 #include <unistd.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <limits.h>
 #include <stdarg.h>
 
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 
 #include "../include/scx_slam_fresh_shared.h"
 #include "scx_slam_fresh.skel.h"
@@ -50,6 +53,38 @@ static int handle_evt(void *ctx, void *data, size_t data_sz)
 
     const struct slam_evt *e = (const struct slam_evt *)data;
 
+    if (e->kind == SLAM_EVT_EST_ENQUEUE) {
+        if (data_sz < sizeof(struct slam_est_enqueue_evt))
+            return 0;
+        const struct slam_est_enqueue_evt *est = data;
+        printf("[est_enqueue] ts_ns=%llu pid_tgid=%llu job=%llu stage=%u "
+               "release_ns=%llu deadline_ns=%llu enq_flags=0x%llx dsq=0x%llx "
+               "slice_ns=%llu vruntime=%llu exec_ns=%llu policy=%u cpu=%u overrun=%u state_present=%u\n",
+               (unsigned long long)e->ts_ns, (unsigned long long)e->pid_tgid,
+               (unsigned long long)e->job_id, e->stage_id,
+               (unsigned long long)e->release_ts_ns, (unsigned long long)e->deadline_ts_ns,
+               (unsigned long long)est->enq_flags, (unsigned long long)est->dsq_id,
+               (unsigned long long)est->slice_ns, (unsigned long long)est->vruntime,
+               (unsigned long long)e->exec_ns_in_job, est->policy, est->cpu,
+               est->overrun, est->state_present);
+        return 0;
+    }
+
+    if (e->kind == SLAM_EVT_IMU_ENQUEUE) {
+        if (data_sz < sizeof(struct slam_imu_enqueue_evt))
+            return 0;
+        const struct slam_imu_enqueue_evt *imu = data;
+        printf("[imu_enqueue] ts_ns=%llu pid_tgid=%llu job=%llu stage=%u "
+               "release_ns=%llu deadline_ns=%llu enq_flags=0x%llx dsq=0x%llx "
+               "policy=%u cpu=%u wakeup=%u late=%u hint_present=%u\n",
+               (unsigned long long)e->ts_ns, (unsigned long long)e->pid_tgid,
+               (unsigned long long)e->job_id, e->stage_id,
+               (unsigned long long)e->release_ts_ns, (unsigned long long)e->deadline_ts_ns,
+               (unsigned long long)imu->enq_flags, (unsigned long long)imu->dsq_id,
+               imu->policy, imu->cpu, imu->wakeup, imu->late, imu->hint_present);
+        return 0;
+    }
+
     const char *kind = "UNKNOWN";
     switch (e->kind) {
     case SLAM_EVT_DEADLINE_MISS:  kind = "DEADLINE_MISS"; break;
@@ -59,24 +94,152 @@ static int handle_evt(void *ctx, void *data, size_t data_sz)
     default: break;
     }
 
-    printf("[evt] %s stage=%u job=%llu pid_tgid=0x%llx age=%.3fms exec=%.3fms\n",
+    printf("[evt] %s stage=%u job=%llu pid_tgid=0x%llx age=%.3fms exec=%.3fms "
+           "ts_ns=%llu release_ns=%llu deadline_ns=%llu\n",
            kind,
            e->stage_id,
            (unsigned long long)e->job_id,
            (unsigned long long)e->pid_tgid,
            (double)e->age_ns / 1e6,
-           (double)e->exec_ns_in_job / 1e6);
+           (double)e->exec_ns_in_job / 1e6,
+           (unsigned long long)e->ts_ns, (unsigned long long)e->release_ts_ns,
+           (unsigned long long)e->deadline_ts_ns);
     return 0;
+}
+
+static const char *blocking_syscall(uint64_t id)
+{
+    if (id == (uint64_t)-1) return "none";
+    if (id == SYS_clock_nanosleep) return "clock_nanosleep";
+    if (id == SYS_nanosleep) return "nanosleep";
+    if (id == SYS_futex) return "futex";
+    if (id == SYS_exit || id == SYS_exit_group) return "exit";
+    return "other";
+}
+
+static void print_execution_task(const char *prefix, const struct slam_execution_task *t)
+{
+    /* Hex comm is lossless and cannot inject delimiters or new log lines. */
+    printf(" %s_key=%llu %s_policy=%u %s_stage=%u %s_slice_ns=%llu "
+           "%s_last_dsq=%llu %s_insert_ns=%llu %s_requested_slice_ns=%llu %s_comm_hex=",
+           prefix, (unsigned long long)t->pid_tgid, prefix, t->policy,
+           prefix, t->stage, prefix, (unsigned long long)t->slice_ns,
+           prefix, (unsigned long long)t->last_insert_dsq,
+           prefix, (unsigned long long)t->last_insert_ns,
+           prefix, (unsigned long long)t->requested_slice_ns, prefix);
+    for (size_t i = 0; i < sizeof(t->comm); i++)
+        printf("%02x", (unsigned char)t->comm[i]);
+}
+
+static int handle_execution_evt(void *ctx, void *data, size_t size)
+{
+    (void)ctx;
+    if (size != sizeof(struct slam_execution_evt)) return -EINVAL;
+    const struct slam_execution_evt *e = data;
+    printf("[execution] kind=%u ts_ns=%llu imu_key=%llu cpu=%u runnable=%u preempt=%u "
+           "prev_state=%llu callback_delta_ns=%llu syscall_id=%llu syscall=%s",
+           e->kind, (unsigned long long)e->ts_ns, (unsigned long long)e->imu_pid_tgid,
+           e->cpu, e->runnable, e->preempt, (unsigned long long)e->prev_state,
+           (unsigned long long)e->callback_delta_ns, (unsigned long long)e->syscall_id,
+           blocking_syscall(e->syscall_id));
+    print_execution_task("task", &e->task);
+    print_execution_task("next", &e->next);
+    putchar('\n');
+    return 0;
+}
+
+static int print_execution_stats(struct scx_slam_fresh_bpf *skel)
+{
+    int ncpu = libbpf_num_possible_cpus();
+    if (ncpu < 1) return -EINVAL;
+    struct slam_execution_stats *values = calloc(ncpu, sizeof(*values));
+    if (!values) return -ENOMEM;
+    uint32_t key = 0;
+    int err = bpf_map_lookup_elem(bpf_map__fd(skel->maps.execution_stats), &key, values);
+    struct slam_execution_stats sum = {};
+    if (!err) {
+        for (int cpu = 0; cpu < ncpu; cpu++) {
+            sum.emitted += values[cpu].emitted;
+            sum.lost += values[cpu].lost;
+            sum.identity_conflicts += values[cpu].identity_conflicts;
+        }
+        printf("execution_summary: emitted=%llu lost=%llu identity_conflicts=%llu\n",
+               (unsigned long long)sum.emitted, (unsigned long long)sum.lost,
+               (unsigned long long)sum.identity_conflicts);
+    }
+    free(values);
+    return err;
 }
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s --pin <dir>\n"
+            "Usage: %s (--pin <dir> | --print-ops-flags)\n"
+            "  --print-ops-flags: inspect embedded BPF flags without loading or attaching\n"
+            "  --print-config: inspect flags and selected probe options without attaching\n"
+            "  --imu-preempt wakeup|always: opt-in preemption probe (default wakeup)\n"
+            "  --deadline-grace-us N: late-demotion grace in microseconds (default 1000)\n"
+            "  --trace-imu: sampled enqueue events and unsampled counters (default off)\n"
+            "  --trace-estimator: unsampled estimator enqueue lanes for perf correlation (default off)\n"
+            "  --trace-execution-cpu N: switch/wakeup/syscall and IMU callback probe (default off)\n"
             "\n"
             "Example:\n"
             "  sudo %s --pin /sys/fs/bpf/scx_slam_fresh\n",
             argv0, argv0);
+}
+
+static int print_imu_trace_stats(struct scx_slam_fresh_bpf *skel)
+{
+    int ncpu = libbpf_num_possible_cpus();
+    if (ncpu < 1)
+        return -EINVAL;
+    struct slam_imu_trace_stats *values = calloc(ncpu, sizeof(*values));
+    if (!values)
+        return -ENOMEM;
+    uint32_t key = 0;
+    int err = bpf_map_lookup_elem(bpf_map__fd(skel->maps.imu_trace_stats), &key, values);
+    if (err) {
+        free(values);
+        return err;
+    }
+    struct slam_imu_trace_stats sum = {};
+    for (int cpu = 0; cpu < ncpu; cpu++) {
+#define SLAM_ADD_COUNTER(name) sum.name += values[cpu].name;
+        SLAM_IMU_COUNTER_FIELDS(SLAM_ADD_COUNTER)
+#undef SLAM_ADD_COUNTER
+    }
+    printf("imu_trace_summary:");
+#define SLAM_PRINT_COUNTER(name) printf(" " #name "=%llu", (unsigned long long)sum.name);
+    SLAM_IMU_COUNTER_FIELDS(SLAM_PRINT_COUNTER)
+#undef SLAM_PRINT_COUNTER
+    printf("\n");
+    free(values);
+    return 0;
+}
+
+static int print_est_trace_stats(struct scx_slam_fresh_bpf *skel)
+{
+    int ncpu = libbpf_num_possible_cpus();
+    if (ncpu < 1)
+        return -EINVAL;
+    struct slam_est_trace_stats *values = calloc(ncpu, sizeof(*values));
+    if (!values)
+        return -ENOMEM;
+    uint32_t key = 0;
+    int err = bpf_map_lookup_elem(bpf_map__fd(skel->maps.est_trace_stats), &key, values);
+    if (!err) {
+        struct slam_est_trace_stats sum = {};
+        for (int cpu = 0; cpu < ncpu; cpu++) {
+            sum.enqueues += values[cpu].enqueues;
+            sum.emitted += values[cpu].emitted;
+            sum.lost += values[cpu].lost;
+        }
+        printf("est_trace_summary: enqueues=%llu emitted=%llu lost=%llu\n",
+               (unsigned long long)sum.enqueues, (unsigned long long)sum.emitted,
+               (unsigned long long)sum.lost);
+    }
+    free(values);
+    return err;
 }
 
 static int ensure_dir(const char *dir)
@@ -95,10 +258,53 @@ static int ensure_dir(const char *dir)
 int main(int argc, char **argv)
 {
     const char *pin_dir = NULL;
+    int print_ops_flags = 0;
+    int print_config = 0;
+    int preempt_always = 0;
+    int trace_imu = 0;
+    int trace_est = 0;
+    int execution_cpu = -1;
+    uint64_t deadline_grace_us = 1000;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
             pin_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--print-ops-flags")) {
+            print_ops_flags = 1;
+        } else if (!strcmp(argv[i], "--print-config")) {
+            print_config = 1;
+        } else if (!strcmp(argv[i], "--trace-imu")) {
+            trace_imu = 1;
+        } else if (!strcmp(argv[i], "--trace-estimator")) {
+            trace_est = 1;
+        } else if (!strcmp(argv[i], "--deadline-grace-us") && i + 1 < argc) {
+            char *end = NULL;
+            const char *value = argv[++i];
+            errno = 0;
+            unsigned long long parsed = strtoull(value, &end, 10);
+            if (errno || !*value || strspn(value, "0123456789") != strlen(value) ||
+                !end || *end || parsed > UINT64_MAX / 1000ULL) {
+                fprintf(stderr, "invalid deadline grace: %s\n", value);
+                return 1;
+            }
+            deadline_grace_us = (uint64_t)parsed;
+        } else if (!strcmp(argv[i], "--trace-execution-cpu") && i + 1 < argc) {
+            char *end = NULL;
+            errno = 0;
+            const char *value = argv[++i];
+            long parsed = strtol(value, &end, 10);
+            if (errno || !*value || *end || parsed < 0 || parsed > INT_MAX) {
+                fprintf(stderr, "invalid execution trace CPU: %s\n", value);
+                return 1;
+            }
+            execution_cpu = (int)parsed;
+        } else if (!strcmp(argv[i], "--imu-preempt") && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (strcmp(mode, "wakeup") && strcmp(mode, "always")) {
+                fprintf(stderr, "invalid IMU preemption probe: %s\n", mode);
+                return 1;
+            }
+            preempt_always = !strcmp(mode, "always");
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -108,19 +314,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!pin_dir) {
+    if ((!pin_dir && !print_ops_flags && !print_config) ||
+        (pin_dir && (print_ops_flags || print_config)) || (print_ops_flags && print_config)) {
         usage(argv[0]);
-        return 1;
-    }
-
-    if (bump_memlock_rlimit()) {
-        perror("setrlimit(RLIMIT_MEMLOCK)");
-        /* keep going; some distros don't need this */
-    }
-
-    int err = ensure_dir(pin_dir);
-    if (err) {
-        fprintf(stderr, "Failed to create pin dir %s: %s\n", pin_dir, strerror(-err));
         return 1;
     }
 
@@ -133,6 +329,48 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    skel->rodata->imu_preempt_always = preempt_always;
+    skel->rodata->trace_imu_enqueues = trace_imu;
+    skel->rodata->trace_est_enqueues = trace_est;
+    skel->rodata->execution_trace_cpu = execution_cpu;
+    skel->rodata->deadline_grace_ns = deadline_grace_us * 1000ULL;
+    if (execution_cpu < 0)
+        bpf_map__set_max_entries(skel->maps.execution_events, 4096);
+    /* No tracepoint load or attachment requirement for ordinary runs. */
+    bpf_program__set_autoload(skel->progs.trace_execution_switch, execution_cpu >= 0);
+    bpf_program__set_autoload(skel->progs.trace_execution_wakeup, execution_cpu >= 0);
+    bpf_program__set_autoload(skel->progs.trace_execution_sys_enter, execution_cpu >= 0);
+    bpf_program__set_autoload(skel->progs.trace_execution_sys_exit, execution_cpu >= 0);
+    if (print_ops_flags || print_config) {
+        if (print_ops_flags)
+            printf("0x%llx\n", skel->struct_ops.scx_slam_fresh_ops->flags);
+        else
+            printf("ops_flags=0x%llx imu_preempt=%s trace_imu=%u execution_cpu=%d "
+                   "trace_est=%u deadline_grace_us=%llu\n",
+                   skel->struct_ops.scx_slam_fresh_ops->flags,
+                   skel->rodata->imu_preempt_always ? "always" : "wakeup",
+                   skel->rodata->trace_imu_enqueues, execution_cpu, trace_est,
+                   (unsigned long long)deadline_grace_us);
+        scx_slam_fresh_bpf__destroy(skel);
+        return 0;
+    }
+
+    if (bump_memlock_rlimit()) {
+        perror("setrlimit(RLIMIT_MEMLOCK)");
+        /* keep going; some distros don't need this */
+    }
+
+    int err = ensure_dir(pin_dir);
+    if (err) {
+        fprintf(stderr, "Failed to create pin dir %s: %s\n", pin_dir, strerror(-err));
+        goto out;
+    }
+
+    printf("Loading scheduler with ops_flags=0x%llx imu_preempt=%s trace_imu=%u execution_cpu=%d "
+           "trace_est=%u deadline_grace_us=%llu\n",
+           skel->struct_ops.scx_slam_fresh_ops->flags,
+           preempt_always ? "always" : "wakeup", trace_imu, execution_cpu, trace_est,
+           (unsigned long long)deadline_grace_us);
     err = scx_slam_fresh_bpf__load(skel);
     if (err) {
         fprintf(stderr, "Failed to load BPF skeleton: %s\n", strerror(-err));
@@ -169,6 +407,13 @@ int main(int argc, char **argv)
         err = -ENOMEM;
         goto out;
     }
+    if (execution_cpu >= 0) {
+        err = ring_buffer__add(rb, bpf_map__fd(skel->maps.execution_events), handle_execution_evt, NULL);
+        if (err) {
+            ring_buffer__free(rb);
+            goto out;
+        }
+    }
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -188,6 +433,26 @@ int main(int argc, char **argv)
         }
     }
 
+    /* The harness stops this loader only after its demo has exited. Flush
+     * remaining diagnostic events before printing the full unsampled counts.
+     */
+    /* Stop CPU-wide producers before flushing and taking their final counts. */
+    if (execution_cpu >= 0)
+        scx_slam_fresh_bpf__detach(skel);
+    int consume_err = ring_buffer__consume(rb);
+    if (consume_err < 0) err = consume_err;
+    if (trace_imu && print_imu_trace_stats(skel)) {
+        fprintf(stderr, "failed to read IMU trace counters\n");
+        err = -EIO;
+    }
+    if (trace_est && print_est_trace_stats(skel)) {
+        fprintf(stderr, "failed to read estimator trace counters\n");
+        err = -EIO;
+    }
+    if (execution_cpu >= 0 && print_execution_stats(skel)) {
+        fprintf(stderr, "failed to read execution trace counters\n");
+        err = -EIO;
+    }
     ring_buffer__free(rb);
 
 out:
