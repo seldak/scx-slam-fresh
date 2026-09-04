@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(scx_slam_executor VERSION 0.1.0 LANGUAGES C CXX)
 
 find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
 find_path(LIBBPF_INCLUDE_DIR bpf/bpf.h REQUIRED)
 find_library(LIBBPF_LIBRARY bpf REQUIRED)
 
@@ -43,13 +44,28 @@ target_include_directories(slamqos
 target_link_libraries(slamqos PUBLIC "${LIBBPF_LIBRARY}")
 set_target_properties(slamqos PROPERTIES VERSION "${PROJECT_VERSION}" SOVERSION 0)
 
+add_library(freshness_executor SHARED src/freshness_executor.cpp)
+add_library(scx_slam_executor::freshness_executor ALIAS freshness_executor)
+target_compile_features(freshness_executor PUBLIC cxx_std_17)
+target_include_directories(freshness_executor
+  PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
+    "$<INSTALL_INTERFACE:include>"
+)
+target_link_libraries(freshness_executor PUBLIC slamqos rclcpp::rclcpp)
+set_target_properties(
+  freshness_executor PROPERTIES VERSION "${PROJECT_VERSION}" SOVERSION 0
+)
+
 install(
-  TARGETS slamqos
+  TARGETS slamqos freshness_executor
   EXPORT export_scx_slam_executor
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
+install(DIRECTORY include/ DESTINATION include)
 install(
   FILES
     "${SCX_SLAM_BUILD_INCLUDE}/slamqos.h"
@@ -62,7 +78,11 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_slamqos test/test_slamqos.cpp)
   target_link_libraries(test_slamqos slamqos)
+
+  ament_add_gtest(test_freshness_executor test/test_freshness_executor.cpp)
+  target_link_libraries(test_freshness_executor freshness_executor)
 endif()
 
 ament_export_targets(export_scx_slam_executor HAS_LIBRARY_TARGET)
+ament_export_dependencies(rclcpp)
 ament_package()

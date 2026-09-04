@@ -11,7 +11,7 @@ target_link_libraries(
   scx_slam_workload_smoke
   PRIVATE
     rclcpp::rclcpp
-    scx_slam_executor::slamqos
+    scx_slam_executor::freshness_executor
 )
 
 install(TARGETS scx_slam_workload_smoke DESTINATION lib/${PROJECT_NAME})

@@ -131,6 +131,21 @@ publishes the head item only when it will wake a sleeping consumer; the
 consumer republishes the exact item after `pop()`. Producers do not overwrite
 the hint while that consumer is busy.
 
+### ROS 2 single-worker instance
+
+`scx_slam_executor::FreshnessExecutor` implements the same ownership rule with
+separate dispatcher and worker threads. The dispatcher selects one ready
+`rclcpp::AnyExecutable` only after the worker has finished its previous job. It
+then publishes the selected callback group's profile for that worker before
+waking it. The worker does not steal or migrate work and clears its hint after
+the callback returns or throws.
+
+The generic ROS executor does not inspect subscription payloads before callback
+execution. Its initial `release_ts_ns` is therefore callback selection time,
+not a sensor timestamp. This implementation validates wake-safe worker
+classification; a message-aware workload adapter is still required before the
+timestamp can represent end-to-end sensor age.
+
 ---
 
 ## Hint fields and invariants

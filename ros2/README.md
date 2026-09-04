@@ -25,10 +25,30 @@ Generated Colcon state is isolated in `.ros2-build`, `.ros2-install`, and
 Packages:
 
 - `scx_slam_executor` exports the existing `libslamqos` C implementation to
-  Ament consumers. The callback dispatcher/worker executor is not implemented
-  yet.
+  Ament consumers and provides the first `FreshnessExecutor` implementation.
 - `scx_slam_workload` is a minimal downstream smoke node. The ROS workload and
   bag replay integration are not implemented yet.
+
+## FreshnessExecutor v1
+
+The first executor is deliberately narrow: one ROS dispatcher and one callback
+worker. The dispatcher waits for and selects an `rclcpp::AnyExecutable` only
+while the worker is idle, publishes that callback group's profile for the
+worker, and then wakes it. The worker clears its slot after the callback ends.
+There is no work stealing or mid-callback migration.
+
+This separation locates the experiment precisely:
+
+- DDS/RMW readiness and callback selection stay on the dispatcher.
+- Only callback compute runs on the configurable worker CPU and scheduling
+  policy.
+- `PinnedMapHintSink` sends profiles to the pinned sched_ext map; `NullHintSink`
+  runs the identical executor without hints.
+
+The generic executor currently uses callback selection time as `release_ts_ns`.
+That is suitable for validating wake-safe handoff and callback scheduling delay,
+but it is not a sensor timestamp. The bag workload must provide message-derived
+release times before we make end-to-end freshness claims.
 
 The default build remains ROS-independent:
 
