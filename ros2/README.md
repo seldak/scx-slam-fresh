@@ -72,14 +72,43 @@ source .ros2-install/setup.bash
 ros2 run scx_slam_workload scx_slam_pipeline --duration 3
 ```
 
-The executable also accepts `--worker-cpu N`, `--ext-policy N`, and `--pin DIR`.
-The last two opt into the attached sched_ext policy and pinned hint map. A later
-evaluation harness will keep non-worker DDS threads off the experimental CPU and
-run matched CFS/sched_ext cases.
+The executable also accepts `--worker-cpu N`, `--ext-policy N`, `--pin DIR`,
+`--hog N`, and `--window-stats`. The pin and policy options opt into the
+attached sched_ext policy. Contenders use the same policy as callback workers:
+they are ordinary CFS threads in the CFS case and unhinted best-effort
+`SCHED_EXT` threads in the scx case.
 
 This is still a synthetic compute workload. Phase 2 proves ROS transport,
 message-derived hinting, fixed worker ownership, and stage-to-stage timestamp
 propagation. It is not bag evidence or an estimator accuracy result.
+
+## Phase 3 ROS scheduling evaluation
+
+The matched evaluation keeps DDS, RMW, publishers, and executor dispatchers on
+a housekeeping CPU. Only the four callback workers and the requested CPU
+contenders are pinned to the experimental CPU. This isolates the sched_ext
+experiment at callback compute while retaining real ROS topic transport and
+readiness handling.
+
+Build as the normal user, then run the privileged harness:
+
+```bash
+make
+make ros2 test-ros2
+sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
+  REPETITIONS=3 scripts/run_ros2_eval.sh
+```
+
+The harness runs matched CFS and `scx_slam` cases. It refuses full-switch mode,
+uses one attached loader for all scx repetitions, records binary hashes and the
+environment, and writes `summary.tsv`. Each stage reports fixed-window offered,
+completed, late, started-stale, unfinished, thread CPU, p99/max callback-start
+age, and p99/max completion age. Work completed after the common monotonic
+cutoff is excluded.
+
+Phase 3 is an evaluation, not a pass/fail test. The harness deliberately does
+not assert that scx must beat CFS. Results remain synthetic-work evidence until
+bag replay and an actual estimator are introduced in later phases.
 
 The default build remains ROS-independent:
 

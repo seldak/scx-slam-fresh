@@ -36,6 +36,11 @@ if(BUILD_TESTING)
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 15
   )
+  ament_add_test(test_slam_pipeline_window
+    COMMAND $<TARGET_FILE:scx_slam_pipeline> --duration 1 --window-stats
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 15
+  )
 endif()
 
 ament_package()

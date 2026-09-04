@@ -4,8 +4,14 @@
 #include <scx_slam_executor/freshness_executor.hpp>
 #include <scx_slam_msgs/msg/stamped_job.hpp>
 
+#include <linux/sched/types.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -33,15 +39,32 @@ struct Options
   int duration_s{3};
   int worker_cpu{-1};
   int ext_policy{-1};
+  int hog_threads{0};
+  bool window_stats{false};
   std::string pin_dir;
 };
 
 struct StageStats
 {
-  std::atomic<uint64_t> completed{0};
-  std::atomic<uint64_t> late{0};
-  std::atomic<uint64_t> cpu_ns{0};
-  std::atomic<uint64_t> max_age_ns{0};
+  std::mutex mutex;
+  uint64_t completed{0};
+  uint64_t late{0};
+  uint64_t stale{0};
+  uint64_t cpu_ns{0};
+  std::vector<uint64_t> start_ages_ns;
+  std::vector<uint64_t> completion_ages_ns;
+};
+
+struct StageSnapshot
+{
+  uint64_t completed{0};
+  uint64_t late{0};
+  uint64_t stale{0};
+  uint64_t cpu_ns{0};
+  uint64_t p99_start_age_ns{0};
+  uint64_t max_start_age_ns{0};
+  uint64_t p99_age_ns{0};
+  uint64_t max_age_ns{0};
 };
 
 uint64_t clock_ns(clockid_t clock)
@@ -87,27 +110,39 @@ void sleep_until_ns(uint64_t wake_ns)
   }
 }
 
-void update_max(std::atomic<uint64_t> & maximum, uint64_t value)
+uint64_t percentile_99(std::vector<uint64_t> values)
 {
-  uint64_t current = maximum.load();
-  while (current < value && !maximum.compare_exchange_weak(current, value)) {
+  if (values.empty()) {
+    return 0;
   }
+  std::sort(values.begin(), values.end());
+  const size_t index = (values.size() * 99ULL + 99ULL) / 100ULL - 1ULL;
+  return values[index];
 }
 
 void account_job(
-  StageStats & stats, const Message & message, uint64_t work_us, uint64_t deadline_ns)
+  StageStats & stats, const Message & message, uint64_t work_us,
+  uint64_t deadline_ns, uint64_t stale_ns)
 {
+  const uint64_t start = monotonic_ns();
+  const uint64_t start_age = start > message.release_ts_ns ? start - message.release_ts_ns : 0;
   const uint64_t cpu_start = thread_cpu_ns();
   busy_work_us(work_us);
-  stats.cpu_ns.fetch_add(thread_cpu_ns() - cpu_start);
+  const uint64_t cpu_ns = thread_cpu_ns() - cpu_start;
 
   const uint64_t now = monotonic_ns();
   const uint64_t age = now > message.release_ts_ns ? now - message.release_ts_ns : 0;
-  stats.completed.fetch_add(1);
+  std::lock_guard<std::mutex> lock(stats.mutex);
+  stats.completed++;
   if (deadline_ns != 0 && age > deadline_ns) {
-    stats.late.fetch_add(1);
+    stats.late++;
   }
-  update_max(stats.max_age_ns, age);
+  if (stale_ns != 0 && start_age > stale_ns) {
+    stats.stale++;
+  }
+  stats.cpu_ns += cpu_ns;
+  stats.start_ages_ns.push_back(start_age);
+  stats.completion_ages_ns.push_back(age);
 }
 
 int parse_integer(const char * text, const char * option)
@@ -142,12 +177,19 @@ Options parse_options(int argc, char ** argv)
       options.worker_cpu = parse_integer(require_value("--worker-cpu"), "--worker-cpu");
     } else if (argument == "--ext-policy") {
       options.ext_policy = parse_integer(require_value("--ext-policy"), "--ext-policy");
+    } else if (argument == "--hog") {
+      options.hog_threads = parse_integer(require_value("--hog"), "--hog");
+      if (options.hog_threads < 0) {
+        throw std::invalid_argument("--hog must be non-negative");
+      }
+    } else if (argument == "--window-stats") {
+      options.window_stats = true;
     } else if (argument == "--pin") {
       options.pin_dir = require_value("--pin");
     } else if (argument == "--help") {
       std::cout <<
         "usage: scx_slam_pipeline [--duration S] [--worker-cpu N] "
-        "[--ext-policy N] [--pin DIR]\n";
+        "[--ext-policy N] [--pin DIR] [--hog N] [--window-stats]\n";
       std::exit(0);
     } else if (argument != "--ros-args" && argument.rfind("__", 0) != 0) {
       throw std::invalid_argument("unknown argument: " + argument);
@@ -191,12 +233,82 @@ void publish_periodic(
   }
 }
 
-void print_stats(const char * name, const StageStats & stats)
+StageSnapshot snapshot(StageStats & stats)
 {
-  std::cout << name << ": completed=" << stats.completed.load() <<
-    " late=" << stats.late.load() <<
-    " cpu_us=" << stats.cpu_ns.load() / 1000ULL <<
-    " max_age_us=" << stats.max_age_ns.load() / 1000ULL << '\n';
+  std::lock_guard<std::mutex> lock(stats.mutex);
+  StageSnapshot result;
+  result.completed = stats.completed;
+  result.late = stats.late;
+  result.stale = stats.stale;
+  result.cpu_ns = stats.cpu_ns;
+  result.p99_start_age_ns = percentile_99(stats.start_ages_ns);
+  result.max_start_age_ns = stats.start_ages_ns.empty() ?
+    0 : *std::max_element(stats.start_ages_ns.begin(), stats.start_ages_ns.end());
+  result.p99_age_ns = percentile_99(stats.completion_ages_ns);
+  result.max_age_ns = stats.completion_ages_ns.empty() ?
+    0 : *std::max_element(stats.completion_ages_ns.begin(), stats.completion_ages_ns.end());
+  return result;
+}
+
+void print_stats(
+  const char * prefix, const char * name, uint64_t offered,
+  const StageSnapshot & stats)
+{
+  const uint64_t unfinished = offered > stats.completed ? offered - stats.completed : 0;
+  std::cout << prefix << name << ": offered=" << offered <<
+    " completed=" << stats.completed <<
+    " late=" << stats.late <<
+    " started_stale=" << stats.stale <<
+    " unfinished=" << unfinished <<
+    " cpu_us=" << stats.cpu_ns / 1000ULL <<
+    " p99_start_age_us=" << stats.p99_start_age_ns / 1000ULL <<
+    " max_start_age_us=" << stats.max_start_age_ns / 1000ULL <<
+    " p99_age_us=" << stats.p99_age_ns / 1000ULL <<
+    " max_age_us=" << stats.max_age_ns / 1000ULL << '\n';
+}
+
+void configure_contender(int cpu, int ext_policy)
+{
+  if (cpu >= 0) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+    const int error = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (error != 0) {
+      throw std::system_error(error, std::generic_category(), "pthread_setaffinity_np(hog)");
+    }
+  }
+  if (ext_policy >= 0) {
+    sched_attr attr{};
+    attr.size = sizeof(attr);
+    attr.sched_policy = static_cast<uint32_t>(ext_policy);
+    if (syscall(SYS_sched_setattr, 0, &attr, 0) != 0) {
+      throw std::system_error(errno, std::generic_category(), "sched_setattr(SCHED_EXT hog)");
+    }
+  }
+  const int error = pthread_setname_np(pthread_self(), "scx_ros_hog");
+  if (error != 0) {
+    throw std::system_error(error, std::generic_category(), "pthread_setname_np(hog)");
+  }
+}
+
+void run_contender(
+  std::atomic<bool> & running, int cpu, int ext_policy,
+  std::mutex & error_mutex, std::exception_ptr & background_error)
+{
+  try {
+    configure_contender(cpu, ext_policy);
+    while (running.load(std::memory_order_relaxed)) {
+      busy_work_us(1000);
+    }
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    if (!background_error) {
+      background_error = std::current_exception();
+    }
+    running.store(false);
+    rclcpp::shutdown();
+  }
 }
 
 void wait_for_graph(
@@ -264,7 +376,7 @@ int main(int argc, char ** argv)
     auto imu_subscription = imu_node->create_subscription<Message>(
       "imu/jobs", qos,
       [&](const Message::SharedPtr message) {
-        account_job(imu_stats, *message, 150, 5000000ULL);
+        account_job(imu_stats, *message, 150, 5000000ULL, 10000000ULL);
       },
       imu_subscription_options);
 
@@ -274,7 +386,7 @@ int main(int argc, char ** argv)
       "camera/jobs", qos,
       [&](const Message::SharedPtr message) {
         const uint64_t work_us = 3000ULL + (message->job_id % 5ULL) * 500ULL;
-        account_job(vision_stats, *message, work_us, 33000000ULL);
+        account_job(vision_stats, *message, work_us, 33000000ULL, 66000000ULL);
         vision_output->publish(*message);
       },
       vision_subscription_options);
@@ -285,7 +397,7 @@ int main(int argc, char ** argv)
       "vision/jobs", qos,
       [&](const Message::SharedPtr message) {
         const uint64_t work_us = 2000ULL + (message->job_id % 5ULL) * 250ULL;
-        account_job(estimator_stats, *message, work_us, 33000000ULL);
+        account_job(estimator_stats, *message, work_us, 33000000ULL, 66000000ULL);
         estimator_output->publish(*message);
       },
       estimator_subscription_options);
@@ -295,7 +407,7 @@ int main(int argc, char ** argv)
     auto mapping_subscription = mapping_node->create_subscription<Message>(
       "estimator/jobs", qos,
       [&](const Message::SharedPtr message) {
-        account_job(mapping_stats, *message, 2000, 0);
+        account_job(mapping_stats, *message, 2000, 0, 0);
       },
       mapping_subscription_options);
 
@@ -319,16 +431,16 @@ int main(int argc, char ** argv)
       profile(SLAM_STAGE_MAPPING_BE, SLAM_SCX_CLASS_BE, 0, 0, 0), metadata);
 
     std::mutex error_mutex;
-    std::exception_ptr executor_error;
+    std::exception_ptr background_error;
     std::vector<std::thread> executor_threads;
     for (auto & executor : executors) {
-      executor_threads.emplace_back([&executor, &error_mutex, &executor_error]() {
+      executor_threads.emplace_back([&executor, &error_mutex, &background_error]() {
           try {
             executor->spin();
           } catch (...) {
             std::lock_guard<std::mutex> lock(error_mutex);
-            if (!executor_error) {
-              executor_error = std::current_exception();
+            if (!background_error) {
+              background_error = std::current_exception();
             }
             rclcpp::shutdown();
           }
@@ -336,7 +448,17 @@ int main(int argc, char ** argv)
     }
 
     wait_for_graph({imu_source, camera_source, vision_output, estimator_output});
+    std::atomic<bool> contenders_running{true};
+    std::vector<std::thread> contenders;
+    contenders.reserve(static_cast<size_t>(options.hog_threads));
+    for (int index = 0; index < options.hog_threads; ++index) {
+      contenders.emplace_back(
+        run_contender, std::ref(contenders_running), options.worker_cpu,
+        options.ext_policy, std::ref(error_mutex), std::ref(background_error));
+    }
+
     const uint64_t start_ns = monotonic_ns() + 100000000ULL;
+    const uint64_t end_ns = start_ns + static_cast<uint64_t>(options.duration_s) * 1000000000ULL;
     std::thread imu_generator(
       publish_periodic, imu_source, 200ULL, static_cast<uint64_t>(options.duration_s), start_ns);
     std::thread camera_generator(
@@ -344,7 +466,23 @@ int main(int argc, char ** argv)
 
     imu_generator.join();
     camera_generator.join();
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    sleep_until_ns(end_ns);
+
+    const uint64_t expected_imu = static_cast<uint64_t>(options.duration_s) * 200ULL;
+    const uint64_t expected_camera = static_cast<uint64_t>(options.duration_s) * 30ULL;
+    const auto window_imu = snapshot(imu_stats);
+    const auto window_vision = snapshot(vision_stats);
+    const auto window_estimator = snapshot(estimator_stats);
+    const auto window_mapping = snapshot(mapping_stats);
+
+    contenders_running.store(false);
+    for (auto & contender : contenders) {
+      contender.join();
+    }
+
+    if (!options.window_stats) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
 
     for (auto & executor : executors) {
       executor->cancel();
@@ -354,21 +492,37 @@ int main(int argc, char ** argv)
     }
     rclcpp::shutdown();
 
-    if (executor_error) {
-      std::rethrow_exception(executor_error);
+    if (background_error) {
+      std::rethrow_exception(background_error);
     }
 
-    print_stats("imu_prop", imu_stats);
-    print_stats("vision_fe", vision_stats);
-    print_stats("state_est", estimator_stats);
-    print_stats("mapping_be", mapping_stats);
+    std::cout << "configuration: duration_s=" << options.duration_s <<
+      " worker_cpu=" << options.worker_cpu <<
+      " ext_policy=" << options.ext_policy <<
+      " hog_threads=" << options.hog_threads <<
+      " window_stats=" << (options.window_stats ? 1 : 0) << '\n';
 
-    const uint64_t expected_imu = static_cast<uint64_t>(options.duration_s) * 200ULL;
-    const uint64_t expected_camera = static_cast<uint64_t>(options.duration_s) * 30ULL;
-    if (imu_stats.completed.load() != expected_imu ||
-      vision_stats.completed.load() != expected_camera ||
-      estimator_stats.completed.load() != expected_camera ||
-      mapping_stats.completed.load() != expected_camera)
+    if (options.window_stats) {
+      print_stats("window_", "imu_prop", expected_imu, window_imu);
+      print_stats("window_", "vision_fe", expected_camera, window_vision);
+      print_stats("window_", "state_est", expected_camera, window_estimator);
+      print_stats("window_", "mapping_be", expected_camera, window_mapping);
+      return 0;
+    }
+
+    const auto final_imu = snapshot(imu_stats);
+    const auto final_vision = snapshot(vision_stats);
+    const auto final_estimator = snapshot(estimator_stats);
+    const auto final_mapping = snapshot(mapping_stats);
+    print_stats("", "imu_prop", expected_imu, final_imu);
+    print_stats("", "vision_fe", expected_camera, final_vision);
+    print_stats("", "state_est", expected_camera, final_estimator);
+    print_stats("", "mapping_be", expected_camera, final_mapping);
+
+    if (final_imu.completed != expected_imu ||
+      final_vision.completed != expected_camera ||
+      final_estimator.completed != expected_camera ||
+      final_mapping.completed != expected_camera)
     {
       std::cerr << "pipeline did not drain every offered message\n";
       return 2;
