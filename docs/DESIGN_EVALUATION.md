@@ -84,12 +84,52 @@ late/stale-demotion feedback shape observed in E4, but it is not part of the E4
 snapshot.
 
 The dedicated IMU path is still a bundle: `DSQ_IMU` routing, wakeup preemption,
-and exemption from stale/late demotion were not separated. This snapshot also
-does not resolve the zero-hog maximum-tail anomaly, establish no-contention
-safety, replay a bag, run a real estimator, add LiDAR to the ROS graph, or
-compare against FIFO, DEADLINE, or another sched_ext scheduler. It is scoped
-synthetic-work evidence for the loaded callback-compute boundary on this
-kernel, revision, CPU pin, and binary set.
+and exemption from stale/late demotion were not separated. This snapshot does
+not establish no-contention safety, replay a bag, run a real estimator, add
+LiDAR to the ROS graph, or compare against FIFO, DEADLINE, or another sched_ext
+scheduler. It is scoped synthetic-work evidence for the loaded
+callback-compute boundary on this kernel, revision, CPU pin, and binary set.
+The separate zero-hog maximum-tail diagnosis is recorded below.
+
+### Zero-hog partial-switch interference diagnosis
+
+This diagnostic is separate from both the loaded two-hog matrix above and
+E0-E4. It used the same `f01e3f9` ROS pipeline, loader, and BPF binaries with
+hinted partial-switch SCX, no synthetic hogs, 15-second fixed windows, and
+three repetitions.
+
+With callback workers pinned to an unshielded CPU 0 and DDS/dispatch on CPU 1,
+standard `sched_switch` and `sched_wakeup` traces showed that CPU 1 woke the IMU
+worker after its expected 4.5-4.9ms sleep. The IMU then remained runnable for
+44-48ms while foreign `SCHED_NORMAL` browser or compositor workers ran on CPU
+0. In partial-switch mode those fair-class tasks remain outside the SCX DSQs
+and have higher scheduling-class precedence than `SCHED_EXT`; neither the IMU
+lane nor SCX wakeup preemption can preempt them. Pinning this workload's worker
+threads did not prevent unrelated processes from using the same CPU.
+
+The matched shielded capture moved the workers to CPU 14, kept CPU 1 for
+DDS/dispatch, and left the SMT sibling CPU 15 unused. Linux rejects sched_ext
+registration with `isolcpus=domain`, so scheduler-domain isolation was not
+used. The effective boot configuration instead retained tick, RCU, and IRQ
+isolation while systemd kept its service tree off CPUs 14-15:
+
+```text
+isolcpus=managed_irq,14-15 nohz_full=14-15 rcu_nocbs=14-15 irqaffinity=0-13 systemd.cpu_affinity=0-13
+```
+
+After reboot, `/sys/devices/system/cpu/nohz_full` reported `14-15` and PID 1's
+`Cpus_allowed_list` reported `0-13`. The worker explicitly selected CPU 14.
+
+| Capture | IMU completed / late / started stale | p99 start age | maximum start age |
+| --- | --- | ---: | ---: |
+| Unshielded CPU 0 | 3000 / 9-14 / 8-12 | 1.213-1.258ms | 44.402-47.936ms |
+| Shielded CPU 14 | 3000 / 0 / 0 | 0.633-0.777ms | 1.167-2.532ms |
+
+Each range covers three repetitions. Short kernel and desktop occupants still
+appeared on CPU 14, so this is not an absolute reserved-core claim. They did
+not reproduce the 40ms-class runnable wait or cause an IMU deadline miss. The
+zero-hog tail is therefore closed as unshielded fair-class interference; no
+scheduler-policy change was made.
 
 ---
 

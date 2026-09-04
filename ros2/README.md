@@ -133,11 +133,23 @@ sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
 The clean loaded result and its scope are recorded in
 [`DESIGN_EVALUATION.md`](../docs/DESIGN_EVALUATION.md#loaded-ros-2-callback-scheduling-snapshot).
 
-The loaded snapshot does not close the separate zero-hog maximum-tail anomaly.
-Capture exactly the `f01e3f9` binary set with standard scheduler tracepoints:
+The separate zero-hog maximum-tail diagnosis is closed and recorded in
+[`DESIGN_EVALUATION.md`](../docs/DESIGN_EVALUATION.md#zero-hog-partial-switch-interference-diagnosis).
+On an unshielded worker CPU, foreign fair-class browser/compositor threads
+outranked partial-switch SCX and left the correctly woken IMU runnable for
+44-48ms. The matched shielded capture used the same `f01e3f9` binary set and no
+policy change. Its boot configuration was:
+
+```text
+isolcpus=managed_irq,14-15 nohz_full=14-15 rcu_nocbs=14-15 irqaffinity=0-13 systemd.cpu_affinity=0-13
+```
+
+The kernel rejects sched_ext with `isolcpus=domain`, so that flag must not be
+added. Workers ran on CPU 14, CPU 1 retained housekeeping work, and SMT sibling
+15 was left unused. Reproduce the standard-perf capture with:
 
 ```bash
-sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 REPETITIONS=3 \
+sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 REPETITIONS=3 \
   scripts/run_ros2_zero_hog_perf.sh
 ```
 
@@ -148,7 +160,11 @@ perf recorder stays on the housekeeping CPU. Raw `perf.data`, decoded events,
 workload metrics, and `perf sched timehist` are retained per repetition.
 Standard scheduler tracepoints do not expose the incoming `scx.slice`, so the
 report can show an observed successor run interval but must not call it the
-task's requested or remaining slice.
+task's requested or remaining slice. The shielded three-repetition result was
+3000 completed IMU callbacks with zero late or started-stale callbacks in every
+run and a maximum start age no greater than 2.532ms. Brief residual occupants
+on CPU 14 mean the core is not claimed as absolutely reserved; they did not
+recreate the 40ms-class failure.
 
 The default build remains ROS-independent:
 
