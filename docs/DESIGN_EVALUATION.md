@@ -624,10 +624,9 @@ budget, class, preemption, execution, or perf probes for this capture.
 
 The seeded run completed on 2026-09-04 with kernel `7.0.0-30-generic`, CPU 0,
 15-second fixed windows, partial-switch flags `0x8`, and source-matched binaries
-at Git revision `0252accae58096d98edd3cfd974b23025fc129cf`. The machine-local raw
-capture is `/tmp/scx-e4-_03x7ctx`. All six 3% controls were identical: critical
-stages clean, LiDAR preprocess 150, registration 27, and mapping 482; no closing
-control drifted.
+at Git revision `0252accae58096d98edd3cfd974b23025fc129cf`. All six 3% controls were
+identical: critical stages clean, LiDAR preprocess 150, registration 27, and
+mapping 482; no closing control drifted.
 
 | IMU work | Critical stages | LiDAR preprocess | Registration vs control | Mapping |
 | --- | --- | ---: | ---: | ---: |
