@@ -41,6 +41,12 @@ if(BUILD_TESTING)
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 15
   )
+  ament_add_test(test_ros2_eval_variants
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/run_ros2_eval.sh
+      --check-variant-mappings
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 5
+  )
 endif()
 
 ament_package()

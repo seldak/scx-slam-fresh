@@ -36,6 +36,22 @@ SCX_VARIANTS is a comma-separated subset of:
 EOF
 }
 
+variant_hint_mode() {
+    case "$1" in
+        hinted) echo full ;;
+        no-hints) echo none ;;
+        imu-only|fe-only) echo "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+check_variant_mappings() {
+    [[ $(variant_hint_mode hinted) == full ]]
+    [[ $(variant_hint_mode no-hints) == none ]]
+    [[ $(variant_hint_mode imu-only) == imu-only ]]
+    [[ $(variant_hint_mode fe-only) == fe-only ]]
+}
+
 cleanup() {
     if [[ -n "$loader_pid" ]] && kill -0 "$loader_pid" 2>/dev/null; then
         kill -TERM "$loader_pid" 2>/dev/null || true
@@ -113,6 +129,11 @@ if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
     exit 0
 fi
+if [[ ${1:-} == --check-variant-mappings ]]; then
+    check_variant_mappings
+    echo "ROS 2 evaluation variant mappings are valid"
+    exit 0
+fi
 if (( $# != 0 )); then
     usage >&2
     exit 2
@@ -137,13 +158,10 @@ if (( ${#variant_list[@]} == 0 )); then
     exit 2
 fi
 for variant in "${variant_list[@]}"; do
-    case "$variant" in
-        hinted|no-hints|imu-only|fe-only) ;;
-        *)
-            echo "error: unknown SCX variant '$variant'" >&2
-            exit 2
-            ;;
-    esac
+    if ! variant_hint_mode "$variant" >/dev/null; then
+        echo "error: unknown SCX variant '$variant'" >&2
+        exit 2
+    fi
 done
 if (( duration < 1 || repetitions < 1 )); then
     echo "error: DURATION and REPETITIONS must be positive" >&2
@@ -220,10 +238,7 @@ loader_pid=$!
 wait_for_scheduler
 
 for variant in "${variant_list[@]}"; do
-    case "$variant" in
-        hinted) hint_mode=full ;;
-        *) hint_mode=$variant ;;
-    esac
+    hint_mode=$(variant_hint_mode "$variant")
     for repetition in $(seq 1 "$repetitions"); do
         if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
             echo "error: sched_ext stopped before $variant case $repetition" >&2
