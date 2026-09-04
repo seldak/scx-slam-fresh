@@ -130,6 +130,9 @@ sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
   scripts/run_ros2_eval.sh
 ```
 
+The clean loaded result and its scope are recorded in
+[`DESIGN_EVALUATION.md`](../docs/DESIGN_EVALUATION.md#loaded-ros-2-callback-scheduling-snapshot).
+
 The default build remains ROS-independent:
 
 ```bash

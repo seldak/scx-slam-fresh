@@ -24,6 +24,75 @@ measurements on `CLOCK_MONOTONIC`, matching BPF `bpf_ktime_get_ns()`.
 
 ---
 
+## Loaded ROS 2 callback scheduling snapshot
+
+This snapshot is separate from E0-E4. It measures the optional ROS 2 pipeline,
+not the standalone demo or the E4 IMU-load regimes. A clean three-repetition
+run used kernel `7.0.0-31-generic`, CPU 0 for callback workers and two CPU hogs,
+CPU 1 for DDS/RMW, publishers, and executor dispatch, 15-second fixed windows,
+ROS 2 Lyrical, `ops_flags=0x8`, and `switch_all=0`. The source revision was
+`f01e3f91c519325e5e06f0d42fd0a08bb872cc85`; scheduler policy last changed in
+`0252acc`. The captured binaries were:
+
+- ROS pipeline: `38a15888215e17aced3a0c8ffe99932bd0c61adb2ca0f35c77d63ec5293920e5`
+- loader: `3dd5519925781964d451c1039017404169d8384deb835bce811e95ddca35243f`
+- BPF object: `75719c3ac6959b41e80fdeb4975538aa28b9bb65eadfa42eedc6e858d42a1860`
+
+The matched command selected CFS plus all four SCX metadata variants:
+
+```bash
+sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
+  REPETITIONS=3 SCX_VARIANTS=hinted,no-hints,imu-only,fe-only \
+  scripts/run_ros2_eval.sh
+```
+
+The IMU result isolates throughput and period survival. Values below are the
+three repetitions; p99 columns give the range across those repetitions.
+
+| Policy | IMU completed | late | unfinished | p99 start age | p99 completion age |
+| --- | --- | --- | --- | ---: | ---: |
+| CFS | 3000, 3000, 3000 | 1, 0, 1 | 0, 0, 0 | 2.897-2.901ms | 3.049-3.053ms |
+| hinted | 3000, 3000, 3000 | 0, 0, 0 | 0, 0, 0 | 0.114-0.242ms | 0.266-0.398ms |
+| no hints | 1876, 1878, 1878 | 1874, 1875, 1876 | 1124, 1122, 1122 | 5013.703-5014.427ms | 5013.856-5014.580ms |
+| IMU only | 3000, 3000, 3000 | 0, 0, 0 | 0, 0, 0 | 0.136-0.149ms | 0.288-0.301ms |
+| FE only | 3, 4, 4 | 1, 1, 1 | 2997, 2996, 2996 | 18.122-20.372ms | 18.274-20.525ms |
+
+The other stages completed 450 jobs per repetition except FE-only mapping,
+which completed 449. Start and completion age remain separate: the table shows
+the range of each run's p99, not a pooled percentile.
+
+| Policy | Vision start / completion | Estimator start / completion | Mapping start / completion |
+| --- | ---: | ---: | ---: |
+| CFS | 5.385-5.557 / 16.650-17.058ms | 19.927-21.241 / 28.602-29.913ms | 30.244-31.381 / 34.276-35.522ms |
+| hinted | 3.595-3.673 / 8.756-8.833ms | 13.590-13.612 / 16.593-16.620ms | 18.585-18.614 / 20.587-20.617ms |
+| no hints | 20.861-20.948 / 25.199-25.458ms | 25.386-25.653 / 28.307-28.465ms | 28.494-29.023 / 30.497-31.026ms |
+| IMU only | 3.601-3.608 / 8.762-8.774ms | 13.598-13.600 / 16.600-16.604ms | 18.595-18.597 / 20.598-20.600ms |
+| FE only | 18.878-19.124 / 23.386-23.626ms | 43.862-44.123 / 46.625-46.876ms | 54.422-54.661 / 56.426-56.668ms |
+
+On this one-core, two-hog ROS pipeline, hinted `scx_slam` cuts callback-start
+tails versus CFS without dropping work. The same workers and hogs all use
+`SCHED_EXT` in the no-hint case, but anonymous BE service completes only about
+1877/3000 IMU callbacks and leaves about 1123 unfinished. Entering scheduling
+class 7 is therefore not the win.
+
+Full hinting and IMU-only hinting are indistinguishable here, including vision
+and estimator tails. Once the dedicated IMU path is protected, FE metadata for
+vision and estimation adds no measurable benefit on this graph and load.
+Ordinary-FE IMU is not a substitute: it becomes stale around job 4 or 5, moves
+to the stale lane, and completes only 3-4 callbacks. This reproduces the
+late/stale-demotion feedback shape observed in E4, but it is not part of the E4
+snapshot.
+
+The dedicated IMU path is still a bundle: `DSQ_IMU` routing, wakeup preemption,
+and exemption from stale/late demotion were not separated. This snapshot also
+does not resolve the zero-hog maximum-tail anomaly, establish no-contention
+safety, replay a bag, run a real estimator, add LiDAR to the ROS graph, or
+compare against FIFO, DEADLINE, or another sched_ext scheduler. It is scoped
+synthetic-work evidence for the loaded callback-compute boundary on this
+kernel, revision, CPU pin, and binary set.
+
+---
+
 ## Workload matrix
 
 The demo is multi-rate: IMU at 200Hz, camera at 30Hz, and LiDAR at 10Hz. LiDAR modes provide increasing registration cost:
