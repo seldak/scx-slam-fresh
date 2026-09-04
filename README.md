@@ -216,8 +216,14 @@ for exact definitions, results, limitations, and the retained diagnostic history
 Opt-in preemption, execution, perf, grace, budget, and class probes remain in the
 harness for reproduction; they are not current next steps and change no defaults.
 
-E1–E3 results predate the corrected partial-switch build and remain withdrawn.
-Rerun that matrix before reporting those miss-rate improvements. Compare:
+E1–E3 were revalidated in three repetitions with the corrected partial-switch
+build on kernel `7.0.0-30-generic`, CPU 0, and commit `749b579`. The run kept
+state-estimator misses at 0% under scx_slam_fresh versus 57.9–59.3% under CFS,
+reduced stale LiDAR-registration pending work from 122 to 3, reduced newest
+burst-frame state-estimate age from about 109ms to 14ms, and reproduced the
+vision budget-overrun/demotion control. See the
+[replacement E0–E3 snapshot](docs/DESIGN_EVALUATION.md#replacement-verification-snapshot--partial-switch)
+for exact per-repetition values, binary hashes, and scope. Compare:
 - `imu_prop`, `vision_fe`, and `state_est` deadline-miss percentages
 - per-stage `cpu_us`, which is accumulated with `CLOCK_THREAD_CPUTIME_ID`
 - `lidar_reg` and `mapping_be` consumer-dropped and queue-evicted stale counts

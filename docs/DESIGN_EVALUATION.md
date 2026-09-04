@@ -61,7 +61,7 @@ Run only this calibration with:
 sudo env EVAL_SCOPE=e0 scripts/run_single_core_eval.sh
 ```
 
-### E1: Heavy LiDAR overload — implemented; partial-switch revalidation pending
+### ~~E1: Heavy LiDAR overload~~ — completed
 
 Use two matched sub-experiments because strict priority plus two hogs can fully
 starve the back-end. A consumer that never runs cannot demonstrate
@@ -94,7 +94,7 @@ sudo env CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 \
   scripts/run_single_core_eval.sh
 ```
 
-### E2: Sensor burst / backlog — implemented; partial-switch revalidation pending
+### ~~E2: Sensor burst / backlog~~ — completed
 
 - Inject a deterministic delayed-delivery camera burst while preserving every
   frame's original sensor timestamp.
@@ -105,16 +105,67 @@ sudo env CPU=0 DURATION=15 SWEEP_DURATION=8 HOG_THREADS=2 \
 The root benchmark enforces all three conditions. Use `BURST_COUNT` and
 `BURST_AT_MS` to change the default 12-frame burst delivered near 3000 ms.
 
-#### Historical verification snapshot — partial-switch baseline withdrawn
+#### Replacement verification snapshot — partial-switch
+
+A three-repetition root run on 2026-09-04 used kernel
+`7.0.0-30-generic`, CPU 0, 15-second cases, 8-second E0 sweeps, two
+isolation/E3 hogs, and no stale-shedding hogs. The scheduler reported
+`ops_flags=0x8` (`SCX_OPS_SWITCH_PARTIAL`) with `switch_all=0`. The clean
+source revision was `749b57921a802eb720f8b1d1951b50a5044131bf`; scheduler
+policy last changed in `0252acc`. The captured binaries were:
+
+- demo: `9707cc74b5a19b11f007d3790aa7d1773b3c796c0c4b3cec3168947d5e5e8b00`
+- loader: `daba71b9ce31716b8f837951f6a579c1221d7feb151c941eb8979e054de12c8c`
+- BPF object: `054ec129d16803dc292821923b555c535683b807e3324150ef2a89cb97498a28`
+
+The benchmark completed all 33 cases and its assertions passed. Process-lifetime
+totals, rather than E4's fixed-window counters, produced this snapshot.
+
+| E0 mode | `reg_job_us` | registration completed | late | pending | registration `cpu_us` |
+| --- | ---: | ---: | ---: | ---: | --- |
+| light | 15804 | 80/80 | 0 | 0 | 1264447, 1264434, 1264439 |
+| mid | 51846 | 80/80 | 0 | 0 | 4147789, 4147791, 4147795 |
+| heavy | 280919 | 15/80 | 15 | 65 | 4213808, 4213807, 4213813 |
+
+E1 deadline isolation reproduced across all three matched runs. Under CFS the
+state estimator completed 454/455 jobs and missed 265, 263, and 269 deadlines
+(58.4%, 57.9%, and 59.3%), with `cpu_us` 1363624, 1363657, and 1363631. Under
+scx_slam_fresh it completed 455/455 with zero misses and zero pending in every
+run, with `cpu_us` 1365634, 1365621, and 1365633.
+
+E1 stale shedding also reproduced independently with zero hogs:
+
+| Policy | registration processed | pending | queue-evicted | consumer-dropped | total dropped |
+| --- | --- | --- | --- | --- | --- |
+| keep | 28, 28, 28 | 122, 122, 122 | 0, 0, 0 | 0, 0, 0 | 0, 0, 0 |
+| drop | 28, 28, 28 | 3, 3, 3 | 99, 100, 100 | 20, 19, 19 | 119, 119, 119 |
+
+E2 injected burst jobs 81 through 92. Keeping stale work processed all 12 burst
+frames and completed state estimation for frame 92 at 109403, 109403, and
+109404us of age. Dropping stale work processed two burst frames, still
+preserved frame 92, and reduced its state-estimate age to 13759, 14040, and
+13808us. Vision completion age for that newest frame fell from 101478, 101645,
+and 101646us to 8059, 8353, and 8121us.
+
+E3's 16ms budget completed 455/455 vision jobs with zero late, zero pending,
+zero overruns, and zero demotions in every run. Its 1ms counterpart completed
+19/455, missed four deadlines, left 436 pending, and emitted 19 overrun plus 19
+confirmed demotion events in every run. Both used 12ms of vision CPU work and a
+30ms deadline.
+
+These are observations for this kernel, CPU pin, workload, revision, and binary
+set. They validate the E0-E3 harness claims on that pin; they are not universal
+performance guarantees or a scheduler-policy change.
+
+#### Withdrawn 2026-09-02 full-switch snapshot
 
 The E4 preflight exposed a build bug on 2026-09-03: an `#ifdef` tested
 `SCX_OPS_SWITCH_PARTIAL`, which is an enum constant rather than a macro. It
 silently omitted the partial-switch flag; the inspected object had `flags=0`
 (full switch). The flag is now required directly in the default build, and the
-loader can report its embedded flags without attaching. E1–E3 must be rerun
-with the corrected build before quoting a partial-switch baseline. The CFS-only
-E0 sweep is unaffected by this switch-mode defect. The figures below are kept
-as historical observations, not current validation.
+loader can report its embedded flags without attaching. The CFS-only E0 sweep
+was unaffected by this switch-mode defect. The figures below are kept as
+historical observations and are superseded by the replacement snapshot above.
 
 One root run on 2026-09-02 using kernel `7.0.0-30-generic`, CPU 0, 15-second
 cases, and one repetition produced:
@@ -137,11 +188,8 @@ cases, and one repetition produced:
 This snapshot used thread CPU time rather than the earlier elapsed-wall-time
 compute model; those two workload models are not comparable. It also predates
 the corrected partial-switch build and is not a multi-run performance claim.
-Generate a replacement with the benchmark command above;
-the script records the environment, revision, binary hashes, and per-case
-output in its chosen results directory.
 
-### E3: Budget misconfiguration — implemented; partial-switch revalidation pending
+### ~~E3: Budget misconfiguration~~ — completed
 
 - Compare matched scx_slam_fresh runs with fixed 12ms vision CPU and a 30ms
   relative deadline.
@@ -666,8 +714,8 @@ residue as offered IMU compute approaches and then fills the core.
 These observations validate E4's four regime descriptions only for this
 heavy-LiDAR workload, kernel, and CPU pin. They do not motivate or validate a
 grace, class, budget, `dispatch(prev)`, lower-lane floor, or admission-control
-change. E1–E3 remain on the withdrawn full-switch historical snapshot until
-they are rerun with the corrected partial-switch build.
+change. E1–E3 have separate corrected-build validation in the replacement
+partial-switch snapshot above.
 
 ---
 
