@@ -42,6 +42,7 @@ struct Options
   int hog_threads{0};
   bool window_stats{false};
   std::string pin_dir;
+  std::string hint_mode{"auto"};
 };
 
 struct StageStats
@@ -186,16 +187,33 @@ Options parse_options(int argc, char ** argv)
       options.window_stats = true;
     } else if (argument == "--pin") {
       options.pin_dir = require_value("--pin");
+    } else if (argument == "--hint-mode") {
+      options.hint_mode = require_value("--hint-mode");
+      if (options.hint_mode != "full" && options.hint_mode != "none" &&
+        options.hint_mode != "imu-only" && options.hint_mode != "fe-only")
+      {
+        throw std::invalid_argument(
+                "--hint-mode must be full, none, imu-only, or fe-only");
+      }
     } else if (argument == "--help") {
       std::cout <<
         "usage: scx_slam_pipeline [--duration S] [--worker-cpu N] "
-        "[--ext-policy N] [--pin DIR] [--hog N] [--window-stats]\n";
+        "[--ext-policy N] [--pin DIR] [--hint-mode MODE] "
+        "[--hog N] [--window-stats]\n";
       std::exit(0);
     } else if (argument != "--ros-args" && argument.rfind("__", 0) != 0) {
       throw std::invalid_argument("unknown argument: " + argument);
     }
   }
   return options;
+}
+
+std::string effective_hint_mode(const Options & options)
+{
+  if (options.hint_mode != "auto") {
+    return options.hint_mode;
+  }
+  return options.pin_dir.empty() ? "none" : "full";
 }
 
 scx_slam_executor::CallbackProfile profile(
@@ -209,6 +227,20 @@ scx_slam_executor::CallbackProfile profile(
   result.stale_ns = stale_us * 1000ULL;
   result.budget_ns = budget_us * 1000ULL;
   return result;
+}
+
+scx_slam_executor::CallbackProfile stage_profile(
+  const std::string & hint_mode, uint32_t stage, uint32_t class_id,
+  uint64_t deadline_us, uint64_t stale_us, uint64_t budget_us)
+{
+  if (hint_mode == "imu-only" && stage != SLAM_STAGE_IMU_PREINT) {
+    return profile(SLAM_STAGE_MISC, SLAM_SCX_CLASS_BE, 0, 0, 0);
+  }
+  if (hint_mode == "fe-only" && stage == SLAM_STAGE_IMU_PREINT) {
+    // Preserve IMU deadlines and budgets while removing its dedicated stage.
+    return profile(SLAM_STAGE_MISC, SLAM_SCX_CLASS_FE, deadline_us, stale_us, budget_us);
+  }
+  return profile(stage, class_id, deadline_us, stale_us, budget_us);
 }
 
 scx_slam_executor::MessageMetadata metadata(const Message & message)
@@ -334,10 +366,14 @@ int main(int argc, char ** argv)
 {
   try {
     const Options options = parse_options(argc, argv);
+    const std::string hint_mode = effective_hint_mode(options);
+    if (hint_mode != "none" && options.pin_dir.empty()) {
+      throw std::invalid_argument("--hint-mode requires --pin unless mode is none");
+    }
     rclcpp::init(argc, argv);
 
     std::shared_ptr<scx_slam_executor::HintSink> hint_sink;
-    if (options.pin_dir.empty()) {
+    if (hint_mode == "none") {
       hint_sink = std::make_shared<scx_slam_executor::NullHintSink>();
     } else {
       hint_sink = std::make_shared<scx_slam_executor::PinnedMapHintSink>(options.pin_dir);
@@ -419,16 +455,23 @@ int main(int argc, char ** argv)
 
     executors[0]->add_subscription_callback_group_with_profile<Message>(
       imu_group, imu_node->get_node_base_interface(),
-      profile(SLAM_STAGE_IMU_PREINT, SLAM_SCX_CLASS_FE, 5000, 10000, 1000), metadata);
+      stage_profile(
+        hint_mode, SLAM_STAGE_IMU_PREINT, SLAM_SCX_CLASS_FE, 5000, 10000, 1000),
+      metadata);
     executors[1]->add_subscription_callback_group_with_profile<Message>(
       vision_group, vision_node->get_node_base_interface(),
-      profile(SLAM_STAGE_VISION_FE, SLAM_SCX_CLASS_FE, 33000, 66000, 12000), metadata);
+      stage_profile(
+        hint_mode, SLAM_STAGE_VISION_FE, SLAM_SCX_CLASS_FE, 33000, 66000, 12000),
+      metadata);
     executors[2]->add_subscription_callback_group_with_profile<Message>(
       estimator_group, estimator_node->get_node_base_interface(),
-      profile(SLAM_STAGE_STATE_EST, SLAM_SCX_CLASS_FE, 33000, 66000, 10000), metadata);
+      stage_profile(
+        hint_mode, SLAM_STAGE_STATE_EST, SLAM_SCX_CLASS_FE, 33000, 66000, 10000),
+      metadata);
     executors[3]->add_subscription_callback_group_with_profile<Message>(
       mapping_group, mapping_node->get_node_base_interface(),
-      profile(SLAM_STAGE_MAPPING_BE, SLAM_SCX_CLASS_BE, 0, 0, 0), metadata);
+      stage_profile(
+        hint_mode, SLAM_STAGE_MAPPING_BE, SLAM_SCX_CLASS_BE, 0, 0, 0), metadata);
 
     std::mutex error_mutex;
     std::exception_ptr background_error;
@@ -500,6 +543,7 @@ int main(int argc, char ** argv)
       " worker_cpu=" << options.worker_cpu <<
       " ext_policy=" << options.ext_policy <<
       " hog_threads=" << options.hog_threads <<
+      " hint_mode=" << hint_mode <<
       " window_stats=" << (options.window_stats ? 1 : 0) << '\n';
 
     if (options.window_stats) {

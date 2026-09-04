@@ -73,10 +73,10 @@ ros2 run scx_slam_workload scx_slam_pipeline --duration 3
 ```
 
 The executable also accepts `--worker-cpu N`, `--ext-policy N`, `--pin DIR`,
-`--hog N`, and `--window-stats`. The pin and policy options opt into the
-attached sched_ext policy. Contenders use the same policy as callback workers:
-they are ordinary CFS threads in the CFS case and unhinted best-effort
-`SCHED_EXT` threads in the scx case.
+`--hint-mode MODE`, `--hog N`, and `--window-stats`. The pin and policy options
+opt into the attached sched_ext policy. Contenders use the same policy as
+callback workers: they are ordinary CFS threads in the CFS case and unhinted
+best-effort `SCHED_EXT` threads in the scx case.
 
 This is still a synthetic compute workload. Phase 2 proves ROS transport,
 message-derived hinting, fixed worker ownership, and stage-to-stage timestamp
@@ -109,6 +109,26 @@ cutoff is excluded.
 Phase 3 is an evaluation, not a pass/fail test. The harness deliberately does
 not assert that scx must beat CFS. Results remain synthetic-work evidence until
 bag replay and an actual estimator are introduced in later phases.
+
+The default `SCX_VARIANTS=hinted` runs the complete metadata policy. Ablations
+can be selected individually or together:
+
+- `hinted`: dedicated IMU stage plus FE vision/estimator hints.
+- `no-hints`: all workers enter `SCHED_EXT`, but `NullHintSink` publishes no
+  metadata; this is the anonymous BE fallback.
+- `imu-only`: only IMU keeps its dedicated hint; every other stage is
+  `MISC/BE`.
+- `fe-only`: vision and estimator remain FE; IMU retains its deadline and
+  budget as ordinary FE but loses the dedicated IMU stage and wakeup-preempt
+  path.
+
+Run the complete split under the same attached scheduler and workload:
+
+```bash
+sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
+  REPETITIONS=3 SCX_VARIANTS=hinted,no-hints,imu-only,fe-only \
+  scripts/run_ros2_eval.sh
+```
 
 The default build remains ROS-independent:
 

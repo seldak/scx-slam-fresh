@@ -15,6 +15,7 @@ duration=${DURATION:-15}
 hog_threads=${HOG_THREADS:-2}
 ext_policy=${EXT_POLICY:-7}
 repetitions=${REPETITIONS:-3}
+scx_variants=${SCX_VARIANTS:-hinted}
 output_dir=${OUTPUT_DIR:-/tmp/scx-slam-fresh-ros2-eval-$(date +%Y%m%d-%H%M%S)-$$}
 pin_dir="/sys/fs/bpf/scx_slam_fresh_ros2_eval_$$"
 loader_pid=
@@ -27,8 +28,11 @@ Run 'make && make ros2 && make test-ros2' as your normal user first.
 
 Optional environment variables:
   CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2
-  EXT_POLICY=7 REPETITIONS=3 OUTPUT_DIR=/path/to/results
+  EXT_POLICY=7 REPETITIONS=3 SCX_VARIANTS=hinted OUTPUT_DIR=/path/to/results
   ROS2_SETUP=/opt/ros/lyrical/setup.bash
+
+SCX_VARIANTS is a comma-separated subset of:
+  hinted,no-hints,imu-only,fe-only
 EOF
 }
 
@@ -127,6 +131,20 @@ for value in "$cpu" "$housekeeping_cpu" "$duration" "$hog_threads" "$ext_policy"
         exit 2
     fi
 done
+IFS=',' read -r -a variant_list <<<"$scx_variants"
+if (( ${#variant_list[@]} == 0 )); then
+    echo "error: SCX_VARIANTS must select at least one variant" >&2
+    exit 2
+fi
+for variant in "${variant_list[@]}"; do
+    case "$variant" in
+        hinted|no-hints|imu-only|fe-only) ;;
+        *)
+            echo "error: unknown SCX variant '$variant'" >&2
+            exit 2
+            ;;
+    esac
+done
 if (( duration < 1 || repetitions < 1 )); then
     echo "error: DURATION and REPETITIONS must be positive" >&2
     exit 2
@@ -180,8 +198,9 @@ hog_threads=$hog_threads
 ext_policy=$ext_policy
 ops_flags=$ops_flags
 repetitions=$repetitions
-git_commit=$(git -C "$repo_dir" rev-parse HEAD)
-git_dirty=$(if [[ -n $(git -C "$repo_dir" status --porcelain) ]]; then echo yes; else echo no; fi)
+scx_variants=$scx_variants
+git_commit=$(git -c safe.directory="$repo_dir" -C "$repo_dir" rev-parse HEAD)
+git_dirty=$(if [[ -n $(git -c safe.directory="$repo_dir" -C "$repo_dir" status --porcelain) ]]; then echo yes; else echo no; fi)
 ros_pipeline_sha256=$(sha256sum "$(readlink -f "$ros_bin")" | awk '{print $1}')
 loader_sha256=$(sha256sum "$loader_bin" | awk '{print $1}')
 bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{print $1}')
@@ -200,14 +219,21 @@ taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" \
 loader_pid=$!
 wait_for_scheduler
 
-for repetition in $(seq 1 "$repetitions"); do
-    if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
-        echo "error: sched_ext stopped before scx case $repetition" >&2
-        tail -n 40 "$output_dir/loader.txt" >&2 || true
-        exit 1
-    fi
-    echo "=== scx-$repetition ===" >>"$output_dir/loader.txt"
-    run_case scx "$repetition" --pin "$pin_dir" --ext-policy "$ext_policy"
+for variant in "${variant_list[@]}"; do
+    case "$variant" in
+        hinted) hint_mode=full ;;
+        *) hint_mode=$variant ;;
+    esac
+    for repetition in $(seq 1 "$repetitions"); do
+        if [[ $(< /sys/kernel/sched_ext/state) != enabled ]]; then
+            echo "error: sched_ext stopped before $variant case $repetition" >&2
+            tail -n 40 "$output_dir/loader.txt" >&2 || true
+            exit 1
+        fi
+        echo "=== ${variant}-${repetition} ===" >>"$output_dir/loader.txt"
+        run_case "$variant" "$repetition" \
+            --pin "$pin_dir" --ext-policy "$ext_policy" --hint-mode "$hint_mode"
+    done
 done
 
 echo
