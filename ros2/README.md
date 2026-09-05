@@ -201,7 +201,7 @@ second terminal:
 
 ```bash
 ros2 run scx_slam_workload scx_slam_pipeline \
-  --duration 30 --input external --window-stats
+  --duration 30 --input external --source-start-ns SOURCE_EPOCH_NS --window-stats
 ```
 
 Then start playback in a third terminal:
@@ -216,12 +216,17 @@ The override file must set both selected sensor topics to `reliable`,
 file and verifies both endpoints with `ros2 topic info -v`; use the manual
 three-terminal form only for plumbing checks.
 
+External window statistics use source time, not pipeline process start. The
+matched harness obtains `SOURCE_EPOCH_NS` from a short preflight playback,
+passes the same value to every CFS and SCX case, and rejects a result if any
+stage reports a different offered count or first/last source timestamp.
+
 Start the adapter and pipeline before playback, and choose a pipeline duration
 longer than the selected bag interval. External-mode `offered` fields count
-callbacks taken by the measurement cutoff; messages still queued inside DDS
-are not observable by this first adapter. Consequently this phase establishes
-the bag-to-executor path but does not yet provide a matched scheduling result,
-bag-level offered-count accounting, or estimator accuracy.
+callbacks taken whose source timestamps fall inside the fixed interval. The
+adapter reports transport drops, while the harness verifies identical counts
+and source boundaries across cases. This still measures scheduler behavior,
+not estimator accuracy.
 
 For a matched 15-second CFS-versus-hinted capture, keep the bag outside the
 repository and use the dedicated harness:

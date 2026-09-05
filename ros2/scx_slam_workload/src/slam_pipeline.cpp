@@ -43,6 +43,7 @@ struct Options
   int ext_policy{-1};
   int hog_threads{0};
   bool window_stats{false};
+  uint64_t source_start_ns{0};
   std::string pin_dir;
   std::string hint_mode{"auto"};
   std::string input_mode{"synthetic"};
@@ -134,13 +135,10 @@ uint64_t percentile_99(std::vector<uint64_t> values)
 
 void account_job(
   StageStats & stats, const Message & message, uint64_t work_us,
-  uint64_t deadline_ns, uint64_t stale_ns, uint64_t window_start_ns,
-  uint64_t window_end_ns)
+  uint64_t deadline_ns, uint64_t stale_ns, bool measured)
 {
   const uint64_t start = monotonic_ns();
   const uint64_t start_age = start > message.release_ts_ns ? start - message.release_ts_ns : 0;
-  const bool measured =
-    message.release_ts_ns >= window_start_ns && message.release_ts_ns < window_end_ns;
   if (measured) {
     std::lock_guard<std::mutex> lock(stats.mutex);
     if (stats.first_job_id == 0) {
@@ -172,6 +170,14 @@ void account_job(
   stats.completion_ages_ns.push_back(age);
 }
 
+bool source_time_measured(
+  const Message & message, uint64_t source_start_ns,
+  uint64_t warmup_ns, uint64_t duration_ns)
+{
+  const uint64_t start = source_start_ns + warmup_ns;
+  return message.source_ts_ns >= start && message.source_ts_ns < start + duration_ns;
+}
+
 int parse_integer(const char * text, const char * option)
 {
   char * end = nullptr;
@@ -181,6 +187,17 @@ int parse_integer(const char * text, const char * option)
     throw std::invalid_argument(std::string("invalid value for ") + option);
   }
   return static_cast<int>(value);
+}
+
+uint64_t parse_u64(const char * text, const char * option)
+{
+  char * end = nullptr;
+  errno = 0;
+  const unsigned long long value = std::strtoull(text, &end, 10);
+  if (errno != 0 || !end || *end != '\0' || text[0] == '-' || value == 0) {
+    throw std::invalid_argument(std::string("invalid value for ") + option);
+  }
+  return static_cast<uint64_t>(value);
 }
 
 Options parse_options(int argc, char ** argv)
@@ -216,6 +233,9 @@ Options parse_options(int argc, char ** argv)
       }
     } else if (argument == "--window-stats") {
       options.window_stats = true;
+    } else if (argument == "--source-start-ns") {
+      options.source_start_ns = parse_u64(
+        require_value("--source-start-ns"), "--source-start-ns");
     } else if (argument == "--pin") {
       options.pin_dir = require_value("--pin");
     } else if (argument == "--hint-mode") {
@@ -235,11 +255,15 @@ Options parse_options(int argc, char ** argv)
       std::cout <<
         "usage: scx_slam_pipeline [--duration S] [--worker-cpu N] "
         "[--ext-policy N] [--pin DIR] [--hint-mode MODE] "
-        "[--input synthetic|external] [--warmup S] [--hog N] [--window-stats]\n";
+        "[--input synthetic|external] [--source-start-ns NS] [--warmup S] "
+        "[--hog N] [--window-stats]\n";
       std::exit(0);
     } else if (argument != "--ros-args" && argument.rfind("__", 0) != 0) {
       throw std::invalid_argument("unknown argument: " + argument);
     }
+  }
+  if (options.input_mode == "external" && options.source_start_ns == 0) {
+    throw std::invalid_argument("--input external requires --source-start-ns");
   }
   return options;
 }
@@ -472,6 +496,8 @@ int main(int argc, char ** argv)
     StageStats mapping_stats;
     std::atomic<uint64_t> measurement_start_ns{std::numeric_limits<uint64_t>::max()};
     std::atomic<uint64_t> measurement_end_ns{0};
+    const uint64_t warmup_ns = static_cast<uint64_t>(options.warmup_s) * 1000000000ULL;
+    const uint64_t duration_ns = static_cast<uint64_t>(options.duration_s) * 1000000000ULL;
     std::atomic<uint64_t> imu_taken{0};
     std::atomic<uint64_t> vision_taken{0};
     std::atomic<uint64_t> estimator_taken{0};
@@ -484,12 +510,14 @@ int main(int argc, char ** argv)
       [&](const Message::SharedPtr message) {
         const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
         const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
-        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+        const bool measured = options.input_mode == "external" ?
+          source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
+          message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
+        if (measured) {
           imu_taken.fetch_add(1, std::memory_order_relaxed);
         }
         account_job(
-          imu_stats, *message, 150, 5000000ULL, 10000000ULL,
-          window_start, window_end);
+          imu_stats, *message, 150, 5000000ULL, 10000000ULL, measured);
       },
       imu_subscription_options);
 
@@ -500,13 +528,15 @@ int main(int argc, char ** argv)
       [&](const Message::SharedPtr message) {
         const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
         const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
-        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+        const bool measured = options.input_mode == "external" ?
+          source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
+          message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
+        if (measured) {
           vision_taken.fetch_add(1, std::memory_order_relaxed);
         }
         const uint64_t work_us = 3000ULL + (message->job_id % 5ULL) * 500ULL;
         account_job(
-          vision_stats, *message, work_us, 33000000ULL, 66000000ULL,
-          window_start, window_end);
+          vision_stats, *message, work_us, 33000000ULL, 66000000ULL, measured);
         vision_output->publish(*message);
       },
       vision_subscription_options);
@@ -518,13 +548,15 @@ int main(int argc, char ** argv)
       [&](const Message::SharedPtr message) {
         const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
         const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
-        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+        const bool measured = options.input_mode == "external" ?
+          source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
+          message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
+        if (measured) {
           estimator_taken.fetch_add(1, std::memory_order_relaxed);
         }
         const uint64_t work_us = 2000ULL + (message->job_id % 5ULL) * 250ULL;
         account_job(
-          estimator_stats, *message, work_us, 33000000ULL, 66000000ULL,
-          window_start, window_end);
+          estimator_stats, *message, work_us, 33000000ULL, 66000000ULL, measured);
         estimator_output->publish(*message);
       },
       estimator_subscription_options);
@@ -536,10 +568,13 @@ int main(int argc, char ** argv)
       [&](const Message::SharedPtr message) {
         const uint64_t window_start = measurement_start_ns.load(std::memory_order_acquire);
         const uint64_t window_end = measurement_end_ns.load(std::memory_order_acquire);
-        if (message->release_ts_ns >= window_start && message->release_ts_ns < window_end) {
+        const bool measured = options.input_mode == "external" ?
+          source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
+          message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
+        if (measured) {
           mapping_taken.fetch_add(1, std::memory_order_relaxed);
         }
-        account_job(mapping_stats, *message, 2000, 0, 0, window_start, window_end);
+        account_job(mapping_stats, *message, 2000, 0, 0, measured);
       },
       mapping_subscription_options);
 
@@ -601,10 +636,9 @@ int main(int argc, char ** argv)
         options.ext_policy, std::ref(error_mutex), std::ref(background_error));
     }
 
-    const uint64_t lead_ns = options.input_mode == "synthetic" ?
-      100000000ULL : static_cast<uint64_t>(options.warmup_s) * 1000000000ULL;
+    const uint64_t lead_ns = options.input_mode == "synthetic" ? 100000000ULL : warmup_ns;
     const uint64_t start_ns = monotonic_ns() + lead_ns;
-    const uint64_t end_ns = start_ns + static_cast<uint64_t>(options.duration_s) * 1000000000ULL;
+    const uint64_t end_ns = start_ns + duration_ns;
     measurement_start_ns.store(start_ns, std::memory_order_release);
     measurement_end_ns.store(end_ns, std::memory_order_release);
     std::thread imu_generator;
@@ -619,7 +653,9 @@ int main(int argc, char ** argv)
       imu_generator.join();
       camera_generator.join();
     }
-    sleep_until_ns(end_ns);
+    const uint64_t process_end_ns = options.input_mode == "external" ?
+      end_ns + 2000000000ULL : end_ns;
+    sleep_until_ns(process_end_ns);
 
     const uint64_t expected_imu = options.input_mode == "synthetic" ?
       static_cast<uint64_t>(options.duration_s) * 200ULL :
@@ -664,12 +700,13 @@ int main(int argc, char ** argv)
       " hog_threads=" << options.hog_threads <<
       " hint_mode=" << hint_mode <<
       " input=" << options.input_mode <<
+      " source_start_ns=" << options.source_start_ns <<
       " window_stats=" << (options.window_stats ? 1 : 0) << '\n';
 
     if (options.input_mode == "external") {
       std::cout <<
-        "external_counts: offered fields count callbacks taken by the measurement cutoff; "
-        "messages still queued in DDS are not observable here\n";
+        "external_counts: source-time window begins at source_start_ns plus warmup; "
+        "offered fields count callbacks taken in that fixed source interval\n";
     }
 
     if (options.window_stats) {

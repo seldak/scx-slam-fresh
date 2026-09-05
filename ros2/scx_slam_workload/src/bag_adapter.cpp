@@ -75,6 +75,7 @@ private:
     uint64_t received{0};
     uint64_t published{0};
     uint64_t dropped{0};
+    uint64_t first_source_ts_ns{0};
   };
 
   void publish_job(
@@ -83,8 +84,11 @@ private:
   {
     const uint64_t job_id = ++counts.received;
     try {
-      publisher->publish(
-        scx_slam_workload::make_stamped_job(job_id, monotonic_ns(), source_stamp));
+      const auto job = scx_slam_workload::make_stamped_job(job_id, monotonic_ns(), source_stamp);
+      if (counts.first_source_ts_ns == 0) {
+        counts.first_source_ts_ns = job.source_ts_ns;
+      }
+      publisher->publish(job);
       counts.published++;
     } catch (const std::exception & error) {
       counts.dropped++;
@@ -98,10 +102,11 @@ private:
   {
     RCLCPP_INFO(
       get_logger(),
-      "adapter_%s: received=%llu published=%llu dropped=%llu",
+      "adapter_%s: received=%llu published=%llu dropped=%llu first_source_ts_ns=%llu",
       stream, static_cast<unsigned long long>(counts.received),
       static_cast<unsigned long long>(counts.published),
-      static_cast<unsigned long long>(counts.dropped));
+      static_cast<unsigned long long>(counts.dropped),
+      static_cast<unsigned long long>(counts.first_source_ts_ns));
   }
 
   StreamCounts imu_counts_;

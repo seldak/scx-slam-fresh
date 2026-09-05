@@ -26,6 +26,7 @@ loader_pid=
 adapter_pid=
 pipeline_pid=
 player_pid=
+source_start_ns=
 
 usage() {
     cat <<EOF
@@ -127,7 +128,7 @@ start_adapter() {
 start_player() {
     local log=$1
     local paused=${2:-0}
-    local play_duration=$((warmup + duration + 2))
+    local play_duration=$((warmup + duration + 5))
     local args=(
         bag play "$bag_path" --rate 1.0
         --start-offset "$bag_offset"
@@ -149,7 +150,7 @@ start_player() {
 qos_preflight() {
     echo "Checking bag-player and adapter QoS endpoints..."
     start_adapter "$output_dir/qos-adapter.txt"
-    start_player "$output_dir/qos-player.txt" 1
+    start_player "$output_dir/qos-player.txt"
     wait_for_topic_endpoints "$imu_topic" 1 1
     wait_for_topic_endpoints "$camera_topic" 1 1
     ros2 topic info -v "$imu_topic" >"$output_dir/qos-imu.txt"
@@ -165,10 +166,27 @@ qos_preflight() {
             return 1
         fi
     done
-    cleanup_process "$player_pid"
+    # Let both streams publish, then terminate the preflight player reliably.
+    sleep 2
+    cleanup_process "$player_pid" TERM
     player_pid=
     cleanup_process "$adapter_pid"
     adapter_pid=
+    local imu_start camera_start
+    imu_start=$(sed -n 's/.*adapter_imu: .*first_source_ts_ns=\([0-9][0-9]*\).*/\1/p' \
+        "$output_dir/qos-adapter.txt")
+    camera_start=$(sed -n 's/.*adapter_camera: .*first_source_ts_ns=\([0-9][0-9]*\).*/\1/p' \
+        "$output_dir/qos-adapter.txt")
+    if [[ -z $imu_start || -z $camera_start ]]; then
+        echo "error: preflight did not capture both source timestamps" >&2
+        return 1
+    fi
+    if (( imu_start < camera_start )); then
+        source_start_ns=$imu_start
+    else
+        source_start_ns=$camera_start
+    fi
+    echo "Fixed source-time epoch: $source_start_ns ns"
 }
 
 assert_case_accounting() {
@@ -220,13 +238,31 @@ append_summary() {
     ' "$result_file" >>"$output_dir/summary.tsv"
 }
 
+assert_matched_source_windows() {
+    awk -F '\t' '
+        NR == 1 { next }
+        {
+            stage = $3
+            signature = $4 FS $14 FS $15
+            if (!(stage in expected)) {
+                expected[stage] = signature
+            } else if (expected[stage] != signature) {
+                printf "error: unmatched source window for %s: expected %s, got %s\n", \
+                    stage, expected[stage], signature > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' "$output_dir/summary.tsv"
+}
+
 run_case() {
     local mode=$1
     local repetition=$2
     local name="${mode}-${repetition}"
     local case_dir="$output_dir/$name"
     local pipeline_args=(--duration "$duration" --warmup "$warmup" --input external
-        --worker-cpu "$cpu" --hog "$hog_threads" --window-stats)
+        --source-start-ns "$source_start_ns" --worker-cpu "$cpu" --hog "$hog_threads"
+        --window-stats)
     if [[ $mode == hinted ]]; then
         pipeline_args+=(--pin "$pin_dir" --ext-policy "$ext_policy" --hint-mode full)
     fi
@@ -340,7 +376,7 @@ else
 fi
 bag_sha256=$(sha256sum "$output_dir/bag-files.sha256" | awk '{print $1}')
 worker_thread_siblings=$(< "/sys/devices/system/cpu/cpu${cpu}/topology/thread_siblings_list")
-play_duration=$((warmup + duration + 2))
+play_duration=$((warmup + duration + 5))
 printf -v play_command \
     'ros2 bag play %q --rate 1.0 --start-offset %q --playback-duration %q --topics %q %q --qos-profile-overrides-path %q --delay 1 --disable-keyboard-controls --progress-bar-update-rate 0' \
     "$bag_path" "$bag_offset" "$play_duration" "$imu_topic" \
@@ -383,6 +419,7 @@ EOF
 printf "mode\trepetition\tstage\toffered\tcompleted\tlate\tstarted_stale\tunfinished\tcpu_us\tp99_start_age_us\tmax_start_age_us\tp99_age_us\tmax_age_us\tfirst_source_ts_ns\tlast_source_ts_ns\n" >"$output_dir/summary.tsv"
 
 qos_preflight
+echo "source_start_ns=$source_start_ns" >>"$output_dir/environment.txt"
 for repetition in $(seq 1 "$repetitions"); do
     run_case cfs "$repetition"
 done
@@ -394,6 +431,7 @@ wait_for_scheduler
 for repetition in $(seq 1 "$repetitions"); do
     run_case hinted "$repetition"
 done
+assert_matched_source_windows
 
 echo
 echo "Bag-backed exploration complete; no comparative win is asserted."
