@@ -830,8 +830,8 @@ partial-switch snapshot above.
 
 ## Bag-backed hog2 baseline before BE slice experiments
 
-Preserve `/tmp/scx-slam-fresh-ros2-bag-20260905-223435-126782` as the
-uncapped baseline. This run used clean revision `1e1bf87`, kernel
+The uncapped hog2 run on 2026-09-05 is the preserved baseline.
+This run used clean revision `1e1bf87`, kernel
 `7.0.0-31-generic`, CPU 14 for workers and two EXT hogs, CPU 1 for
 housekeeping, partial switch (`ops_flags=0x8`), and 1ms deadline grace.
 The SMT sibling CPU 15 remained unused. There was no FE wakeup preemption;
@@ -868,8 +868,9 @@ flight. Estimator progressed through job 360. This is a cutoff failure under
 load, not a recurrence of the permanent STALE ownership lock. Completion-age
 percentiles exclude dropped and unfinished work.
 
-The separate hog0 recovery gate passed three hinted repetitions in
-`/tmp/scx-slam-fresh-ros2-bag-20260905-222032-123253`: IMU 3000/0 late and
+The separate hog0 recovery gate on 2026-09-05 passed three hinted repetitions
+using `875daa1` plus the bag-evaluation changes later committed as `1e1bf87`:
+IMU 3000/0 late and
 each downstream stage 300/0 late, with zero drops or unfinished work. That
 validated recovery on the pinned input; it did not validate camera-chain
 latency under hog2. Design B retains the shared 33ms source-relative camera
@@ -884,9 +885,9 @@ Baseline binaries (SHA256):
 
 ### BE insertion cap: 2ms, three hinted hog2 repetitions
 
-The capture in `/tmp/scx-slam-fresh-ros2-bag-20260905-225924-132199` used
+The capped hog2 capture on 2026-09-05 used
 `BE_SLICE_CAP_US=2000 HINTED_ONLY=1 REPETITIONS=3 HOG_THREADS=2` and
-`BASELINE_DIR=/tmp/scx-slam-fresh-ros2-bag-20260905-223435-126782`.
+the preserved uncapped hog2 baseline for source-window comparison.
 It ran on `1e1bf87` plus the uncommitted cap experiment. The recorded loader
 configuration confirms `be_slice_cap_us=2000`, `imu_preempt=wakeup`,
 `deadline_grace_us=1000`, and `ops_flags=0x8`. The cap defaults to disabled.
@@ -921,8 +922,7 @@ reintroducing IMU lateness. It supports long BE service intervals as a cause
 of the multi-hop latency loss in this workload. It does not separately
 measure DDS, dispatcher, and runnable-wait contributions or establish a
 worst-case latency bound. No FE preemption or deadline rewrite was added.
-The cap-enabled hog0 check passed one hinted repetition in
-`/tmp/scx-slam-fresh-ros2-bag-20260905-232701-136538`, captured at clean
+The cap-enabled hog0 check on 2026-09-05 passed one hinted repetition at clean
 revision `f8aea1a` before the documentation-only validation amendment.
 It used the same 15s source window, `BE_SLICE_CAP_US=2000`, and identical
 pipeline, adapter, loader, and BPF binaries to the capped hog2 capture.
