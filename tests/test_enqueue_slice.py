@@ -27,9 +27,11 @@ class SliceTests(unittest.TestCase):
         program = '''
 #include <assert.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include "scx_slam_fresh_shared.h"
 typedef uint64_t u64;
 enum { SCX_SLICE_DFL = DEFAULT_NS };
+uint64_t be_slice_cap_ns = 0;
 HELPER
 int main(void) {
     struct slam_task_hint hint = {};
@@ -52,6 +54,26 @@ int main(void) {
         const uint64_t next = request ? request : (residual ? residual : 1);
         assert(next == SCX_SLICE_DFL);
     }
+    const uint64_t caps[] = {2000000, 5000000};
+    const uint64_t requests[] = {0, 1, 150000, 2000000, 5000000, 20000000, UINT64_MAX};
+    for (size_t c = 0; c < sizeof(caps) / sizeof(caps[0]); c++) {
+        be_slice_cap_ns = caps[c];
+        assert(enqueue_slice_ns(NULL) == caps[c]); // Unhinted EXT hog.
+        for (unsigned stage = 0; stage < SLAM_STAGE_MAX; stage++) {
+            for (unsigned cls = SLAM_SCX_CLASS_BE; cls <= SLAM_SCX_CLASS_FE; cls++) {
+                hint.stage_id = stage;
+                hint.class_id = cls;
+                for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+                    hint.slice_ns = requests[i];
+                    uint64_t original = requests[i] ? requests[i] : SCX_SLICE_DFL;
+                    bool eligible = stage != SLAM_STAGE_IMU_PREINT && cls == SLAM_SCX_CLASS_BE;
+                    uint64_t expected = eligible && original > caps[c] ? caps[c] : original;
+                    assert(enqueue_slice_ns(&hint) == expected);
+                    assert(hint.slice_ns == requests[i]);
+                }
+            }
+        }
+    }
 }
 '''.replace("DEFAULT_NS", default[1]).replace("HELPER", helper[0])
         with tempfile.TemporaryDirectory(prefix="scx-slice-test-") as directory:
@@ -70,6 +92,9 @@ int main(void) {
         self.assertEqual(len(calls), 7)
         self.assertEqual(calls.count("enqueue_slice_ns(h)"), 1)  # No-state fallback.
         self.assertEqual(len(re.findall(r"\bscx_insert(?:_vtime)?\(", body)), len(calls))
+
+    def test_be_cap_is_default_off(self):
+        self.assertIn("const volatile __u64 be_slice_cap_ns = 0;", SOURCE.read_text())
 
     def test_estimator_probe_observes_every_route_without_changing_it(self):
         source = SOURCE.read_text()

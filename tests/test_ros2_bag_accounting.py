@@ -12,9 +12,33 @@ SCRIPT = (pathlib.Path(__file__).resolve().parents[1] /
           "scripts/run_ros2_bag_eval.sh").read_text()
 ASSERT = re.search(r"^assert_case_accounting\(\) \{\n.*?^\}", SCRIPT,
                    re.M | re.S).group()
+MATCH = re.search(r"^assert_matched_source_windows\(\) \{\n.*?^\}", SCRIPT,
+                 re.M | re.S).group()
 
 
 class BagAccounting(unittest.TestCase):
+    def test_hinted_only_windows_match_external_baseline_exactly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            baseline = root / "baseline"
+            output = root / "experiment"
+            baseline.mkdir()
+            output.mkdir()
+            def summary(mode, first_stamp):
+                fields = [mode, "1", "state_est", "300"] + ["0"] * 17
+                fields[13:15] = [str(first_stamp), "1403636597713555500"]
+                fields[19:21] = ["61", "360"]
+                return "header\n" + "\t".join(fields) + "\n"
+            stamp = 1403636582763555500
+            (baseline / "summary.tsv").write_text(summary("cfs", stamp))
+            for offset in (0, 1):
+                (output / "summary.tsv").write_text(summary("hinted", stamp + offset))
+                result = subprocess.run(
+                    ["bash", "-c", MATCH + '\nbaseline_dir=$1\noutput_dir=$2\n'
+                     'assert_matched_source_windows', "test", str(baseline), str(output)],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, offset == 0, result.stderr)
+
     def check_case(self, changes=None, adapter_drops=0):
         changes = changes or {}
         lines = []

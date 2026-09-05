@@ -134,6 +134,10 @@ static __always_inline bool scx_move_to_local(u64 dsq_id)
  * The loader may set this to zero for a default-off diagnostic A/B.
  */
 const volatile __u64 deadline_grace_ns = 1000000ULL; /* 1ms */
+/* Default-off service-timing experiment: cap only BE/unhinted insertion.
+ * FE (including budget-demoted FE) and the dedicated IMU path are unchanged.
+ */
+const volatile __u64 be_slice_cap_ns = 0;
 
 /* Opt-in diagnostic A/B probe, selected by the loader before attachment.
  * Default policy is unchanged. Both variants use the same BPF binary.
@@ -149,7 +153,12 @@ static __always_inline u64 enqueue_slice_ns(const struct slam_task_hint *h)
      * SCX_SLICE_DFL; passing zero does not refill the kernel default.
      * A missing hint uses the same default, including the no-state fallback.
      */
-    return h && h->slice_ns ? h->slice_ns : SCX_SLICE_DFL;
+    u64 slice = h && h->slice_ns ? h->slice_ns : SCX_SLICE_DFL;
+    bool be = !h || (h->stage_id != SLAM_STAGE_IMU_PREINT &&
+                    h->class_id == SLAM_SCX_CLASS_BE);
+    if (be && be_slice_cap_ns && slice > be_slice_cap_ns)
+        slice = be_slice_cap_ns;
+    return slice;
 }
 
 

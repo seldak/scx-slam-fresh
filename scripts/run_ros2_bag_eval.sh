@@ -19,6 +19,9 @@ repetitions=${REPETITIONS:-3}
 hog_threads=${HOG_THREADS:-0}
 ext_policy=${EXT_POLICY:-7}
 deadline_grace_us=${DEADLINE_GRACE_US:-1000}
+be_slice_cap_us=${BE_SLICE_CAP_US:-0}
+hinted_only=${HINTED_ONLY:-0}
+baseline_dir=${BASELINE_DIR:-}
 imu_topic=${IMU_TOPIC:-/imu0}
 camera_topic=${CAMERA_TOPIC:-/cam0/image_raw}
 output_dir=${OUTPUT_DIR:-/tmp/scx-slam-fresh-ros2-bag-$(date +%Y%m%d-%H%M%S)-$$}
@@ -39,10 +42,13 @@ Defaults:
   CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 BAG_OFFSET=0
   REPETITIONS=3 HOG_THREADS=0 EXT_POLICY=7
   DEADLINE_GRACE_US=1000
+  BE_SLICE_CAP_US=0 (disabled) HINTED_ONLY=0
+  BASELINE_DIR= (optional previous results for source-window comparison)
   IMU_TOPIC=/imu0 CAMERA_TOPIC=/cam0/image_raw
 
 The harness runs three CFS repetitions followed by three hinted partial-switch
 SCX repetitions. Dataset content remains outside the repository.
+Set HINTED_ONLY=1 to run only the hinted cases against an existing baseline.
 EOF
 }
 
@@ -240,8 +246,13 @@ append_summary() {
 }
 
 assert_matched_source_windows() {
+    local inputs=()
+    if [[ -n $baseline_dir ]]; then
+        inputs+=("$baseline_dir/summary.tsv")
+    fi
+    inputs+=("$output_dir/summary.tsv")
     awk -F '\t' '
-        NR == 1 { next }
+        FNR == 1 { next }
         {
             stage = $3
             signature = $4 FS $14 FS $15 FS $20 FS $21
@@ -253,7 +264,7 @@ assert_matched_source_windows() {
                 exit 1
             }
         }
-    ' "$output_dir/summary.tsv"
+    ' "${inputs[@]}"
 }
 
 run_case() {
@@ -324,12 +335,26 @@ if (( cpu == housekeeping_cpu )); then
     exit 2
 fi
 for value in "$cpu" "$housekeeping_cpu" "$duration" "$warmup" "$bag_offset" \
-    "$repetitions" "$hog_threads" "$ext_policy" "$deadline_grace_us"; do
+    "$repetitions" "$hog_threads" "$ext_policy" "$deadline_grace_us" \
+    "$be_slice_cap_us" "$hinted_only"; do
     if [[ ! $value =~ ^[0-9]+$ ]]; then
         echo "error: numeric options must contain non-negative integers" >&2
         exit 2
     fi
 done
+if [[ $hinted_only != 0 && $hinted_only != 1 ]]; then
+    echo "error: HINTED_ONLY must be 0 or 1" >&2
+    exit 2
+fi
+if [[ -e $output_dir ]]; then
+    echo "error: OUTPUT_DIR already exists; preserve prior results: $output_dir" >&2
+    exit 2
+fi
+if [[ -n $baseline_dir ]] &&
+   [[ ! -s $baseline_dir/summary.tsv || ! -f $baseline_dir/environment.txt ]]; then
+    echo "error: BASELINE_DIR must contain summary.tsv and environment.txt" >&2
+    exit 2
+fi
 if (( duration < 1 || warmup < 1 || repetitions < 1 )); then
     echo "error: DURATION, WARMUP, and REPETITIONS must be positive" >&2
     exit 2
@@ -377,6 +402,11 @@ ros2 bag info "$bag_path" >"$output_dir/bag-info.txt"
 source_start_ns=$(python3 "$repo_dir/scripts/ros2_bag_source_epoch.py" \
     "$bag_path" "$imu_topic" "$camera_topic" --index-dir "$output_dir/source-index")
 echo "Fixed source-time epoch: $source_start_ns ns"
+if [[ -n $baseline_dir ]] &&
+   ! grep -Fxq "source_start_ns=$source_start_ns" "$baseline_dir/environment.txt"; then
+    echo "error: source epoch differs from BASELINE_DIR" >&2
+    exit 1
+fi
 if [[ -f $bag_path ]]; then
     bag_dir=$(dirname -- "$bag_path")
     bag_name=$(basename -- "$bag_path")
@@ -423,6 +453,9 @@ warmup=$warmup
 hog_threads=$hog_threads
 ext_policy=$ext_policy
 deadline_grace_us=$deadline_grace_us
+be_slice_cap_us=$be_slice_cap_us
+hinted_only=$hinted_only
+baseline_dir=$baseline_dir
 ops_flags=$ops_flags
 repetitions=$repetitions
 git_commit=$(git -c safe.directory="$repo_dir" -C "$repo_dir" rev-parse HEAD)
@@ -437,12 +470,15 @@ printf "mode\trepetition\tstage\toffered\tcompleted\tlate\tstarted_stale\tunfini
 
 qos_preflight
 echo "source_start_ns=$source_start_ns" >>"$output_dir/environment.txt"
-for repetition in $(seq 1 "$repetitions"); do
-    run_case cfs "$repetition"
-done
+if (( ! hinted_only )); then
+    for repetition in $(seq 1 "$repetitions"); do
+        run_case cfs "$repetition"
+    done
+fi
 
 taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" \
     --deadline-grace-us "$deadline_grace_us" \
+    --be-slice-cap-us "$be_slice_cap_us" \
     >"$output_dir/loader.txt" 2>&1 &
 loader_pid=$!
 wait_for_scheduler

@@ -14,6 +14,20 @@ LOADER = os.environ.get(
 
 
 class SchedulerModeTests(unittest.TestCase):
+    def test_be_slice_cap_is_opt_in_and_validated(self):
+        default = subprocess.check_output([LOADER, "--print-config"], text=True)
+        self.assertIn("be_slice_cap_us=0", default)
+        for cap in ("0", "2000", "5000"):
+            config = subprocess.check_output(
+                [LOADER, "--print-config", "--be-slice-cap-us", cap], text=True)
+            self.assertIn(f"be_slice_cap_us={cap}", config)
+            self.assertIn("deadline_grace_us=1000", config)
+            self.assertIn("imu_preempt=wakeup", config)
+        for cap in ("-1", "", "+1", "1x", "18446744073709552"):
+            result = subprocess.run([LOADER, "--print-config", "--be-slice-cap-us", cap],
+                                    capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+
     def test_probe_is_opt_in(self):
         default = subprocess.check_output([LOADER, "--print-config"], text=True)
         self.assertIn("imu_preempt=wakeup trace_imu=0", default)

@@ -179,6 +179,7 @@ static void usage(const char *argv0)
             "  --print-config: inspect flags and selected probe options without attaching\n"
             "  --imu-preempt wakeup|always: opt-in preemption probe (default wakeup)\n"
             "  --deadline-grace-us N: late-demotion grace in microseconds (default 1000)\n"
+            "  --be-slice-cap-us N: BE/unhinted insertion slice cap (default 0 = off)\n"
             "  --trace-imu: sampled enqueue events and unsampled counters (default off)\n"
             "  --trace-estimator: unsampled estimator enqueue lanes for perf correlation (default off)\n"
             "  --trace-execution-cpu N: switch/wakeup/syscall and IMU callback probe (default off)\n"
@@ -265,6 +266,7 @@ int main(int argc, char **argv)
     int trace_est = 0;
     int execution_cpu = -1;
     uint64_t deadline_grace_us = 1000;
+    uint64_t be_slice_cap_us = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--pin") && i + 1 < argc) {
@@ -277,17 +279,23 @@ int main(int argc, char **argv)
             trace_imu = 1;
         } else if (!strcmp(argv[i], "--trace-estimator")) {
             trace_est = 1;
-        } else if (!strcmp(argv[i], "--deadline-grace-us") && i + 1 < argc) {
+        } else if ((!strcmp(argv[i], "--deadline-grace-us") ||
+                    !strcmp(argv[i], "--be-slice-cap-us")) && i + 1 < argc) {
+            int is_cap = !strcmp(argv[i], "--be-slice-cap-us");
             char *end = NULL;
             const char *value = argv[++i];
             errno = 0;
             unsigned long long parsed = strtoull(value, &end, 10);
             if (errno || !*value || strspn(value, "0123456789") != strlen(value) ||
                 !end || *end || parsed > UINT64_MAX / 1000ULL) {
-                fprintf(stderr, "invalid deadline grace: %s\n", value);
+                fprintf(stderr, "invalid %s: %s\n",
+                        is_cap ? "BE slice cap" : "deadline grace", value);
                 return 1;
             }
-            deadline_grace_us = (uint64_t)parsed;
+            if (is_cap)
+                be_slice_cap_us = (uint64_t)parsed;
+            else
+                deadline_grace_us = (uint64_t)parsed;
         } else if (!strcmp(argv[i], "--trace-execution-cpu") && i + 1 < argc) {
             char *end = NULL;
             errno = 0;
@@ -334,6 +342,7 @@ int main(int argc, char **argv)
     skel->rodata->trace_est_enqueues = trace_est;
     skel->rodata->execution_trace_cpu = execution_cpu;
     skel->rodata->deadline_grace_ns = deadline_grace_us * 1000ULL;
+    skel->rodata->be_slice_cap_ns = be_slice_cap_us * 1000ULL;
     if (execution_cpu < 0)
         bpf_map__set_max_entries(skel->maps.execution_events, 4096);
     /* No tracepoint load or attachment requirement for ordinary runs. */
@@ -346,11 +355,12 @@ int main(int argc, char **argv)
             printf("0x%llx\n", skel->struct_ops.scx_slam_fresh_ops->flags);
         else
             printf("ops_flags=0x%llx imu_preempt=%s trace_imu=%u execution_cpu=%d "
-                   "trace_est=%u deadline_grace_us=%llu\n",
+                   "trace_est=%u deadline_grace_us=%llu be_slice_cap_us=%llu\n",
                    skel->struct_ops.scx_slam_fresh_ops->flags,
                    skel->rodata->imu_preempt_always ? "always" : "wakeup",
                    skel->rodata->trace_imu_enqueues, execution_cpu, trace_est,
-                   (unsigned long long)deadline_grace_us);
+                   (unsigned long long)deadline_grace_us,
+                   (unsigned long long)be_slice_cap_us);
         scx_slam_fresh_bpf__destroy(skel);
         return 0;
     }
@@ -367,10 +377,11 @@ int main(int argc, char **argv)
     }
 
     printf("Loading scheduler with ops_flags=0x%llx imu_preempt=%s trace_imu=%u execution_cpu=%d "
-           "trace_est=%u deadline_grace_us=%llu\n",
+           "trace_est=%u deadline_grace_us=%llu be_slice_cap_us=%llu\n",
            skel->struct_ops.scx_slam_fresh_ops->flags,
            preempt_always ? "always" : "wakeup", trace_imu, execution_cpu, trace_est,
-           (unsigned long long)deadline_grace_us);
+           (unsigned long long)deadline_grace_us,
+           (unsigned long long)be_slice_cap_us);
     err = scx_slam_fresh_bpf__load(skel);
     if (err) {
         fprintf(stderr, "Failed to load BPF skeleton: %s\n", strerror(-err));
