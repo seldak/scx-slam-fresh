@@ -22,6 +22,9 @@ struct CallbackProfile
   uint64_t budget_ns{0};
   uint64_t slice_ns{0};
   uint32_t weight{0};
+  // Opt in only for message-aware subscriptions. Deadline and stale age bound
+  // admission (no grace); accepted callbacks retain ownership through cleanup.
+  bool reject_expired{false};
 };
 
 struct WorkerConfig
@@ -39,6 +42,14 @@ struct MessageMetadata
 
 using MessageMetadataExtractor =
   std::function<MessageMetadata(const std::shared_ptr<void> & message)>;
+
+enum class MessageEvent {Selected, DroppedBeforeStart};
+// Selected runs on the dispatcher for every successful take. A subsequent
+// drop runs there, or on the worker if the handoff expired. Observers must be
+// short, thread-safe, and must not retain or modify the borrowed message.
+// Exceptions stop spinning after releasing the message and callback group.
+using MessageObserver =
+  std::function<void(const std::shared_ptr<void> &, MessageEvent)>;
 
 class HintSink
 {
@@ -98,7 +109,8 @@ public:
     const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
     const CallbackProfile & profile,
     MessageMetadataExtractor metadata_extractor,
-    bool notify = true);
+    bool notify = true,
+    MessageObserver observer = {});
 
   template<typename MessageT, typename ExtractorT>
   void add_subscription_callback_group_with_profile(
@@ -106,7 +118,8 @@ public:
     const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
     const CallbackProfile & profile,
     ExtractorT && metadata_extractor,
-    bool notify = true)
+    bool notify = true,
+    MessageObserver observer = {})
   {
     add_subscription_callback_group_with_erased_metadata(
       group, node, profile,
@@ -114,7 +127,7 @@ public:
         const std::shared_ptr<void> & message) {
         return extractor(*std::static_pointer_cast<MessageT>(message));
       },
-      notify);
+      notify, std::move(observer));
   }
 
   void remove_callback_group(

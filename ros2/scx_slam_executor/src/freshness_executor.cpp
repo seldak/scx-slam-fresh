@@ -133,14 +133,27 @@ struct FreshnessExecutor::Impl
   {
     CallbackProfile profile;
     MessageMetadataExtractor metadata_extractor;
+    MessageObserver observer;
   };
 
   struct PendingWork
   {
+    PendingWork() = default;
+    PendingWork(const PendingWork &) = delete;
+    PendingWork & operator=(const PendingWork &) = delete;
+    PendingWork(PendingWork && other) noexcept
+    : executable(other.executable), hint(other.hint), message(std::move(other.message)),
+      message_info(std::move(other.message_info)), observer(std::move(other.observer))
+    {
+      // AnyExecutable has a destructor but no move constructor. Its implicit
+      // copy would let a moved-from destructor release our group's ownership.
+      other.executable.callback_group.reset();
+    }
     rclcpp::AnyExecutable executable;
     slam_task_hint hint{};
     std::shared_ptr<void> message;
     std::unique_ptr<rclcpp::MessageInfo> message_info;
+    MessageObserver observer;
   };
 
   explicit Impl(std::shared_ptr<HintSink> sink, WorkerConfig config)
@@ -155,6 +168,7 @@ struct FreshnessExecutor::Impl
   std::optional<PendingWork> pending;
   bool worker_ready{false};
   bool worker_idle{false};
+  bool hint_needs_clear{false};
   bool stop{false};
   uint64_t worker_id{0};
   std::exception_ptr worker_error;
@@ -162,6 +176,18 @@ struct FreshnessExecutor::Impl
   std::mutex profiles_mutex;
   std::unordered_map<const rclcpp::CallbackGroup *, ProfileBinding> profiles;
   uint64_t next_job_id{1};
+
+  // Shutdown only, after observing worker_idle under mutex. Between callbacks
+  // replace the completed slot directly: condition.wait proves logical parking
+  // but its mutex unlock can precede the actual futex sleep. An intermediate
+  // BE clear could strand that runnable tail in a BE DSQ before the next hint.
+  void clear_completed_hint()
+  {
+    if (hint_needs_clear) {
+      hint_sink->clear(worker_id);
+      hint_needs_clear = false;
+    }
+  }
 
   ProfileBinding binding_for(const rclcpp::AnyExecutable & executable)
   {
@@ -190,13 +216,37 @@ struct FreshnessExecutor::Impl
     hint.budget_ns = profile.budget_ns;
     hint.slice_ns = profile.slice_ns;
     hint.weight = profile.weight;
+    if (metadata && profile.reject_expired && profile.stage_id != SLAM_STAGE_IMU_PREINT) {
+      hint.flags |= SLAM_HINT_EXECUTOR_OWNED;
+    }
     return hint;
+  }
+
+  static bool expired(const PendingWork & work)
+  {
+    const auto & h = work.hint;
+    if (!(h.flags & SLAM_HINT_EXECUTOR_OWNED)) {
+      return false;
+    }
+    const auto now = monotonic_now_ns();
+    return (h.deadline_ts_ns && now > h.deadline_ts_ns) ||
+           (h.stale_ns && now > h.release_ts_ns && now - h.release_ts_ns > h.stale_ns);
+  }
+
+  static void drop(PendingWork & work)
+  {
+    if (work.observer) {
+      work.observer(work.message, MessageEvent::DroppedBeforeStart);
+    }
+    return_taken_message(work);
+    release_callback_group(work.executable);
   }
 
   static void release_callback_group(rclcpp::AnyExecutable & executable)
   {
     if (executable.callback_group) {
       executable.callback_group->can_be_taken_from().store(true);
+      executable.callback_group.reset();
     }
   }
 
@@ -263,7 +313,8 @@ void FreshnessExecutor::add_subscription_callback_group_with_erased_metadata(
   const rclcpp::node_interfaces::NodeBaseInterface::SharedPtr & node,
   const CallbackProfile & profile,
   MessageMetadataExtractor metadata_extractor,
-  bool notify)
+  bool notify,
+  MessageObserver observer)
 {
   if (!metadata_extractor) {
     throw std::invalid_argument("subscription metadata extractor must be callable");
@@ -271,6 +322,7 @@ void FreshnessExecutor::add_subscription_callback_group_with_erased_metadata(
   add_callback_group_with_profile(group, node, profile, notify);
   std::lock_guard<std::mutex> lock(impl_->profiles_mutex);
   impl_->profiles[group.get()].metadata_extractor = std::move(metadata_extractor);
+  impl_->profiles[group.get()].observer = std::move(observer);
 }
 
 void FreshnessExecutor::remove_callback_group(
@@ -297,6 +349,7 @@ void FreshnessExecutor::spin()
     impl_->pending.reset();
     impl_->worker_ready = false;
     impl_->worker_idle = false;
+    impl_->hint_needs_clear = false;
     impl_->stop = false;
     impl_->worker_id = 0;
     impl_->worker_error = nullptr;
@@ -309,7 +362,6 @@ void FreshnessExecutor::spin()
           std::lock_guard<std::mutex> lock(impl_->mutex);
           impl_->worker_id = slamqos_pid_tgid_self();
           impl_->worker_ready = true;
-          impl_->worker_idle = true;
         }
         impl_->condition.notify_all();
 
@@ -317,35 +369,42 @@ void FreshnessExecutor::spin()
           std::optional<Impl::PendingWork> work;
           {
             std::unique_lock<std::mutex> lock(impl_->mutex);
+            impl_->worker_idle = true;
+            impl_->condition.notify_all();
             impl_->condition.wait(lock, [this]() {
               return impl_->stop || impl_->pending.has_value();
               });
             if (impl_->stop && !impl_->pending) {
               break;
             }
-            work = std::move(impl_->pending);
+            work.emplace(std::move(*impl_->pending));
             impl_->pending.reset();
           }
 
           try {
             if (work->message) {
-              Impl::execute_taken_subscription(*work);
+              if (Impl::expired(*work)) {
+                Impl::drop(*work);
+              } else {
+                Impl::execute_taken_subscription(*work);
+              }
             } else {
               execute_any_executable(work->executable);
             }
           } catch (...) {
+            Impl::return_taken_message(*work);
+            Impl::release_callback_group(work->executable);
             // The callback is no longer in flight even when it throws. Do not
             // leave its identity in the worker's single-slot hint map.
             impl_->hint_sink->clear(impl_->worker_id);
+            {
+              std::lock_guard<std::mutex> lock(impl_->mutex);
+              impl_->hint_needs_clear = false;
+            }
             throw;
           }
-          impl_->hint_sink->clear(impl_->worker_id);
-
-          {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            impl_->worker_idle = true;
-          }
-          impl_->condition.notify_all();
+          // Retain ownership through destruction of work and parking at the
+          // top of the loop. Clearing here would expose a runnable BE tail.
         }
       } catch (...) {
         {
@@ -395,6 +454,7 @@ void FreshnessExecutor::spin()
       auto binding = impl_->binding_for(executable);
       Impl::PendingWork work;
       work.executable = std::move(executable);
+      executable.callback_group.reset();
 
       try {
         if (binding.metadata_extractor) {
@@ -425,6 +485,14 @@ void FreshnessExecutor::spin()
                     "message metadata must contain nonzero job_id and release_ts_ns");
           }
           work.hint = impl_->make_hint(binding.profile, metadata);
+          work.observer = binding.observer;
+          if (work.observer) {
+            work.observer(work.message, MessageEvent::Selected);
+          }
+          if (Impl::expired(work)) {
+            Impl::drop(work);
+            continue;
+          }
         } else {
           work.hint = impl_->make_hint(binding.profile);
         }
@@ -439,6 +507,7 @@ void FreshnessExecutor::spin()
       {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->worker_idle = false;
+        impl_->hint_needs_clear = true;
         impl_->pending.emplace(std::move(work));
       }
       impl_->condition.notify_all();
@@ -451,6 +520,11 @@ void FreshnessExecutor::spin()
   {
     std::unique_lock<std::mutex> lock(impl_->mutex);
     impl_->condition.wait(lock, [this]() {return impl_->worker_idle || impl_->worker_error;});
+    try {
+      impl_->clear_completed_hint();
+    } catch (...) {
+      if (!dispatch_error) {dispatch_error = std::current_exception();}
+    }
     impl_->stop = true;
   }
   impl_->condition.notify_all();

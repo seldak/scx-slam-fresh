@@ -496,6 +496,12 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
         return;
     }
 
+    /* Executor-owned subscriptions enforce age before admission and callback
+     * entry. Age demotion cannot safely revoke that ownership: it can strand
+     * the owner before its recheck/return/clear path. Leave those jobs in their
+     * normal class, with the same budget demotion below. Unflagged clients keep
+     * the existing firm-deadline policy. No queue selection happens here.
+     */
     /* Staleness check (guard future release timestamps). */
     bool stale = false;
     if (h->stale_ns && h->release_ts_ns) {
@@ -504,7 +510,7 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
             stale = true;
     }
 
-    if (stale) {
+    if (stale && !(h->flags & SLAM_HINT_EXECUTOR_OWNED)) {
         if (st->last_reported_stale_job != h->job_id) {
             emit_evt(SLAM_EVT_STALE_DEMOTION, key, h, st, now_ns);
             st->last_reported_stale_job = h->job_id;
@@ -522,7 +528,8 @@ void BPF_STRUCT_OPS(scx_slam_fresh_enqueue, struct task_struct *p, u64 enq_flags
      * Grace avoids flapping around the boundary. Keep the subtraction after
      * now > deadline so the comparison cannot overflow near U64_MAX.
      */
-    if (h->deadline_ts_ns && now_ns > h->deadline_ts_ns &&
+    if (!(h->flags & SLAM_HINT_EXECUTOR_OWNED) &&
+        h->deadline_ts_ns && now_ns > h->deadline_ts_ns &&
         now_ns - h->deadline_ts_ns > deadline_grace_ns) {
         if (st->last_reported_deadline_miss_job != h->job_id) {
             emit_evt(SLAM_EVT_DEADLINE_MISS, key, h, st, now_ns);

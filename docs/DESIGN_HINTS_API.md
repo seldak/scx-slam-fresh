@@ -137,8 +137,11 @@ the hint while that consumer is busy.
 separate dispatcher and worker threads. The dispatcher selects one ready
 `rclcpp::AnyExecutable` only after the worker has finished its previous job. It
 then publishes the selected callback group's profile for that worker before
-waking it. The worker does not steal or migrate work and clears its hint after
-the callback returns or throws.
+waking it. The worker does not steal or migrate work. After callback completion,
+it retains the completed job's hint through parking. Once the dispatcher has
+established completion, it directly overwrites that slot for the next selected
+job; there is no intermediate MISC/BE clear. The dispatcher clears the final
+slot at shutdown, and the worker clears its slot on callback failure.
 
 For ordinary callback groups, `release_ts_ns` is callback selection time. A
 message-aware subscription registration changes the handoff: the dispatcher
@@ -147,6 +150,20 @@ monotonic source timestamp, publishes that exact hint, and gives the same
 message to the worker. It does not mirror DDS state in another queue. The v1
 message path intentionally excludes serialized, dynamic, and intra-process
 delivery.
+
+Message-aware profiles may opt into `reject_expired`. The dispatcher rejects
+expired messages before publishing or waking, and the worker rechecks after
+handoff before entering the callback. These checks use the raw deadline and
+stale window, without grace; the BPF deadline grace still applies to unflagged
+clients. Dropping returns the taken message, releases the callback group, and
+reports `DroppedBeforeStart` to the registered observer. It never cancels a
+running callback.
+
+Accepted non-IMU messages carry `SLAM_HINT_EXECUTOR_OWNED`: age demotion must
+not strand the owner before its recheck, completion, or parking path. Normal
+class routing and CPU budget demotion remain in effect. IMU stays unflagged
+and retains its existing exemption. The retained completed hint is intentional;
+it does not represent queued application work or authorize kernel selection.
 
 For bag-backed input, the adapter samples `CLOCK_MONOTONIC` when it takes each
 sensor message and places that value in `release_ts_ns`. The recorded ROS

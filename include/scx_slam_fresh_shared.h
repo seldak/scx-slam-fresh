@@ -46,11 +46,17 @@ enum slam_stage_id : uint32_t {
     SLAM_STAGE_MAX            = 16
 };
 
+/* Userspace rejects expired selections and rechecks before callback entry.
+ * Keep the selected owner's normal lane until it releases the slot; CPU
+ * budget enforcement still applies. This is not permission to select backlog.
+ */
+#define SLAM_HINT_EXECUTOR_OWNED (1U << 0)
+
 struct slam_task_hint {
     uint32_t api_version;      /* must be SLAM_SCX_API_VERSION */
     uint32_t stage_id;         /* enum slam_stage_id */
     uint32_t class_id;         /* enum slam_scx_class */
-    uint32_t flags;            /* reserved */
+    uint32_t flags;            /* SLAM_HINT_* */
 
     uint64_t job_id;           /* monotonic per stage/thread */
     uint64_t release_ts_ns;    /* when job became ready (CLOCK_MONOTONIC) */

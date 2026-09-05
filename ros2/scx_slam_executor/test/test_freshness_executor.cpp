@@ -22,20 +22,28 @@ namespace
 class RecordingHintSink final : public scx_slam_executor::HintSink
 {
 public:
+  std::function<void(const slam_task_hint &)> after_publish;
+  std::function<void()> after_clear;
   void publish(uint64_t worker_pid_tgid, const slam_task_hint & hint) override
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    worker_ids_.push_back(worker_pid_tgid);
-    hints_.push_back(hint);
-    operations_.push_back(hint.job_id);
-    published_.store(true);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      worker_ids_.push_back(worker_pid_tgid);
+      hints_.push_back(hint);
+      operations_.push_back(hint.job_id);
+      published_.store(true);
+    }
+    if (after_publish) {after_publish(hint);}
   }
 
   void clear(uint64_t worker_pid_tgid) override
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    cleared_worker_ids_.push_back(worker_pid_tgid);
-    operations_.push_back(0);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      cleared_worker_ids_.push_back(worker_pid_tgid);
+      operations_.push_back(0);
+    }
+    if (after_clear) {after_clear();}
   }
 
   bool published() const
@@ -192,7 +200,7 @@ TEST(FreshnessExecutor, ReplacesOnlyCompletedJobsWhileDraining)
   rclcpp::shutdown();
 
   EXPECT_EQ(callback_count.load(), 3U);
-  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 0, 2, 0, 3, 0}));
+  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 2, 3, 0}));
 }
 
 TEST(FreshnessExecutor, TakesMessageMetadataBeforeWakingSubscriptionWorker)
@@ -254,4 +262,201 @@ TEST(FreshnessExecutor, TakesMessageMetadataBeforeWakingSubscriptionWorker)
   EXPECT_EQ(callback_thread.load(), executor.worker_pid_tgid());
   EXPECT_NE(extractor_thread.load(), callback_thread.load());
   EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{77, 0}));
+}
+
+namespace
+{
+uint64_t now_ns()
+{
+  timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+}
+
+// Real DDS take/return and mutually exclusive callback-group ownership. The
+// timeout is only a failure escape, never the success condition of these tests.
+class AdmissionTest : public ::testing::Test
+{
+protected:
+  using Message = std_msgs::msg::UInt64MultiArray;
+  void SetUp() override
+  {
+    int argc = 0;
+    rclcpp::init(argc, nullptr);
+    node = std::make_shared<rclcpp::Node>("admission_test");
+    group = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    sink = std::make_shared<RecordingHintSink>();
+    executor = std::make_unique<scx_slam_executor::FreshnessExecutor>(sink);
+    profile.stage_id = SLAM_STAGE_STATE_EST;
+    profile.class_id = SLAM_SCX_CLASS_FE;
+    profile.relative_deadline_ns = 20000000ULL;
+    profile.stale_ns = 40000000ULL;
+    profile.budget_ns = 10000000ULL;
+    profile.reject_expired = true;
+  }
+  void TearDown() override {rclcpp::shutdown();}
+  void run(std::function<void(Message::SharedPtr)> callback,
+    scx_slam_executor::MessageObserver observer, unsigned count, bool all_fresh = false)
+  {
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = group;
+    auto subscription = node->create_subscription<Message>("admission", rclcpp::QoS(10),
+      std::move(callback), options);
+    executor->add_subscription_callback_group_with_profile<Message>(
+      group, node->get_node_base_interface(), profile,
+      [](const Message & message) {
+        return scx_slam_executor::MessageMetadata{
+          message.data[0], message.data[1] ? now_ns() : 1ULL};
+      }, true, std::move(observer));
+    auto publisher = node->create_publisher<Message>("admission", rclcpp::QoS(10));
+    std::atomic<bool> done{false};
+    std::thread producer([&]() {
+        for (int i = 0; i < 200 && publisher->get_subscription_count() == 0; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        for (unsigned i = 1; i <= count; ++i) {
+          Message message;
+          message.data = {i, all_fresh || i == count ? 1ULL : 0ULL};
+          publisher->publish(message);
+        }
+        for (int i = 0; i < 400 && !done; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!done) {executor->cancel();}
+      });
+    try {
+      executor->spin();
+    } catch (...) {
+      done = true;
+      producer.join();
+      throw;
+    }
+    done = true;
+    producer.join();
+  }
+  std::shared_ptr<rclcpp::Node> node;
+  rclcpp::CallbackGroup::SharedPtr group;
+  std::shared_ptr<RecordingHintSink> sink;
+  std::unique_ptr<scx_slam_executor::FreshnessExecutor> executor;
+  scx_slam_executor::CallbackProfile profile;
+};
+}
+
+TEST_F(AdmissionTest, RejectsStaleBacklogBeforePublicationAndRecovers)
+{
+  unsigned selected = 0, dropped = 0, completed = 0;
+  std::weak_ptr<void> dropped_message;
+  run([&](Message::SharedPtr message) {
+      EXPECT_EQ(message->data[0], 4U);
+      EXPECT_EQ(dropped, 3U);
+      EXPECT_TRUE(dropped_message.expired());
+      completed++;
+      executor->cancel();
+    }, [&](const std::shared_ptr<void> & message, scx_slam_executor::MessageEvent event) {
+      EXPECT_FALSE(group->can_be_taken_from().load());
+      if (event == scx_slam_executor::MessageEvent::Selected) {selected++;}
+      else {
+        dropped++;
+        dropped_message = message;
+        EXPECT_TRUE(sink->hints().empty());
+      }
+    }, 4);
+  EXPECT_EQ(selected, 4U);
+  EXPECT_EQ(selected, completed + dropped);
+  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{4, 0}));
+  EXPECT_TRUE(group->can_be_taken_from().load());
+}
+
+TEST_F(AdmissionTest, ReleasesMessageAndGroupWhenDropObserverThrows)
+{
+  std::weak_ptr<void> dropped_message;
+  EXPECT_THROW(run([](Message::SharedPtr) {ADD_FAILURE();},
+    [&](const std::shared_ptr<void> & message, scx_slam_executor::MessageEvent event) {
+      if (event == scx_slam_executor::MessageEvent::DroppedBeforeStart) {
+        dropped_message = message;
+        throw std::runtime_error("drop observer failure");
+      }
+    }, 2), std::runtime_error);
+  EXPECT_TRUE(dropped_message.expired());
+  EXPECT_TRUE(group->can_be_taken_from().load());
+  EXPECT_TRUE(sink->operations().empty());
+}
+
+TEST_F(AdmissionTest, RechecksAfterHandoffDelayWithoutRunningExpiredCallback)
+{
+  sink->after_publish = [](const slam_task_hint & hint) {
+      EXPECT_NE(hint.flags & SLAM_HINT_EXECUTOR_OWNED, 0U);
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    };
+  unsigned selected = 0, dropped = 0;
+  run([](Message::SharedPtr) {ADD_FAILURE() << "expired callback ran";},
+    [&](const std::shared_ptr<void> &, scx_slam_executor::MessageEvent event) {
+      if (event == scx_slam_executor::MessageEvent::Selected) {selected++;}
+      else {dropped++; executor->cancel();}
+    }, 1);
+  EXPECT_EQ(selected, 1U);
+  EXPECT_EQ(dropped, 1U);
+  EXPECT_TRUE(group->can_be_taken_from().load());
+  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 0}));
+}
+
+TEST_F(AdmissionTest, KeepsInFlightIdentityAndBudgetThroughLateCallbackTail)
+{
+  unsigned completed = 0;
+  run([&](Message::SharedPtr message) {
+      const auto before = sink->hints().back();
+      EXPECT_FALSE(group->can_be_taken_from().load());
+      EXPECT_NE(before.flags & SLAM_HINT_EXECUTOR_OWNED, 0U);
+      EXPECT_EQ(before.budget_ns, profile.budget_ns);
+      if (message->data[0] == 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        EXPECT_GT(now_ns(), before.deadline_ts_ns);
+        EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1}));
+        EXPECT_EQ(sink->hints().back().job_id, before.job_id);
+      }
+      completed++;
+      if (completed == 2) {executor->cancel();}
+    }, {}, 2, true);
+  EXPECT_EQ(completed, 2U);
+  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 2, 0}));
+}
+
+TEST_F(AdmissionTest, ImuRemainsExemptFromAdmissionEviction)
+{
+  profile.stage_id = SLAM_STAGE_IMU_PREINT;
+  unsigned completed = 0;
+  run([&](Message::SharedPtr) {
+      EXPECT_EQ(sink->hints().back().flags & SLAM_HINT_EXECUTOR_OWNED, 0U);
+      if (++completed == 2) {executor->cancel();}
+    }, [](const std::shared_ptr<void> &, scx_slam_executor::MessageEvent event) {
+      EXPECT_EQ(event, scx_slam_executor::MessageEvent::Selected);
+    }, 2);
+  EXPECT_EQ(completed, 2U);
+}
+
+TEST_F(AdmissionTest, ReplacesCompletedSlotDirectlyAndClearsOnShutdown)
+{
+  const auto dispatcher = slamqos_pid_tgid_self();
+  std::atomic<unsigned> completed{0};
+  unsigned cleared = 0;
+  std::weak_ptr<void> message_reference;
+  sink->after_publish = [&](const slam_task_hint & hint) {
+      EXPECT_EQ(slamqos_pid_tgid_self(), dispatcher);
+      EXPECT_EQ(completed.load(), hint.job_id - 1);
+      EXPECT_TRUE(message_reference.expired());
+      EXPECT_EQ(cleared, 0U);
+    };
+  sink->after_clear = [&]() {
+      EXPECT_EQ(slamqos_pid_tgid_self(), dispatcher);
+      EXPECT_EQ(completed.load(), 2U);
+      ++cleared;
+      EXPECT_TRUE(message_reference.expired());
+      EXPECT_TRUE(group->can_be_taken_from().load());
+    };
+  run([&](Message::SharedPtr message) {
+      message_reference = message;
+      if (++completed == 2) {executor->cancel();}
+    }, {}, 2, true);
+  EXPECT_EQ(cleared, 1U);
+  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 2, 0}));
 }
