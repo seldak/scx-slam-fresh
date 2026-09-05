@@ -18,6 +18,7 @@ bag_offset=${BAG_OFFSET:-0}
 repetitions=${REPETITIONS:-3}
 hog_threads=${HOG_THREADS:-0}
 ext_policy=${EXT_POLICY:-7}
+deadline_grace_us=${DEADLINE_GRACE_US:-1000}
 imu_topic=${IMU_TOPIC:-/imu0}
 camera_topic=${CAMERA_TOPIC:-/cam0/image_raw}
 output_dir=${OUTPUT_DIR:-/tmp/scx-slam-fresh-ros2-bag-$(date +%Y%m%d-%H%M%S)-$$}
@@ -37,6 +38,7 @@ Run 'make && make ros2 && make test-ros2' as your normal user first.
 Defaults:
   CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 BAG_OFFSET=0
   REPETITIONS=3 HOG_THREADS=0 EXT_POLICY=7
+  DEADLINE_GRACE_US=1000
   IMU_TOPIC=/imu0 CAMERA_TOPIC=/cam0/image_raw
 
 The harness runs three CFS repetitions followed by three hinted partial-switch
@@ -119,6 +121,8 @@ start_adapter() {
     local log=$1
     taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$adapter_bin" --ros-args \
         -p "imu_input:=$imu_topic" -p "camera_input:=$camera_topic" \
+        -p "imu_source_index:=$output_dir/source-index/topic-0.tsv" \
+        -p "camera_source_index:=$output_dir/source-index/topic-1.tsv" \
         >"$log" 2>&1 &
     adapter_pid=$!
     wait_for_topic_endpoints /imu/jobs 1 0
@@ -150,7 +154,7 @@ start_player() {
 qos_preflight() {
     echo "Checking bag-player and adapter QoS endpoints..."
     start_adapter "$output_dir/qos-adapter.txt"
-    start_player "$output_dir/qos-player.txt"
+    start_player "$output_dir/qos-player.txt" 1
     wait_for_topic_endpoints "$imu_topic" 1 1
     wait_for_topic_endpoints "$camera_topic" 1 1
     ros2 topic info -v "$imu_topic" >"$output_dir/qos-imu.txt"
@@ -166,27 +170,11 @@ qos_preflight() {
             return 1
         fi
     done
-    # Let both streams publish, then terminate the preflight player reliably.
-    sleep 2
+    # The player stays paused: this phase validates endpoints, not bag timing.
     cleanup_process "$player_pid" TERM
     player_pid=
     cleanup_process "$adapter_pid"
     adapter_pid=
-    local imu_start camera_start
-    imu_start=$(sed -n 's/.*adapter_imu: .*first_source_ts_ns=\([0-9][0-9]*\).*/\1/p' \
-        "$output_dir/qos-adapter.txt")
-    camera_start=$(sed -n 's/.*adapter_camera: .*first_source_ts_ns=\([0-9][0-9]*\).*/\1/p' \
-        "$output_dir/qos-adapter.txt")
-    if [[ -z $imu_start || -z $camera_start ]]; then
-        echo "error: preflight did not capture both source timestamps" >&2
-        return 1
-    fi
-    if (( imu_start < camera_start )); then
-        source_start_ns=$imu_start
-    else
-        source_start_ns=$camera_start
-    fi
-    echo "Fixed source-time epoch: $source_start_ns ns"
 }
 
 assert_case_accounting() {
@@ -198,8 +186,9 @@ assert_case_accounting() {
         echo "error: adapter dropped input in $name" >&2
         return 1
     fi
-    awk '
-        /^window_imu_prop:/ || /^window_vision_fe:/ {
+    awk -v duration="$duration" -v mode="$name" '
+        /^window_[a-z_]+:/ {
+            rows++
             delete value
             for (i = 2; i <= NF; i++) {
                 split($i, pair, "=")
@@ -207,9 +196,19 @@ assert_case_accounting() {
             }
             span = value["last_job_id"] - value["first_job_id"] + 1
             if (value["offered"] == 0 || span != value["offered"]) exit 1
+            expected = ($1 == "window_imu_prop:" ? 200 : 20) * duration
+            if (value["offered"] != expected) exit 1
+            if (value["completed"] + value["dropped_before_start"] + \
+                value["dropped_upstream"] + value["unfinished"] != expected) exit 1
+            if (value["unfinished"] != 0) exit 1
+            if (value["arrivals"] != value["executed"] + value["dropped_before_start"]) exit 1
+            if (value["executed"] != value["completed"]) exit 1
+            if (mode ~ /^hinted/ && $1 == "window_imu_prop:" &&
+                (value["completed"] != expected || value["late"] != 0)) exit 1
         }
+        END { if (rows != 4) exit 1 }
     ' "$pipeline_log" || {
-        echo "error: source job-id span does not match taken callbacks in $name" >&2
+        echo "error: incomplete or inconsistent source-window accounting in $name" >&2
         return 1
     }
 }
@@ -228,12 +227,14 @@ append_summary() {
                 split($i, pair, "=")
                 value[pair[1]] = pair[2]
             }
-            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
                 mode, repetition, stage, value["offered"], value["completed"], \
                 value["late"], value["started_stale"], value["unfinished"], \
                 value["cpu_us"], value["p99_start_age_us"], value["max_start_age_us"], \
                 value["p99_age_us"], value["max_age_us"], value["first_source_ts_ns"], \
-                value["last_source_ts_ns"]
+                value["last_source_ts_ns"], value["arrivals"], value["executed"], \
+                value["dropped_before_start"], value["dropped_upstream"], \
+                value["first_job_id"], value["last_job_id"]
         }
     ' "$result_file" >>"$output_dir/summary.tsv"
 }
@@ -243,7 +244,7 @@ assert_matched_source_windows() {
         NR == 1 { next }
         {
             stage = $3
-            signature = $4 FS $14 FS $15
+            signature = $4 FS $14 FS $15 FS $20 FS $21
             if (!(stage in expected)) {
                 expected[stage] = signature
             } else if (expected[stage] != signature) {
@@ -274,7 +275,18 @@ run_case() {
     taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$pipeline_bin" \
         "${pipeline_args[@]}" >"$case_dir/pipeline.txt" 2>&1 &
     pipeline_pid=$!
-    start_player "$case_dir/player.txt"
+    start_player "$case_dir/player.txt" 1
+    wait_for_topic_endpoints "$imu_topic" 1 1
+    wait_for_topic_endpoints "$camera_topic" 1 1
+    wait_for_topic_endpoints /imu/jobs 1 2
+    wait_for_topic_endpoints /camera/jobs 1 2
+    ros2 service call /rosbag2_player/resume rosbag2_interfaces/srv/Resume \
+        >"$case_dir/resume.txt" 2>&1
+    if ! grep -q 'return_code=0' "$case_dir/resume.txt"; then
+        echo "error: bag player did not resume successfully in $name" >&2
+        cat "$case_dir/resume.txt" >&2
+        return 1
+    fi
     wait "$pipeline_pid"
     pipeline_pid=
     if ! kill -0 "$player_pid" 2>/dev/null; then
@@ -312,7 +324,7 @@ if (( cpu == housekeeping_cpu )); then
     exit 2
 fi
 for value in "$cpu" "$housekeeping_cpu" "$duration" "$warmup" "$bag_offset" \
-    "$repetitions" "$hog_threads" "$ext_policy"; do
+    "$repetitions" "$hog_threads" "$ext_policy" "$deadline_grace_us"; do
     if [[ ! $value =~ ^[0-9]+$ ]]; then
         echo "error: numeric options must contain non-negative integers" >&2
         exit 2
@@ -362,6 +374,9 @@ mkdir -p "$output_dir" "$pin_dir"
 trap cleanup EXIT INT TERM
 write_qos_overrides
 ros2 bag info "$bag_path" >"$output_dir/bag-info.txt"
+source_start_ns=$(python3 "$repo_dir/scripts/ros2_bag_source_epoch.py" \
+    "$bag_path" "$imu_topic" "$camera_topic" --index-dir "$output_dir/source-index")
+echo "Fixed source-time epoch: $source_start_ns ns"
 if [[ -f $bag_path ]]; then
     bag_dir=$(dirname -- "$bag_path")
     bag_name=$(basename -- "$bag_path")
@@ -378,7 +393,7 @@ bag_sha256=$(sha256sum "$output_dir/bag-files.sha256" | awk '{print $1}')
 worker_thread_siblings=$(< "/sys/devices/system/cpu/cpu${cpu}/topology/thread_siblings_list")
 play_duration=$((warmup + duration + 5))
 printf -v play_command \
-    'ros2 bag play %q --rate 1.0 --start-offset %q --playback-duration %q --topics %q %q --qos-profile-overrides-path %q --delay 1 --disable-keyboard-controls --progress-bar-update-rate 0' \
+    'ros2 bag play %q --rate 1.0 --start-offset %q --playback-duration %q --topics %q %q --qos-profile-overrides-path %q --start-paused --disable-keyboard-controls --progress-bar-update-rate 0' \
     "$bag_path" "$bag_offset" "$play_duration" "$imu_topic" \
     "$camera_topic" "$output_dir/qos-overrides.yaml"
 
@@ -396,7 +411,8 @@ play_rate=1.0
 play_clock=disabled
 play_start_offset=$bag_offset
 play_duration=$play_duration
-play_delay=1
+play_start_paused=1
+play_resume=after_sensor_and_pipeline_endpoints_connect
 play_command=$play_command
 qos=reliable,volatile,keep_last,depth_1000
 cpu=$cpu
@@ -406,6 +422,7 @@ duration=$duration
 warmup=$warmup
 hog_threads=$hog_threads
 ext_policy=$ext_policy
+deadline_grace_us=$deadline_grace_us
 ops_flags=$ops_flags
 repetitions=$repetitions
 git_commit=$(git -c safe.directory="$repo_dir" -C "$repo_dir" rev-parse HEAD)
@@ -416,7 +433,7 @@ loader_sha256=$(sha256sum "$loader_bin" | awk '{print $1}')
 bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{print $1}')
 EOF
 
-printf "mode\trepetition\tstage\toffered\tcompleted\tlate\tstarted_stale\tunfinished\tcpu_us\tp99_start_age_us\tmax_start_age_us\tp99_age_us\tmax_age_us\tfirst_source_ts_ns\tlast_source_ts_ns\n" >"$output_dir/summary.tsv"
+printf "mode\trepetition\tstage\toffered\tcompleted\tlate\tstarted_stale\tunfinished\tcpu_us\tp99_start_age_us\tmax_start_age_us\tp99_age_us\tmax_age_us\tfirst_source_ts_ns\tlast_source_ts_ns\tarrivals\texecuted\tdropped_before_start\tdropped_upstream\tfirst_job_id\tlast_job_id\n" >"$output_dir/summary.tsv"
 
 qos_preflight
 echo "source_start_ns=$source_start_ns" >>"$output_dir/environment.txt"
@@ -425,6 +442,7 @@ for repetition in $(seq 1 "$repetitions"); do
 done
 
 taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" \
+    --deadline-grace-us "$deadline_grace_us" \
     >"$output_dir/loader.txt" 2>&1 &
 loader_pid=$!
 wait_for_scheduler

@@ -52,6 +52,14 @@ struct Options
 struct StageStats
 {
   std::mutex mutex;
+  uint64_t offered{0};
+  uint64_t arrivals{0};
+  uint64_t executed{0};
+  uint64_t dropped{0};
+  uint64_t upstream_dropped{0};
+  bool active{false};
+  clockid_t active_clock{};
+  uint64_t active_cpu_start{0};
   uint64_t completed{0};
   uint64_t late{0};
   uint64_t stale{0};
@@ -66,6 +74,11 @@ struct StageStats
 
 struct StageSnapshot
 {
+  uint64_t offered{0};
+  uint64_t arrivals{0};
+  uint64_t executed{0};
+  uint64_t dropped{0};
+  uint64_t upstream_dropped{0};
   uint64_t completed{0};
   uint64_t late{0};
   uint64_t stale{0};
@@ -139,16 +152,19 @@ void account_job(
 {
   const uint64_t start = monotonic_ns();
   const uint64_t start_age = start > message.release_ts_ns ? start - message.release_ts_ns : 0;
-  if (measured) {
-    std::lock_guard<std::mutex> lock(stats.mutex);
-    if (stats.first_job_id == 0) {
-      stats.first_job_id = message.job_id;
-      stats.first_source_ts_ns = message.source_ts_ns;
-    }
-    stats.last_job_id = message.job_id;
-    stats.last_source_ts_ns = message.source_ts_ns;
+  clockid_t cpu_clock{};
+  const int clock_error = pthread_getcpuclockid(pthread_self(), &cpu_clock);
+  if (clock_error) {
+    throw std::system_error(clock_error, std::generic_category(), "pthread_getcpuclockid");
   }
   const uint64_t cpu_start = thread_cpu_ns();
+  if (measured) {
+    std::lock_guard<std::mutex> lock(stats.mutex);
+    stats.executed++;
+    stats.active = true;
+    stats.active_clock = cpu_clock;
+    stats.active_cpu_start = cpu_start;
+  }
   busy_work_us(work_us);
   const uint64_t cpu_ns = thread_cpu_ns() - cpu_start;
 
@@ -166,6 +182,7 @@ void account_job(
     stats.stale++;
   }
   stats.cpu_ns += cpu_ns;
+  stats.active = false;
   stats.start_ages_ns.push_back(start_age);
   stats.completion_ages_ns.push_back(age);
 }
@@ -330,9 +347,17 @@ StageSnapshot snapshot(StageStats & stats)
   std::lock_guard<std::mutex> lock(stats.mutex);
   StageSnapshot result;
   result.completed = stats.completed;
+  result.offered = stats.offered;
+  result.arrivals = stats.arrivals;
+  result.executed = stats.executed;
+  result.dropped = stats.dropped;
+  result.upstream_dropped = stats.upstream_dropped;
   result.late = stats.late;
   result.stale = stats.stale;
   result.cpu_ns = stats.cpu_ns;
+  if (stats.active) {
+    result.cpu_ns += clock_ns(stats.active_clock) - stats.active_cpu_start;
+  }
   result.first_job_id = stats.first_job_id;
   result.last_job_id = stats.last_job_id;
   result.first_source_ts_ns = stats.first_source_ts_ns;
@@ -350,12 +375,20 @@ void print_stats(
   const char * prefix, const char * name, uint64_t offered,
   const StageSnapshot & stats)
 {
-  const uint64_t unfinished = offered > stats.completed ? offered - stats.completed : 0;
+  const uint64_t resolved = stats.completed + stats.dropped + stats.upstream_dropped;
+  const uint64_t unfinished = offered > resolved ? offered - resolved : 0;
+  const uint64_t in_flight = stats.executed - stats.completed;
   std::cout << prefix << name << ": offered=" << offered <<
+    " arrivals=" << stats.arrivals <<
+    " executed=" << stats.executed <<
     " completed=" << stats.completed <<
+    " dropped_before_start=" << stats.dropped <<
+    " dropped_upstream=" << stats.upstream_dropped <<
     " late=" << stats.late <<
     " started_stale=" << stats.stale <<
     " unfinished=" << unfinished <<
+    " in_flight=" << in_flight <<
+    " pending=" << (unfinished > in_flight ? unfinished - in_flight : 0) <<
     " cpu_us=" << stats.cpu_ns / 1000ULL <<
     " first_job_id=" << stats.first_job_id <<
     " last_job_id=" << stats.last_job_id <<
@@ -496,12 +529,74 @@ int main(int argc, char ** argv)
     StageStats mapping_stats;
     std::atomic<uint64_t> measurement_start_ns{std::numeric_limits<uint64_t>::max()};
     std::atomic<uint64_t> measurement_end_ns{0};
+    std::atomic<uint64_t> external_window_start_release_ns{0};
     const uint64_t warmup_ns = static_cast<uint64_t>(options.warmup_s) * 1000000000ULL;
     const uint64_t duration_ns = static_cast<uint64_t>(options.duration_s) * 1000000000ULL;
-    std::atomic<uint64_t> imu_taken{0};
-    std::atomic<uint64_t> vision_taken{0};
-    std::atomic<uint64_t> estimator_taken{0};
-    std::atomic<uint64_t> mapping_taken{0};
+
+    auto measured_message = [&](const Message & message) {
+        return options.input_mode == "external" ?
+          source_time_measured(message, options.source_start_ns, warmup_ns, duration_ns) :
+          message.release_ts_ns >= measurement_start_ns.load() &&
+          message.release_ts_ns < measurement_end_ns.load();
+      };
+    // Independent source audit on the inherited housekeeping CPU. Every camera
+    // offers one opportunity to each downstream stage, even if no worker runs.
+    auto audit_node = std::make_shared<rclcpp::Node>("slam_source_audit");
+    auto offer = [&](StageStats & stats, const Message & message) {
+        std::lock_guard<std::mutex> lock(stats.mutex);
+        stats.offered++;
+        if (!stats.first_job_id) {
+          stats.first_job_id = message.job_id;
+          stats.first_source_ts_ns = message.source_ts_ns;
+        }
+        stats.last_job_id = message.job_id;
+        stats.last_source_ts_ns = message.source_ts_ns;
+      };
+    auto audit_imu = audit_node->create_subscription<Message>("imu/jobs", qos,
+      [&](const Message & message) {
+        if (measured_message(message)) {offer(imu_stats, message);}
+      });
+    auto audit_camera = audit_node->create_subscription<Message>("camera/jobs", qos,
+      [&](const Message & message) {
+        if (measured_message(message)) {
+          offer(vision_stats, message);
+          offer(estimator_stats, message);
+          offer(mapping_stats, message);
+        }
+      });
+    rclcpp::executors::SingleThreadedExecutor audit_executor;
+    audit_executor.add_node(audit_node);
+
+    auto observe = [&](StageStats & stats, std::vector<StageStats *> downstream) {
+        return [&, target = &stats, downstream](
+          const std::shared_ptr<void> & erased, scx_slam_executor::MessageEvent event) {
+            const auto & message = *std::static_pointer_cast<Message>(erased);
+            if (!measured_message(message)) {return;}
+            {
+              std::lock_guard<std::mutex> lock(target->mutex);
+              if (event == scx_slam_executor::MessageEvent::Selected) {
+                target->arrivals++;
+              } else {
+                target->dropped++;
+              }
+            }
+            if (event == scx_slam_executor::MessageEvent::DroppedBeforeStart) {
+              // No fabricated downstream ROS message or callback: explicitly
+              // resolve the source opportunity lost to this upstream eviction.
+              for (auto * next : downstream) {
+                std::lock_guard<std::mutex> lock(next->mutex);
+                next->upstream_dropped++;
+              }
+            }
+          };
+      };
+    auto admission_profile = [&](uint32_t stage, uint32_t class_id,
+      uint64_t deadline_us, uint64_t stale_us, uint64_t budget_us) {
+        auto result = stage_profile(hint_mode, stage, class_id,
+          deadline_us, stale_us, budget_us);
+        result.reject_expired = options.input_mode == "external";
+        return result;
+      };
 
     rclcpp::SubscriptionOptions imu_subscription_options;
     imu_subscription_options.callback_group = imu_group;
@@ -514,7 +609,9 @@ int main(int argc, char ** argv)
           source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
           message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
         if (measured) {
-          imu_taken.fetch_add(1, std::memory_order_relaxed);
+          uint64_t unset = 0;
+          external_window_start_release_ns.compare_exchange_strong(
+            unset, message->release_ts_ns, std::memory_order_acq_rel);
         }
         account_job(
           imu_stats, *message, 150, 5000000ULL, 10000000ULL, measured);
@@ -531,9 +628,6 @@ int main(int argc, char ** argv)
         const bool measured = options.input_mode == "external" ?
           source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
           message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
-        if (measured) {
-          vision_taken.fetch_add(1, std::memory_order_relaxed);
-        }
         const uint64_t work_us = 3000ULL + (message->job_id % 5ULL) * 500ULL;
         account_job(
           vision_stats, *message, work_us, 33000000ULL, 66000000ULL, measured);
@@ -551,9 +645,6 @@ int main(int argc, char ** argv)
         const bool measured = options.input_mode == "external" ?
           source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
           message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
-        if (measured) {
-          estimator_taken.fetch_add(1, std::memory_order_relaxed);
-        }
         const uint64_t work_us = 2000ULL + (message->job_id % 5ULL) * 250ULL;
         account_job(
           estimator_stats, *message, work_us, 33000000ULL, 66000000ULL, measured);
@@ -571,9 +662,6 @@ int main(int argc, char ** argv)
         const bool measured = options.input_mode == "external" ?
           source_time_measured(*message, options.source_start_ns, warmup_ns, duration_ns) :
           message->release_ts_ns >= window_start && message->release_ts_ns < window_end;
-        if (measured) {
-          mapping_taken.fetch_add(1, std::memory_order_relaxed);
-        }
         account_job(mapping_stats, *message, 2000, 0, 0, measured);
       },
       mapping_subscription_options);
@@ -586,27 +674,33 @@ int main(int argc, char ** argv)
 
     executors[0]->add_subscription_callback_group_with_profile<Message>(
       imu_group, imu_node->get_node_base_interface(),
-      stage_profile(
-        hint_mode, SLAM_STAGE_IMU_PREINT, SLAM_SCX_CLASS_FE, 5000, 10000, 1000),
-      metadata);
+      admission_profile(SLAM_STAGE_IMU_PREINT, SLAM_SCX_CLASS_FE, 5000, 10000, 1000),
+      metadata, true, observe(imu_stats, {}));
     executors[1]->add_subscription_callback_group_with_profile<Message>(
       vision_group, vision_node->get_node_base_interface(),
-      stage_profile(
-        hint_mode, SLAM_STAGE_VISION_FE, SLAM_SCX_CLASS_FE, 33000, 66000, 12000),
-      metadata);
+      admission_profile(SLAM_STAGE_VISION_FE, SLAM_SCX_CLASS_FE, 33000, 66000, 12000),
+      metadata, true, observe(vision_stats, {&estimator_stats, &mapping_stats}));
     executors[2]->add_subscription_callback_group_with_profile<Message>(
       estimator_group, estimator_node->get_node_base_interface(),
-      stage_profile(
-        hint_mode, SLAM_STAGE_STATE_EST, SLAM_SCX_CLASS_FE, 33000, 66000, 10000),
-      metadata);
+      admission_profile(SLAM_STAGE_STATE_EST, SLAM_SCX_CLASS_FE, 33000, 66000, 10000),
+      metadata, true, observe(estimator_stats, {&mapping_stats}));
     executors[3]->add_subscription_callback_group_with_profile<Message>(
       mapping_group, mapping_node->get_node_base_interface(),
-      stage_profile(
-        hint_mode, SLAM_STAGE_MAPPING_BE, SLAM_SCX_CLASS_BE, 0, 0, 0), metadata);
+      admission_profile(SLAM_STAGE_MAPPING_BE, SLAM_SCX_CLASS_BE, 0, 0, 0),
+      metadata, true, observe(mapping_stats, {}));
 
     std::mutex error_mutex;
     std::exception_ptr background_error;
     std::vector<std::thread> executor_threads;
+    executor_threads.emplace_back([&]() {
+        try {
+          audit_executor.spin();
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(error_mutex);
+          if (!background_error) {background_error = std::current_exception();}
+          rclcpp::shutdown();
+        }
+      });
     for (auto & executor : executors) {
       executor_threads.emplace_back([&executor, &error_mutex, &background_error]() {
           try {
@@ -636,14 +730,15 @@ int main(int argc, char ** argv)
         options.ext_policy, std::ref(error_mutex), std::ref(background_error));
     }
 
-    const uint64_t lead_ns = options.input_mode == "synthetic" ? 100000000ULL : warmup_ns;
-    const uint64_t start_ns = monotonic_ns() + lead_ns;
-    const uint64_t end_ns = start_ns + duration_ns;
-    measurement_start_ns.store(start_ns, std::memory_order_release);
-    measurement_end_ns.store(end_ns, std::memory_order_release);
+    uint64_t start_ns = 0;
+    uint64_t end_ns = 0;
     std::thread imu_generator;
     std::thread camera_generator;
     if (options.input_mode == "synthetic") {
+      start_ns = monotonic_ns() + 100000000ULL;
+      end_ns = start_ns + duration_ns;
+      measurement_start_ns.store(start_ns, std::memory_order_release);
+      measurement_end_ns.store(end_ns, std::memory_order_release);
       imu_generator = std::thread(
         publish_periodic, imu_source, 200ULL,
         static_cast<uint64_t>(options.duration_s), start_ns);
@@ -652,25 +747,43 @@ int main(int argc, char ** argv)
         static_cast<uint64_t>(options.duration_s), start_ns);
       imu_generator.join();
       camera_generator.join();
+    } else {
+      const uint64_t start_timeout_ns =
+        monotonic_ns() + warmup_ns + 10000000000ULL;
+      while ((start_ns = external_window_start_release_ns.load(std::memory_order_acquire)) == 0) {
+        if (monotonic_ns() >= start_timeout_ns) {
+          contenders_running.store(false);
+          for (auto & contender : contenders) {
+            contender.join();
+          }
+          for (auto & executor : executors) {
+            executor->cancel();
+          }
+          audit_executor.cancel();
+          for (auto & thread : executor_threads) {
+            thread.join();
+          }
+          rclcpp::shutdown();
+          throw std::runtime_error("timed out waiting for external source-time window");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      end_ns = start_ns + duration_ns;
+      measurement_start_ns.store(start_ns, std::memory_order_release);
+      measurement_end_ns.store(end_ns, std::memory_order_release);
     }
-    const uint64_t process_end_ns = options.input_mode == "external" ?
-      end_ns + 2000000000ULL : end_ns;
-    sleep_until_ns(process_end_ns);
+    sleep_until_ns(end_ns);
 
-    const uint64_t expected_imu = options.input_mode == "synthetic" ?
-      static_cast<uint64_t>(options.duration_s) * 200ULL :
-      imu_taken.load(std::memory_order_relaxed);
-    const uint64_t expected_vision = options.input_mode == "synthetic" ?
-      static_cast<uint64_t>(options.duration_s) * 30ULL :
-      vision_taken.load(std::memory_order_relaxed);
-    const uint64_t expected_estimator = options.input_mode == "synthetic" ?
-      expected_vision : estimator_taken.load(std::memory_order_relaxed);
-    const uint64_t expected_mapping = options.input_mode == "synthetic" ?
-      expected_vision : mapping_taken.load(std::memory_order_relaxed);
     const auto window_imu = snapshot(imu_stats);
     const auto window_vision = snapshot(vision_stats);
     const auto window_estimator = snapshot(estimator_stats);
     const auto window_mapping = snapshot(mapping_stats);
+    const uint64_t expected_imu = options.input_mode == "synthetic" ?
+      static_cast<uint64_t>(options.duration_s) * 200ULL : window_imu.offered;
+    const uint64_t expected_vision = options.input_mode == "synthetic" ?
+      static_cast<uint64_t>(options.duration_s) * 30ULL : window_vision.offered;
+    const uint64_t expected_estimator = expected_vision;
+    const uint64_t expected_mapping = expected_vision;
 
     contenders_running.store(false);
     for (auto & contender : contenders) {
@@ -684,6 +797,7 @@ int main(int argc, char ** argv)
     for (auto & executor : executors) {
       executor->cancel();
     }
+    audit_executor.cancel();
     for (auto & thread : executor_threads) {
       thread.join();
     }
@@ -706,7 +820,8 @@ int main(int argc, char ** argv)
     if (options.input_mode == "external") {
       std::cout <<
         "external_counts: source-time window begins at source_start_ns plus warmup; "
-        "offered fields count callbacks taken in that fixed source interval\n";
+        "offered counts independently observed source opportunities; arrivals counts "
+        "subscription selections; dropped_upstream resolves upstream evictions\n";
     }
 
     if (options.window_stats) {

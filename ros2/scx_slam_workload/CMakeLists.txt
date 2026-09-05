@@ -50,6 +50,12 @@ install(TARGETS scx_slam_bag_adapter DESTINATION lib/${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_test REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  ament_add_test(test_ros2_bag_accounting
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_ros2_bag_accounting.py
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 5
+  )
   ament_add_gtest(test_bag_adapter test/test_bag_adapter.cpp)
   target_compile_features(test_bag_adapter PRIVATE cxx_std_17)
   target_include_directories(

@@ -41,6 +41,10 @@ public:
     const auto camera_input = declare_parameter<std::string>("camera_input", "/camera/image_raw");
     const auto imu_output = declare_parameter<std::string>("imu_output", "/imu/jobs");
     const auto camera_output = declare_parameter<std::string>("camera_output", "/camera/jobs");
+    imu_index_ = scx_slam_workload::SourceJobIndex(
+      declare_parameter<std::string>("imu_source_index", ""));
+    camera_index_ = scx_slam_workload::SourceJobIndex(
+      declare_parameter<std::string>("camera_source_index", ""));
 
     const auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable().durability_volatile();
     const auto output_qos = rclcpp::QoS(rclcpp::KeepLast(1000)).reliable().durability_volatile();
@@ -50,12 +54,12 @@ public:
     imu_subscription_ = create_subscription<sensor_msgs::msg::Imu>(
       imu_input, sensor_qos,
       [this](const sensor_msgs::msg::Imu::ConstSharedPtr message) {
-        publish_job(imu_jobs_, imu_counts_, message->header.stamp, "IMU");
+        publish_job(imu_jobs_, imu_counts_, imu_index_, message->header.stamp, "IMU");
       });
     camera_subscription_ = create_subscription<sensor_msgs::msg::Image>(
       camera_input, sensor_qos,
       [this](const sensor_msgs::msg::Image::ConstSharedPtr message) {
-        publish_job(camera_jobs_, camera_counts_, message->header.stamp, "camera");
+        publish_job(camera_jobs_, camera_counts_, camera_index_, message->header.stamp, "camera");
       });
 
     RCLCPP_INFO(
@@ -80,10 +84,12 @@ private:
 
   void publish_job(
     const rclcpp::Publisher<Job>::SharedPtr & publisher, StreamCounts & counts,
+    const scx_slam_workload::SourceJobIndex & index,
     const builtin_interfaces::msg::Time & source_stamp, const char * stream)
   {
-    const uint64_t job_id = ++counts.received;
+    uint64_t job_id = ++counts.received;
     try {
+      job_id = index.job_id(scx_slam_workload::source_stamp_ns(source_stamp), job_id);
       const auto job = scx_slam_workload::make_stamped_job(job_id, monotonic_ns(), source_stamp);
       if (counts.first_source_ts_ns == 0) {
         counts.first_source_ts_ns = job.source_ts_ns;
@@ -110,6 +116,8 @@ private:
   }
 
   StreamCounts imu_counts_;
+  scx_slam_workload::SourceJobIndex imu_index_;
+  scx_slam_workload::SourceJobIndex camera_index_;
   StreamCounts camera_counts_;
   rclcpp::Publisher<Job>::SharedPtr imu_jobs_;
   rclcpp::Publisher<Job>::SharedPtr camera_jobs_;

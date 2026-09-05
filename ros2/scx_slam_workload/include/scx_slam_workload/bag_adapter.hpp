@@ -6,9 +6,49 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <fstream>
+#include <map>
+#include <string>
 
 namespace scx_slam_workload
 {
+
+// Exact bag ordinals preserve compute variation across playback sessions even
+// when their first delivered messages differ. No timing/rate inference here.
+class SourceJobIndex
+{
+public:
+  explicit SourceJobIndex(const std::string & path = "")
+  {
+    if (path.empty()) {return;}
+    std::ifstream input(path);
+    if (!input) {throw std::runtime_error("cannot open source job index: " + path);}
+    uint64_t stamp, ordinal, previous = 0;
+    while (input >> stamp) {
+      if (!(input >> ordinal) || !stamp || stamp <= previous ||
+        ordinal != entries_.size() + 1)
+      {
+        throw std::runtime_error("invalid source job index: " + path);
+      }
+      entries_.emplace(stamp, ordinal);
+      previous = stamp;
+    }
+    if (!input.eof() || entries_.empty()) {
+      throw std::runtime_error("invalid source job index: " + path);
+    }
+  }
+
+  uint64_t job_id(uint64_t source_ns, uint64_t receive_counter) const
+  {
+    if (entries_.empty()) {return receive_counter;}
+    const auto found = entries_.find(source_ns);
+    if (found == entries_.end()) {throw std::runtime_error("timestamp absent from bag index");}
+    return found->second;
+  }
+
+private:
+  std::map<uint64_t, uint64_t> entries_;
+};
 
 inline uint64_t source_stamp_ns(const builtin_interfaces::msg::Time & stamp)
 {

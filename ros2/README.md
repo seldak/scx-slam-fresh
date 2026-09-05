@@ -217,7 +217,7 @@ file and verifies both endpoints with `ros2 topic info -v`; use the manual
 three-terminal form only for plumbing checks.
 
 External window statistics use source time, not pipeline process start. The
-matched harness obtains `SOURCE_EPOCH_NS` from a short preflight playback,
+matched harness reads `SOURCE_EPOCH_NS` directly from the bag,
 passes the same value to every CFS and SCX case, and rejects a result if any
 stage reports a different offered count or first/last source timestamp.
 
