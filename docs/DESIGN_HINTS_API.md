@@ -2,7 +2,7 @@
 
 The scheduler owns the [hint ABI and publication contract](https://github.com/seldak/scx_fresh/blob/main/docs/HINTS_API.md).
 This page describes how the standalone workload and ROS executor implement
-that contract. The scheduler repository is currently private.
+that contract.
 
 ## Executor contract
 

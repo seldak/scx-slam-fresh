@@ -56,12 +56,11 @@ checkout. It defaults to the sibling
 directory `../scx_fresh`; set `SCX_FRESH_DIR` for another location. No scheduler
 sources are vendored here. This tree requires the scheduler's version 2 hint ABI
 (`freshqos` and explicit service classes), validated with scheduler revision
-`2a744c8`. The earlier extraction revision is not compatible. Access to the
-private scheduler repository is currently required.
+`43b0bd5`. The earlier extraction revision is not compatible.
 
 ```bash
 git clone https://github.com/seldak/scx_fresh.git ../scx_fresh
-git -C ../scx_fresh checkout 2a744c8635d79e3fee6f801c2aa7ed233ba6c907
+git -C ../scx_fresh checkout 43b0bd5e4ce81f3a7864a21930d98c8012ec2b34
 ```
 
 ```bash
@@ -104,7 +103,7 @@ matched evaluations.
 
 - [Usage](docs/USAGE.md): demo options, tests, and build modes.
 - [Architecture](docs/DESIGN.md): components and work ownership.
-- [Scheduler](https://github.com/seldak/scx_fresh/blob/main/docs/SCHEDULER.md): routing, budgets, and slices (private repository).
+- [Scheduler](https://github.com/seldak/scx_fresh/blob/main/docs/SCHEDULER.md): routing, budgets, and slices.
 - [Hint integration](docs/DESIGN_HINTS_API.md): ROS message and standalone queue lifecycles.
 - [ROS 2](ros2/README.md): integration, replay, and harness commands.
 - [Evaluation](docs/DESIGN_EVALUATION.md): findings, measurement rules, and reports.

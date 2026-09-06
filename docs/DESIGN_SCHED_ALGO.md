@@ -3,7 +3,7 @@
 The current scheduling policy is documented in
 [scx_fresh: scheduler rules](https://github.com/seldak/scx_fresh/blob/main/docs/SCHEDULER.md).
 That repository owns routing, deadline and budget rules, slices, and kernel
-compatibility. It is currently private.
+compatibility.
 
 SLAM workload assumptions, ROS message handling, and measurements remain here:
 
