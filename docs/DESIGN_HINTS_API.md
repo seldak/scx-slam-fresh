@@ -1,81 +1,14 @@
-# Userspace hints API
+# Application hint integration
 
-`libslamqos` writes scheduling metadata to the pinned `task_hints` BPF map.
-Each key is a worker identity, packed as `(tgid << 32) | tid`. Each value
-describes one selected job.
-
-> Userspace selects work. sched_ext consumes metadata about the work already
-> selected for a worker.
-
-## Functions
-
-In the external `scx_fresh` checkout, declarations are in `src/slamqos.h`; the shared layout is
-`struct slam_task_hint` in `include/scx_slam_fresh_shared.h`.
-
-| Function | Use |
-| --- | --- |
-| `slamqos_pid_tgid_self()` | Return the current worker's packed identity. |
-| `slamqos_open(q, pin_dir)` | Open the pinned hint map into a caller-owned handle. |
-| `slamqos_close(q)` | Close the map descriptor. |
-| `slamqos_publish_hint(q, hint)` | Replace the current thread's hint. |
-| `slamqos_publish_hint_for(q, worker, hint)` | Replace an explicitly identified worker's hint. |
-| `slamqos_publish_job(...)` / `slamqos_publish_job_for(...)` | Build and publish a hint from individual fields. |
-| `slamqos_clear_hint(q)` | Write a MISC/BE hint with job ID zero for the current thread. |
-
-Use the full hint structure when setting flags such as
-`SLAM_HINT_EXECUTOR_OWNED`. A clear is a map update, not an ownership or
-cancellation operation; an executor must establish that clearing is safe.
-
-## Fields
-
-| Field | Meaning |
-| --- | --- |
-| `api_version` | Set to `SLAM_SCX_API_VERSION`. |
-| `stage_id` | Application stage; the IMU stage selects the dedicated route. |
-| `class_id` | FE or BE. |
-| `flags` | Ownership flags; zero unless the client implements their contract. |
-| `job_id` | Stable for one job; change it when selecting new work. |
-| `release_ts_ns` | Monotonic release time. |
-| `deadline_ts_ns` | Absolute monotonic deadline, or zero for none. |
-| `stale_ns` | Maximum useful age, or zero to disable the stale threshold. |
-| `budget_ns` | Execution budget, or zero to disable budget enforcement. |
-| `slice_ns` | Requested insertion slice; zero selects the scheduler default. |
-| `weight` | Reserved fairness parameter; current BPF runtime accounting does not apply it. |
-
-For nonzero deadlines, use a value at or after release. Scheduler timestamps
-use `CLOCK_MONOTONIC`, corresponding to BPF `bpf_ktime_get_ns()`. Recorded ROS
-header stamps are not in this timebase and must not be sent as kernel deadlines.
+The scheduler owns the [hint ABI and publication contract](https://github.com/seldak/scx_fresh/blob/main/docs/HINTS_API.md).
+This page describes how the standalone workload and ROS executor implement
+that contract. The scheduler repository is currently private.
 
 ## Executor contract
 
-The single slot per worker makes publication ordering part of correctness.
-
-### Assign, publish, wake
-
-For a sleeping worker:
-
-1. Select a job and bind it to that worker.
-2. Publish its identity and scheduling fields into the worker's slot.
-3. Wake the worker.
-
-Publishing only after the worker starts running is too late to classify its
-wakeup. A worker selecting another job without sleeping must publish after
-selection and before compute.
-
-### Ownership and eviction
-
-A producer or eviction path must not overwrite an executing job's hint.
-Only the worker may replace or clear it, unless the executor has independently
-established completion.
-
-Do not publish work evicted before assignment. If the selected head is removed
-before a planned wake, publish the replacement first or do not wake the worker.
-A pre-start thief publishes the stolen job onto its own slot before execution.
-
-Once compute begins, the job stays with that worker until completion or
-worker-controlled cancellation. Budget state is keyed by worker, so moving
-a running job would reset accounting and could grant it a second FE budget.
-Mid-job migration requires state keyed by at least stage and job identity.
+Select work, publish its hint, then wake the worker. Never overwrite an
+already-running callback's hint. The integration must establish completion
+before replacing the slot; a map update is not callback cancellation.
 
 ### ROS message lifecycle
 
@@ -122,7 +55,3 @@ The bag adapter samples monotonic time when it takes a sensor message and
 stores it in `release_ts_ns`. It preserves the recorded header stamp separately
 as `source_ts_ns`; offline bag ordinals supply stable job IDs. Downstream
 camera jobs retain both identity and release time, sharing the camera deadline.
-
-Unannotated SCHED_EXT tasks receive BE fallback service. See the
-[scheduler reference](DESIGN_SCHED_ALGO.md) for default slices, age rules,
-budget enforcement, and the optional BE cap.

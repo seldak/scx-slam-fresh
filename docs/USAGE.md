@@ -20,17 +20,12 @@ Check the embedded scheduler mode without attaching:
 make test-scheduler-mode
 ```
 
-Default builds report `0x8` (partial switch). A full-switch build reports zero
-and is rejected by the evaluation runners. For an explicit full-switch test
-build, clean both the external scheduler build and the local build before
-running `make SLAM_FULL_SWITCH=1`. This places all
-eligible tasks under sched_ext and is outside the validated evaluation setup.
-Return to clean default builds afterward. Make does not track command-line
-flag changes. The local `BUILD_DIR` does not select a different external build.
-
-The loader pins `task_hints` and the `events` ring buffer beneath the supplied
-pin directory. In partial mode, workers must enter `SCHED_EXT`; the demo accepts
-the numeric policy with `--ext-policy` because libc headers may lag the kernel.
+Evaluation requires partial-switch mode (`0x8`). Scheduler attachment options
+and build-mode details belong in the
+[scheduler operation guide](https://github.com/seldak/scx_fresh/blob/main/docs/USAGE.md).
+The local `BUILD_DIR` does not select a different external build.
+The demo accepts the numeric worker policy with `--ext-policy` because libc
+headers may lag the kernel.
 
 ## Demo controls
 

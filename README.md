@@ -102,8 +102,8 @@ matched evaluations.
 
 - [Usage](docs/USAGE.md): demo options, tests, and build modes.
 - [Architecture](docs/DESIGN.md): components and work ownership.
-- [Scheduler](docs/DESIGN_SCHED_ALGO.md): routing, budgets, and slices.
-- [Hints API](docs/DESIGN_HINTS_API.md): publication and executor contract.
+- [Scheduler](https://github.com/seldak/scx_fresh/blob/main/docs/SCHEDULER.md): routing, budgets, and slices (private repository).
+- [Hint integration](docs/DESIGN_HINTS_API.md): ROS message and standalone queue lifecycles.
 - [ROS 2](ros2/README.md): integration, replay, and harness commands.
 - [Evaluation](docs/DESIGN_EVALUATION.md): findings, measurement rules, and reports.
 - [Project status](docs/ROADMAP.md): completed work and open questions.
