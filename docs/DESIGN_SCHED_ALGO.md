@@ -1,162 +1,102 @@
-# DESIGN: Scheduling algorithm (Freshness + EDF + Budgets)
+# Scheduler rules
 
-## TL;DR
-- IMU propagation uses a dedicated highest-priority lane.
-- Front-end tasks use **effective deadlines** and run under EDF-like ordering.
-- Back-end tasks are **best-effort** with vtime fairness.
-- Tasks that overrun their compute budget are **demoted** for the remainder of the job.
-- Tasks processing data older than their freshness window are **demoted**.
+This describes the current default policy. Userspace owns job selection;
+the scheduler routes the thread named by its hint.
 
-This is implemented using 4 custom DSQs and DSQ vtime ordering.
+## Routing at enqueue
 
----
+Rules are applied in this order:
 
-## Definitions
+| Condition | Destination |
+| --- | --- |
+| IMU stage, wakeup enqueue | CPU-local DSQ with `SCX_ENQ_PREEMPT` |
+| IMU stage, other enqueue | `DSQ_IMU`, ordered by effective deadline |
+| Non-IMU, unowned hint, stale or beyond deadline grace | `DSQ_STALE` |
+| FE class, no budget overrun | `DSQ_FE`, ordered by effective deadline |
+| BE class, unhinted task, or FE budget overrun | `DSQ_BE` |
 
-### Inputs (from userspace)
-For each runnable task `p`, userspace provides `hint(p)`:
+In `dispatch`, at most one task moves to the local DSQ, in this order:
 
-- `class`: FE or BE
-- `job_id`: identifies current work item
-- `release_ts`: job release time
-- `deadline_ts`: absolute deadline
-- `stale_ns`: freshness window
-- `budget_ns`: compute budget for this job
-- `slice_ns`: requested slice; API `0` resolves to `SCX_SLICE_DFL` (20 ms), not kernel `slice=0` (keep residual, or 1 ns if exhausted).
-
-### Scheduler-maintained state
-For each task `p`, we keep:
-
-- `exec_ns_in_job`: accumulated CPU time for current job
-- `vruntime`: fairness accumulator for BE
-- `last_start_ns`: timestamp when `p` started running last
-- `overrun`: flag (set when exec exceeds budget for a job)
-
----
-
-## Effective deadline and freshness
-For non-IMU work, we treat freshness as a hard preference:
-- If `(now - release_ts) > stale_ns` ⇒ demote to DSQ_STALE.
-
-If `release_ts` is in the future, age is clamped to zero. This avoids unsigned underflow when a periodic producer publishes the next IMU hint before the tick is released.
-
-Within the IMU and front-end lanes, ordering uses:
-
-`effective_deadline = min(deadline_ts, release_ts + stale_ns)`
-
-This ensures that even if a job has a long deadline, it won’t be scheduled ahead of newer work once it starts to become stale.
-
----
-
-## DSQ mapping
-- A waking IMU propagation task (`stage_id == SLAM_STAGE_IMU_PREINT`) is inserted directly into its CPU-local DSQ with `SCX_ENQ_PREEMPT`, so it can shorten a running lower lane's slice. Non-wakeup requeues use DSQ_IMU with vtime set to the effective deadline.
-
-IMU propagation is exempt from stale and already-late demotion. Budget accounting still occurs, but the IMU stage is always routed to DSQ_IMU.
-
-- FE & not stale & not overrun ⇒ DSQ_FE with vtime = effective_deadline
-- BE or overrun ⇒ DSQ_BE with vtime = vruntime
-- stale ⇒ DSQ_STALE with vtime = vruntime (or now)
-
----
-
-## Dispatch policy
-In each `dispatch(cpu, prev)` callback, we move at most one task to the CPU-local DSQ:
-
-1. try DSQ_IMU
-2. else DSQ_FE
-3. else DSQ_BE
-4. else DSQ_STALE
-
-Moving only one task is deliberate. Batching lower-priority work into the local DSQ would prevent a later wakeup from jumping ahead of that batch. Waking IMU jobs additionally direct-dispatch to the head of the local DSQ with preemption, because custom-DSQ ordering alone cannot interrupt the currently running slice.
-
----
-
-## Budget enforcement
-In `stopping(p, runnable)`:
-
-- `delta = now - last_start_ns`
-- `exec_ns_in_job += delta`
-
-If `exec_ns_in_job > budget_ns` and `budget_ns != 0`, set `overrun=1` and emit
-a budget-overrun event.
-
-Then on the next `enqueue` for this task/job, demote it to DSQ_BE and emit a
-separate budget-demotion event. The two events distinguish detecting an
-overrun at a scheduling boundary from applying the lower-priority route.
-
----
-
-## State machine
-```mermaid
-stateDiagram-v2
-  [*] --> Idle
-
-  Idle --> FE_Active: new job (class=FE)
-  Idle --> BE_Active: new job (class=BE)
-  Idle --> IMU_Active: IMU propagation tick
-
-  IMU_Active --> IMU_Active: next tick is already queued
-  IMU_Active --> Idle: sleeping until next tick
-
-  FE_Active --> FE_Active: exec < budget AND age < stale
-  FE_Active --> Overrun_Demoted: exec >= budget
-  FE_Active --> Stale_Demoted: age >= stale
-
-  Overrun_Demoted --> Overrun_Demoted: same job
-  Stale_Demoted --> Stale_Demoted: same job
-
-  Overrun_Demoted --> FE_Active: next job (job_id changes)
-  Stale_Demoted --> FE_Active: next job (job_id changes)
-
-  BE_Active --> BE_Active: vruntime updates
-  BE_Active --> Idle: sleeping / blocked
-  FE_Active --> Idle: sleeping / blocked
-```
-
----
-
-## Pseudocode (enqueue)
 ```text
-on enqueue(task p):
-    now = scx_now()
-
-    st = state[p] (create if absent)
-    h  = hint[p] (may be absent)
-
-    if h.job_id != st.last_job_id:
-        st.exec_ns_in_job = 0
-        st.overrun = 0
-        st.last_job_id = h.job_id
-
-    if h.stage_id == IMU_PREINT:
-        if enq_flags has SCX_ENQ_WAKEUP:
-            dsq_insert(SCX_DSQ_LOCAL, slice=h.slice_ns,
-                       flags=enq_flags | SCX_ENQ_PREEMPT)
-        else:
-            dsq_insert_vtime(DSQ_IMU, effective_deadline(h), slice=h.slice_ns)
-        return
-
-    age = max(now - h.release_ts, 0)
-    if h.stale_ns != 0 and age > h.stale_ns:
-        class = STALE
-    else if h.class == FE and !st.overrun:
-        class = FE
-    else:
-        class = BE
-
-    if class == FE:
-        vtime = min(h.deadline_ts, h.release_ts + h.stale_ns)
-        dsq_insert_vtime(DSQ_FE, vtime, slice=h.slice_ns)
-    else if class == BE:
-        vtime = st.vruntime
-        dsq_insert_vtime(DSQ_BE, vtime, slice=h.slice_ns_or_default)
-    else:
-        dsq_insert_vtime(DSQ_STALE, st.vruntime, slice=small)
+IMU -> FE -> BE -> STALE
 ```
 
----
+Moving one task avoids queuing a batch of lower-priority tasks ahead of a later
+arrival. Only the default IMU wakeup path preempts. FE arrival does not shorten
+a running BE slice.
 
-## Compatibility notes
-Several sched_ext kfuncs were renamed across kernel versions (with aliases that later disappear).
-This repo uses a weak-kfunc + `bpf_ksym_exists()` compatibility layer so one BPF object can run
-across those renames.
+## Age and effective deadlines
+
+Age is `max(now - release_ts_ns, 0)`. A future release therefore does not
+underflow. For an unowned non-IMU hint:
+
+- A nonzero stale window and release timestamp enable stale demotion when
+  age exceeds `stale_ns`.
+- A nonzero deadline enables late demotion when elapsed time beyond the
+  deadline exceeds `deadline_grace_ns`, which defaults to 1 ms.
+
+IMU is exempt from both checks. `SLAM_HINT_EXECUTOR_OWNED` exempts a selected
+non-IMU owner from age demotion so it can reach its recheck and completion
+path. The executor performs its own expiry checks without grace. The flag
+does not disable budget demotion or give BPF permission to select backlog.
+
+Within IMU and FE queues, the effective deadline is the earliest available
+value among `deadline_ts_ns` and `release_ts_ns + stale_ns`. The latter is
+used only when both fields are nonzero. With neither bound, the key is the
+current time. This is deadline ordering, not newest-message selection.
+
+## Execution budgets
+
+BPF stores execution accounting per worker. A new `job_id` resets the job's
+execution total and overrun state at enqueue.
+At `stopping`, elapsed running time is added to `exec_ns_in_job` and
+`vruntime`.
+
+When execution exceeds a nonzero budget, the scheduler marks the job overrun
+and emits a budget-overrun event. A later enqueue sends overrun FE work to BE
+and emits a budget-demotion event. The two events distinguish detection from
+routing. IMU accounting still records overruns, but its special route takes
+precedence over budget demotion.
+
+Budget enforcement occurs at scheduling boundaries; it is not a timer that
+cancels compute at the exact budget. Background ordering uses accumulated
+runtime. The hint's `weight` field is currently not applied to that accumulator.
+
+## Insertion slices
+
+The hint's `slice_ns=0` means use `SCX_SLICE_DFL` (20 ms on the tested kernel).
+It is translated to an explicit slice before insertion. Passing a literal
+zero to the kernel would retain the residual slice, or grant 1 ns if exhausted.
+
+The optional loader argument `--be-slice-cap-us N` caps the resolved slice
+for missing hints and non-IMU hints whose original class is BE.
+The bag harness exposes it as `BE_SLICE_CAP_US`.
+
+| Setting | Effect |
+| --- | --- |
+| `0` (default) | No cap; existing requested/default slices apply. |
+| Positive value | Eligible insertions use the smaller of the resolved slice and cap. |
+
+Hogs and mapping are eligible. IMU and FE hints are not, including an FE job
+routed to BE after a budget overrun. The cap changes neither the global
+default slice nor queue order, deadlines, admission, or preemption.
+
+## Hint lifetime and observability
+
+A worker's hint may remain visible after callback compute completes.
+That retained identity protects the userspace completion tail; it is replaced
+only after the executor establishes completion. See the
+[executor contract](DESIGN_HINTS_API.md#executor-contract).
+
+Deadline events are best-effort observations at scheduler boundaries. They
+are not the workload's completion-lateness counters. Use application metrics
+to evaluate whether outputs completed on time.
+
+## Kernel compatibility and diagnostics
+
+The BPF source uses weak kfunc declarations and `bpf_ksym_exists()` for renamed
+sched_ext helpers. The loader can report embedded switch flags before attachment;
+evaluation harnesses require partial-switch mode.
+
+Historical trace and preemption probes remain opt-in and are not part of
+the default policy or the capped bag ablation.

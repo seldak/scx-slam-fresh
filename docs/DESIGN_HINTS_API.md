@@ -1,194 +1,128 @@
-# DESIGN: Userspace hints API (libslamqos)
+# Userspace hints API
 
-## Goal
-Provide a **small, explicit API** for pipeline code to publish the scheduling metadata
-that Linux can’t infer:
+`libslamqos` writes scheduling metadata to the pinned `task_hints` BPF map.
+Each key is a worker identity, packed as `(tgid << 32) | tid`. Each value
+describes one selected job.
 
-- “this work item is stale after 2 frames”
-- “this job must complete before T”
-- “this job should not burn more than X microseconds”
-- “this is front-end vs back-end”
-
-## Why a userspace API instead of kernel heuristics?
-Because a robotics pipeline’s semantics live above the kernel:
-only the application knows the freshness window and the meaning of a job id.
-
-The ownership rule is:
-
-> Userspace selects work. `sched_ext` consumes metadata about the work already
+> Userspace selects work. sched_ext consumes metadata about the work already
 > selected for a worker.
 
-A hint describes a worker that is about to run a specific job. It is not a
-kernel-side copy of an application queue.
+## Functions
 
----
+Declarations are in `src/slamqos.h`; the shared layout is
+`struct slam_task_hint` in `include/scx_slam_fresh_shared.h`.
 
-## Data flow (sequence)
-```mermaid
-sequenceDiagram
-  participant Producer as Producer / executor
-  participant Worker as Sleeping worker
-  participant QoS as libslamqos
-  participant Map as BPF map (task_hints)
-  participant SCX as scx_slam_fresh (BPF)
-  participant CPU as CPU dispatch
+| Function | Use |
+| --- | --- |
+| `slamqos_pid_tgid_self()` | Return the current worker's packed identity. |
+| `slamqos_open(q, pin_dir)` | Open the pinned hint map into a caller-owned handle. |
+| `slamqos_close(q)` | Close the map descriptor. |
+| `slamqos_publish_hint(q, hint)` | Replace the current thread's hint. |
+| `slamqos_publish_hint_for(q, worker, hint)` | Replace an explicitly identified worker's hint. |
+| `slamqos_publish_job(...)` / `slamqos_publish_job_for(...)` | Build and publish a hint from individual fields. |
+| `slamqos_clear_hint(q)` | Write a MISC/BE hint with job ID zero for the current thread. |
 
-  Producer->>Producer: select job and assign worker
-  Producer->>QoS: publish hint for worker pid_tgid
-  QoS->>Map: bpf_map_update_elem(task_hints[key], hint)
-  Producer->>Worker: wake worker
-  SCX->>Map: lookup hint on enqueue()
-  SCX->>CPU: insert into DSQ_FE/DSQ_BE/DSQ_STALE
-  CPU->>Worker: run selected job
-  Worker->>QoS: republish exact job after pop
-```
+Use the full hint structure when setting flags such as
+`SLAM_HINT_EXECUTOR_OWNED`. A clear is a map update, not an ownership or
+cancellation operation; an executor must establish that clearing is safe.
 
----
+## Fields
 
-## API surface
+| Field | Meaning |
+| --- | --- |
+| `api_version` | Set to `SLAM_SCX_API_VERSION`. |
+| `stage_id` | Application stage; the IMU stage selects the dedicated route. |
+| `class_id` | FE or BE. |
+| `flags` | Ownership flags; zero unless the client implements their contract. |
+| `job_id` | Stable for one job; change it when selecting new work. |
+| `release_ts_ns` | Monotonic release time. |
+| `deadline_ts_ns` | Absolute monotonic deadline, or zero for none. |
+| `stale_ns` | Maximum useful age, or zero to disable the stale threshold. |
+| `budget_ns` | Execution budget, or zero to disable budget enforcement. |
+| `slice_ns` | Requested insertion slice; zero selects the scheduler default. |
+| `weight` | Reserved fairness parameter; current BPF runtime accounting does not apply it. |
 
-### `slamqos_open(pin_dir)`
-- opens `task_hints` map pinned under `pin_dir`
-
-### `slamqos_publish_hint(hint)`
-Updates the map entry keyed by current thread’s pid/tgid.
-
-### Recommended usage pattern
-For a worker that is already running, at the start of each work item:
-1) compute `deadline_ts` and `stale_ns`
-2) set `job_id` (monotonic per stage/thread)
-3) publish the hint
-4) do work
-
-Sleeping workers need the stronger executor contract below because publishing
-after they run is too late to classify the wakeup.
-
----
+For nonzero deadlines, use a value at or after release. Scheduler timestamps
+use `CLOCK_MONOTONIC`, corresponding to BPF `bpf_ktime_get_ns()`. Recorded ROS
+header stamps are not in this timebase and must not be sent as kernel deadlines.
 
 ## Executor contract
 
-`task_hints` contains one slot per worker `pid_tgid`. Correctness therefore
-depends on the executor serializing job ownership and hint publication.
+The single slot per worker makes publication ordering part of correctness.
 
 ### Assign, publish, wake
 
-For a sleeping worker, perform these actions in order:
+For a sleeping worker:
 
-1. Select the job and bind it to a worker.
-2. Publish `(worker pid_tgid, job_id, stage, class, release, deadline, stale,
-   budget, slice)` into that worker's slot.
+1. Select a job and bind it to that worker.
+2. Publish its identity and scheduling fields into the worker's slot.
 3. Wake the worker.
 
-Never wake a worker while its slot still describes the previous job.
+Publishing only after the worker starts running is too late to classify its
+wakeup. A worker selecting another job without sleeping must publish after
+selection and before compute.
 
-### Busy worker
+### Ownership and eviction
 
-When a worker selects another callback without sleeping, publish the new job
-after selection and before compute begins. No intervening sleep is required:
-the current execution is already running, and the new hint will be visible to
-the next `stopping` / `enqueue` scheduling boundary.
+A producer or eviction path must not overwrite an executing job's hint.
+Only the worker may replace or clear it, unless the executor has independently
+established completion.
 
-### Protect in-flight work
+Do not publish work evicted before assignment. If the selected head is removed
+before a planned wake, publish the replacement first or do not wake the worker.
+A pre-start thief publishes the stolen job onto its own slot before execution.
 
-A producer, stealing path, or eviction path must not overwrite a worker whose
-current `job_id` is still executing. Only the worker may clear or replace the
-slot at job end, unless the executor has independently established that the
-worker finished.
+Once compute begins, the job stays with that worker until completion or
+worker-controlled cancellation. Budget state is keyed by worker, so moving
+a running job would reset accounting and could grant it a second FE budget.
+Mid-job migration requires state keyed by at least stage and job identity.
 
-### Steal, cancel, and evict
+### ROS message lifecycle
 
-- Do not wake a victim for work it no longer owns.
-- A thief publishes the stolen job onto its own worker before running it.
-- Do not publish an item that is cancelled or evicted before execution.
-- If an evicted head item was going to wake a worker, either publish the new
-  head before waking that worker or do not wake it.
+Each `FreshnessExecutor` instance has a dispatcher and one callback worker.
+The dispatcher selects an `rclcpp::AnyExecutable` only when the worker is idle.
+For message-aware subscriptions, it takes one normal message directly from DDS,
+extracts its job metadata, and hands that same message to the worker.
 
-### Migration limitation
+With `reject_expired` enabled, expiry is checked twice: before hint publication
+and wake, then after handoff before callback entry. Both use the raw deadline
+and stale window without grace. A rejected message is returned, its callback
+group is released, and the observer receives `DroppedBeforeStart`. This never
+cancels an already-running callback.
 
-Contract version 1 supports stealing or migration only before a job starts
-executing. Once a job enters compute, it remains on that worker until it
-finishes, is cancelled by that worker, or is dropped by that worker.
+Accepted non-IMU work in this recovery path carries
+`SLAM_HINT_EXECUTOR_OWNED`. BPF age demotion cannot revoke its service before
+it reaches the recheck, completion, or parking path. Normal class routing and
+budget demotion still apply. Real IMU profiles remain unflagged and retain
+the scheduler's IMU exemption.
 
-Publishing the same `job_id` on another worker preserves identity but does not
-transfer scheduler state. Today `exec_ns_in_job`, `overrun`, and the
-`last_reported_*_job` fields are keyed by worker `pid_tgid`. Mid-job migration
-would reset budget accounting and could grant a second FE pass. Supporting it
-requires job-scoped state keyed by at least `(stage_id, job_id)`.
+The completed job's hint remains through parking. Once completion is
+established, the dispatcher directly replaces it with the next selected job.
+An intermediate MISC/BE clear could strand the worker's completion tail under
+BE contention. The dispatcher clears the final slot at shutdown; callback
+failure clears it on the worker. Retaining identity does not create a queued
+job or authorize kernel-side selection.
 
-### Identity and timebase
+Serialized, dynamic, and intra-process message delivery are outside the
+message-aware path. The current worker does not steal or migrate callbacks.
 
-- Keep `job_id` stable for one logical item across assignment or pre-start
-  stealing. Assign a new id to new work.
-- Use `CLOCK_MONOTONIC`, the userspace timebase corresponding to BPF
-  `bpf_ktime_get_ns()`.
-- Treat an unannotated `SCHED_EXT` worker as BE fallback behavior, not as a way
-  to run front-end work.
+### Standalone FIFO lifecycle
 
-### Current demo instance
+Each queue has one consumer. Producers publish the head item's hint only when
+waking a sleeping consumer; after `pop()`, the consumer republishes the exact
+selected item. Busy consumers' slots are not overwritten by later arrivals.
+This is the standalone instance of the same ownership contract.
 
-The demo implements this contract for one FIFO consumer per queue. A producer
-publishes the head item only when it will wake a sleeping consumer; the
-consumer republishes the exact item after `pop()`. Producers do not overwrite
-the hint while that consumer is busy.
+## Release time and bag identity
 
-### ROS 2 single-worker instance
+Ordinary callback groups use callback selection as release time. Message-aware
+groups use the monotonic release carried by their message.
 
-`scx_slam_executor::FreshnessExecutor` implements the same ownership rule with
-separate dispatcher and worker threads. The dispatcher selects one ready
-`rclcpp::AnyExecutable` only after the worker has finished its previous job. It
-then publishes the selected callback group's profile for that worker before
-waking it. The worker does not steal or migrate work. After callback completion,
-it retains the completed job's hint through parking. Once the dispatcher has
-established completion, it directly overwrites that slot for the next selected
-job; there is no intermediate MISC/BE clear. The dispatcher clears the final
-slot at shutdown, and the worker clears its slot on callback failure.
+The bag adapter samples monotonic time when it takes a sensor message and
+stores it in `release_ts_ns`. It preserves the recorded header stamp separately
+as `source_ts_ns`; offline bag ordinals supply stable job IDs. Downstream
+camera jobs retain both identity and release time, sharing the camera deadline.
 
-For ordinary callback groups, `release_ts_ns` is callback selection time. A
-message-aware subscription registration changes the handoff: the dispatcher
-takes one normal ROS message directly from DDS, extracts its `job_id` and
-monotonic source timestamp, publishes that exact hint, and gives the same
-message to the worker. It does not mirror DDS state in another queue. The v1
-message path intentionally excludes serialized, dynamic, and intra-process
-delivery.
-
-Message-aware profiles may opt into `reject_expired`. The dispatcher rejects
-expired messages before publishing or waking, and the worker rechecks after
-handoff before entering the callback. These checks use the raw deadline and
-stale window, without grace; the BPF deadline grace still applies to unflagged
-clients. Dropping returns the taken message, releases the callback group, and
-reports `DroppedBeforeStart` to the registered observer. It never cancels a
-running callback.
-
-Accepted non-IMU messages carry `SLAM_HINT_EXECUTOR_OWNED`: age demotion must
-not strand the owner before its recheck, completion, or parking path. Normal
-class routing and CPU budget demotion remain in effect. IMU stays unflagged
-and retains its existing exemption. The retained completed hint is intentional;
-it does not represent queued application work or authorize kernel selection.
-
-For bag-backed input, the adapter samples `CLOCK_MONOTONIC` when it takes each
-sensor message and places that value in `release_ts_ns`. The recorded ROS
-header stamp is retained separately as `source_ts_ns` for dataset correlation;
-it is never passed to BPF as a release or deadline time.
-
----
-
-## Hint fields and invariants
-
-### Required
-- `stage_id`
-- `class` (FE/BE)
-- `job_id` (must change for new work)
-- `release_ts_ns` (CLOCK_MONOTONIC / steady_clock)
-- `deadline_ts_ns` (>= release_ts_ns; 0 means “none”)
-- `stale_ns` (0 means “never stale”, but for SLAM you usually want nonzero)
-
-### Optional
-- `budget_ns` (0 => no demotion)
-- `slice_ns` (0 => scheduler default)
-- `weight` (for BE fairness; 0 => default)
-
----
-
-## What happens if you don’t publish hints?
-- The scheduler falls back to BE behavior with a default slice.
-- This matters because in partial switch mode you might have unrelated SCHED_EXT tasks.
+Unannotated SCHED_EXT tasks receive BE fallback service. See the
+[scheduler reference](DESIGN_SCHED_ALGO.md) for default slices, age rules,
+budget enforcement, and the optional BE cap.

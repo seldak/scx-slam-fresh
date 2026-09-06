@@ -1,34 +1,30 @@
-# Roadmap (stretch goals)
+# Project status
 
-These are great “resume bullets” because they show depth beyond the initial demo.
+The scheduler is frozen at the current partial-switch policy. The optional
+BE insertion cap remains disabled by default.
 
-## Scheduling features
-- Stage-aware CPU affinity hints (e.g., keep FE on fewer cores for cache locality).
+## Completed
 
-Deferred pending E4 evidence:
-- Slack stealing, only if E4 shows BE-only collapse while IMU and FE remain healthy.
-- Bounded lower-lane service, only if E4 shows FE and BE collapse while IMU remains healthy.
+- Standalone calibration, overload, burst, budget, and IMU-load experiments.
+- ROS callback execution with one worker per executor instance.
+- Executor stale-selection rejection and protection of the completion tail.
+- Deterministic bag identity, source windows, and explicit drop accounting.
+- EuRoC uncapped baseline, opt-in 2 ms cap, and capped hint ablations.
 
-Not planned:
-- A BPF pending-hint ring. The userspace executor remains the source of truth
-  for work selection; duplicating its queue in BPF would create divergent state.
+See the [evaluation reports](DESIGN_EVALUATION.md) for results and scope.
 
-## Better pipeline integration
-- ~~Classify the loaded ROS snapshot's zero-hog maximum-tail anomaly.~~ Closed
-  as unshielded fair-class interference by matched standard-perf captures; the
-  shielded confirmation required no scheduler-policy change.
-- Run the matched ROS 2 CFS/scx callback-compute evaluation and document the
-  validated scope before changing scheduler policy.
-- ROS2: validate a recorded sensor bag with the matched CFS/hinted harness and
-  freeze bag-window offered-count rules from the captured job-id spans.
-- Generalize the documented executor hint contract beyond the demo's 1:1 FIFO workers.
+## Open questions
 
-## Power / perf (still non-proprietary)
-- Experiment with `scx_bpf_cpuperf_set()` (if available) to boost CPU perf during FE spikes.
+The current evidence does not separate FE class priority from EDF ordering
+and budgets. It also does not quantify cap overhead against an uncapped run
+with equivalent hog counters. These are limits of the results, not scheduled
+policy changes.
 
-## Observability
-- Export events as JSON
-- Add a Python notebook for plots (p50/p99, miss rate, wasted work)
+Additional slice values, FIFO comparisons, other datasets, and a real estimator
+integration are outside the current work. No new scheduling mechanism is planned.
 
-## CI
-- Build-only CI job (compile BPF and userspace, don’t attach)
+## Contract boundaries
+
+Userspace remains responsible for selecting and evicting work. A BPF pending-job
+queue would duplicate that ownership and is not planned. Mid-callback migration
+would require job-scoped budget accounting before it could be supported.

@@ -1,245 +1,178 @@
-# Optional ROS 2 integration
+# ROS 2 integration
 
-This directory contains the optional ROS 2 Lyrical integration. It is not part
-of the standalone `make` build and does not change the BPF scheduler, loader,
-synthetic pipeline, or E0-E4 tests.
+The optional ROS 2 Lyrical workspace provides an executor, synthetic callback
+graph, and sensor-bag adapter. It is separate from the standalone build.
 
-Build and test it explicitly from the repository root:
+## Build and test
+
+From the repository root:
 
 ```bash
+make
 make ros2
 make test-ros2
 ```
 
 The helper sources `/opt/ros/lyrical/setup.bash` by default. Set `ROS2_SETUP`
-to use another installation path. It rejects an active non-Lyrical overlay so
-packages from two ROS distributions cannot be mixed accidentally.
+for another installation path. It rejects an active non-Lyrical overlay.
+The executor links libslamqos and needs the same libbpf development dependency
+as the standalone build.
 
-The executor wrapper links the repository's existing `libslamqos`
-implementation and therefore needs the same `libbpf-dev` system dependency as
-the standalone build.
+Generated state stays in the ignored `.ros2-build`, `.ros2-install`, and
+`.ros2-log` directories.
 
-Generated Colcon state is isolated in `.ros2-build`, `.ros2-install`, and
-`.ros2-log`, all of which are ignored by Git.
+| Package | Purpose |
+| --- | --- |
+| `scx_slam_executor` | FreshnessExecutor and libslamqos integration. |
+| `scx_slam_msgs` | Stamped job message shared by stages. |
+| `scx_slam_workload` | Smoke node, synthetic graph, and sensor-to-job adapter. |
 
-Packages:
-
-- `scx_slam_executor` exports the existing `libslamqos` C implementation to
-  Ament consumers and provides the first `FreshnessExecutor` implementation.
-- `scx_slam_msgs` defines the stamped work item shared by the ROS pipeline.
-- `scx_slam_workload` provides a downstream executor smoke node and a bounded
-  ROS pub/sub pipeline plus the Phase 4 sensor-to-job adapter.
-
-## FreshnessExecutor v1
-
-The first executor is deliberately narrow: one ROS dispatcher and one callback
-worker. The dispatcher waits for and selects an `rclcpp::AnyExecutable` only
-while the worker is idle, publishes that callback group's profile for the
-worker, and then wakes it. The worker clears its slot after the callback ends.
-There is no work stealing or mid-callback migration.
-
-This separation locates the experiment precisely:
-
-- DDS/RMW readiness and callback selection stay on the dispatcher.
-- Only callback compute runs on the configurable worker CPU and scheduling
-  policy.
-- `PinnedMapHintSink` sends profiles to the pinned sched_ext map; `NullHintSink`
-  runs the identical executor without hints.
-
-Ordinary callback groups use callback selection time as `release_ts_ns`.
-Message-aware subscription groups instead let the dispatcher take a normal ROS
-message from DDS, extract its `job_id` and monotonic source timestamp, publish
-the exact hint, and hand that same message to the worker. DDS remains the only
-pending-message queue. Serialized, dynamic, and intra-process delivery are not
-part of this v1 path.
-
-## Phase 2 ROS pipeline
-
-The bounded workload uses real ROS topics and four separate executor instances:
+## Execution model
 
 ```text
-IMU source ──────────────> IMU propagation
+IMU source ----------------------> IMU propagation
 Camera source -> vision FE -> state estimator -> mapping BE
 ```
 
-Each stage has one fixed worker. Configuring every worker for the same CPU
-creates kernel-visible contention between the stages, while each executor's
-dispatcher performs DDS readiness and message selection outside callback
-compute. Run the unloaded, no-hint version after building:
+Each stage has one executor instance with a dispatcher and one fixed callback
+worker. Dispatchers handle DDS readiness and callback selection on the
+housekeeping CPU. Workers and hogs use the experimental CPU and selected policy.
+
+The dispatcher publishes a selected message's hint before waking its worker.
+Expired messages may be rejected before publication or after handoff. Completed
+hints remain through parking and are directly replaced at the next assignment.
+The [executor contract](../docs/DESIGN_HINTS_API.md#executor-contract) specifies
+message cleanup, ownership protection, and supported subscription types.
+
+For an unprivileged smoke run:
 
 ```bash
 source .ros2-install/setup.bash
 ros2 run scx_slam_workload scx_slam_pipeline --duration 3
 ```
 
-The executable also accepts `--worker-cpu N`, `--ext-policy N`, `--pin DIR`,
-`--hint-mode MODE`, `--hog N`, and `--window-stats`. The pin and policy options
-opt into the attached sched_ext policy. Contenders use the same policy as
-callback workers: they are ordinary CFS threads in the CFS case and unhinted
-best-effort `SCHED_EXT` threads in the scx case.
+The pipeline accepts `--worker-cpu`, `--ext-policy`, `--pin`,
+`--hint-mode`, `--hog`, and `--window-stats`. Its compute costs are synthetic,
+including when sensor input comes from a bag.
 
-This is still a synthetic compute workload. Phase 2 proves ROS transport,
-message-derived hinting, fixed worker ownership, and stage-to-stage timestamp
-propagation. It is not bag evidence or an estimator accuracy result.
+## Bag evaluation
 
-## Phase 3 ROS scheduling evaluation
-
-The matched evaluation keeps DDS, RMW, publishers, and executor dispatchers on
-a housekeeping CPU. Only the four callback workers and the requested CPU
-contenders are pinned to the experimental CPU. This isolates the sched_ext
-experiment at callback compute while retaining real ROS topic transport and
-readiness handling.
-
-Build as the normal user, then run the privileged harness:
+Keep datasets outside the repository. Build as the normal user, then run:
 
 ```bash
-make
-make ros2 test-ros2
-sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
-  REPETITIONS=3 scripts/run_ros2_eval.sh
+sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 \
+  REPETITIONS=3 HOG_THREADS=0 \
+  scripts/run_ros2_bag_eval.sh /absolute/path/to/ros2-bag
 ```
 
-The harness runs matched CFS and `scx_slam` cases. It refuses full-switch mode,
-uses one attached loader for all scx repetitions, records binary hashes and the
-environment, and writes `summary.tsv`. Each stage reports fixed-window offered,
-completed, late, started-stale, unfinished, thread CPU, p99/max callback-start
-age, and p99/max completion age. Work completed after the common monotonic
-cutoff is excluded.
+The harness runs CFS followed by hinted partial-switch SCX. Useful controls:
 
-Phase 3 is an evaluation, not a pass/fail test. The harness deliberately does
-not assert that scx must beat CFS. Results remain synthetic-work evidence until
-bag replay and an actual estimator are introduced in later phases.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CPU` / `HOUSEKEEPING_CPU` | `14` / `1` | Workers and hogs / DDS, dispatch, adapter, player, loader. |
+| `DURATION` / `WARMUP` | `15` / `3` seconds | Measured source interval and preceding warmup. |
+| `REPETITIONS` / `HOG_THREADS` | `3` / `0` | Runs per policy and contenders per run. |
+| `IMU_TOPIC` | `/imu0` | Bag IMU topic. |
+| `CAMERA_TOPIC` | `/cam0/image_raw` | Bag image topic. |
+| `DEADLINE_GRACE_US` | `1000` | BPF grace for unowned clients; executor expiry has no grace. |
+| `BE_SLICE_CAP_US` | `0` | Optional BE insertion cap in microseconds; zero disables it. |
+| `HINTED_ONLY` | `0` | Set to one to skip CFS. |
+| `SCX_VARIANT` | `hinted` | `hinted`, `imu-only`, or `fe-only`. |
+| `BASELINE_DIR` | unset | Prior results for exact source-window comparison. |
+| `OUTPUT_DIR` | generated | New result directory; existing output is not overwritten. |
 
-The default `SCX_VARIANTS=hinted` runs the complete metadata policy. Ablations
-can be selected individually or together:
+Playback uses rate 1.0. The harness reads the source epoch and topic ordinals
+offline, keeps QoS preflight paused, and resumes playback after endpoints are
+ready. Ordinals make IDs and ID-dependent compute costs properties of the bag,
+rather than startup timing.
 
-- `hinted`: dedicated IMU stage plus FE vision/estimator hints.
-- `no-hints`: all workers enter `SCHED_EXT`, but `NullHintSink` publishes no
-  metadata; this is the anonymous BE fallback.
-- `imu-only`: only IMU keeps its dedicated hint; every other stage is
-  `MISC/BE`.
-- `fe-only`: vision and estimator remain FE; IMU retains its deadline and
-  budget as ordinary FE but loses the dedicated IMU stage and wakeup-preempt
-  path.
+The adapter samples monotonic release time when taking a sensor message.
+Recorded header stamps identify the source window separately. Camera identity
+and release time propagate through vision, estimation, and mapping.
 
-Run the complete split under the same attached scheduler and workload:
+An independent audit counts each camera input as an offer to all three stages.
+`arrivals` counts subscription selections; `dropped_before_start` records
+executor rejection; `dropped_upstream` resolves downstream offers whose input
+was evicted earlier. A starved downstream stage cannot report zero offered work.
+See [measurement rules](../docs/DESIGN_EVALUATION.md#measurement-rules).
+
+The gate requires matched windows, no adapter drops, complete accounting, and
+zero unfinished work. Every SCX variant must also complete all IMU jobs on time.
+Downstream drops remain explicit outcomes. The result contains environment and
+binary provenance, stage metrics, and adapter totals.
+
+## Capped hint ablation
+
+To reproduce full/A/B with two hogs and a 2 ms cap:
 
 ```bash
-sudo env CPU=0 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
-  REPETITIONS=3 SCX_VARIANTS=hinted,no-hints,imu-only,fe-only \
-  scripts/run_ros2_eval.sh
+sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 \
+  REPETITIONS=3 DEADLINE_GRACE_US=1000 \
+  scripts/run_ros2_bag_ablation.sh /absolute/path/to/ros2-bag
 ```
 
-The clean loaded result and its scope are recorded in
-[`DESIGN_EVALUATION.md`](../docs/DESIGN_EVALUATION.md#loaded-ros-2-callback-scheduling-snapshot).
+The driver fixes two hogs, the 2000 us cap, and SCX-only execution. It repeats
+the full control along with A and B using identical binaries and source windows.
 
-The separate zero-hog maximum-tail diagnosis is closed and recorded in
-[`DESIGN_EVALUATION.md`](../docs/DESIGN_EVALUATION.md#zero-hog-partial-switch-interference-diagnosis).
-On an unshielded worker CPU, foreign fair-class browser/compositor threads
-outranked partial-switch SCX and left the correctly woken IMU runnable for
-44-48ms. The matched shielded capture used the same `f01e3f9` binary set and no
-policy change. Its boot configuration was:
+| Cell | IMU hint | Downstream hints |
+| --- | --- | --- |
+| Full | Dedicated IMU route | FE vision/estimator |
+| A: `imu-only` | Dedicated IMU route | MISC/BE |
+| B: `fe-only` | MISC/FE; no dedicated queue or wakeup preemption | FE vision/estimator |
+
+These bag variants project published hints without changing admission profiles.
+B preserves age protection with the existing ownership flag. It removes the
+queue/preemption bundle, not preemption alone.
+
+Hog iterations are counted in the original wall window; mapping CPU remains
+in stage statistics. The driver retains strict-gate failures and continues
+collecting cells, then exits nonzero if any failed. Infrastructure and adapter
+failures stop the run. [Recorded results](../docs/evaluation/euroc.md) explain
+why B fails the IMU gate despite complete accounting.
+
+## CPU placement
+
+Partial switch does not isolate the worker CPU from other scheduling classes.
+The recorded bag runs used worker CPU 14, housekeeping CPU 1, and left SMT
+sibling 15 unused. Their boot configuration was:
 
 ```text
 isolcpus=managed_irq,14-15 nohz_full=14-15 rcu_nocbs=14-15 irqaffinity=0-13 systemd.cpu_affinity=0-13
 ```
 
-The kernel rejects sched_ext with `isolcpus=domain`, so that flag must not be
-added. Workers ran on CPU 14, CPU 1 retained housekeeping work, and SMT sibling
-15 was left unused. Reproduce the standard-perf capture with:
+These CPU numbers are machine-specific. The tested kernel rejects sched_ext
+attachment with `isolcpus=domain`. The
+[CPU-interference report](../docs/evaluation/ros-synthetic.md#zero-hog-partial-switch-interference-diagnosis)
+records the evidence behind this setup.
+
+## Periodic-source evaluation
+
+For the earlier ROS graph with synthetic periodic publishers:
 
 ```bash
-sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 REPETITIONS=3 \
-  scripts/run_ros2_zero_hog_perf.sh
+sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 HOG_THREADS=2 \
+  REPETITIONS=3 scripts/run_ros2_eval.sh
 ```
 
-This fixed diagnostic runs only hinted SCX with zero hogs. It records
-`sched_switch`, `sched_wakeup`, new wakeups, forks, and migrations on CPUs 0 and
-1; `sched_stat_runtime` and custom BPF execution tracing are not enabled. The
-perf recorder stays on the housekeeping CPU. Raw `perf.data`, decoded events,
-workload metrics, and `perf sched timehist` are retained per repetition.
-Standard scheduler tracepoints do not expose the incoming `scx.slice`, so the
-report can show an observed successor run interval but must not call it the
-task's requested or remaining slice. The shielded three-repetition result was
-3000 completed IMU callbacks with zero late or started-stale callbacks in every
-run and a maximum start age no greater than 2.532ms. Brief residual occupants
-on CPU 14 mean the core is not claimed as absolutely reserved; they did not
-recreate the 40ms-class failure.
+That runner uses `SCX_VARIANTS` (plural, comma-separated) and supports
+`hinted,no-hints,imu-only,fe-only`. It is distinct from the bag runner:
+legacy synthetic variants change stage profiles, whereas bag ablations project
+only published hints. Do not combine their tables as one experiment.
 
-The default build remains ROS-independent:
+The [periodic-source report](../docs/evaluation/ros-synthetic.md) records its
+historical results. Standard-perf diagnostics use the configured worker and
+housekeeping CPUs; their captured run intervals do not expose requested or
+remaining sched_ext slices.
 
-```bash
-make
-make test-demo test-e4 test-scheduler-mode test-window test-slice
-```
+## Adapter plumbing
 
-## Phase 4 bag-backed input
+The adapter accepts `sensor_msgs/msg/Imu` and `sensor_msgs/msg/Image`,
+publishing `StampedJob` on `/imu/jobs` and `/camera/jobs`. Input topic defaults
+are `/imu` and `/camera/image_raw`; the bag harness supplies its topic overrides.
 
-`scx_slam_bag_adapter` accepts standard `sensor_msgs/msg/Imu` and
-`sensor_msgs/msg/Image` topics from `ros2 bag play` and publishes the existing
-`StampedJob` inputs on `/imu/jobs` and `/camera/jobs`. The scheduler-facing
-`release_ts_ns` is sampled from `CLOCK_MONOTONIC` when the adapter takes the
-sensor message. The original ROS header timestamp is preserved separately as
-`source_ts_ns`; it is not used as a kernel timestamp.
-
-Both bag-player inputs and stamped-job outputs use an explicit reliable,
-volatile, keep-last QoS profile with depth 1000. The bag harness supplies the
-matching rosbag2 playback override and captures `ros2 topic info -v` for both
-sensor topics before running a case. The adapter prints received, published,
-and dropped totals for IMU and camera when it shuts down.
-
-The default input topics are `/imu` and `/camera/image_raw`. Override them with
-ROS parameters to match a bag, for example:
-
-```bash
-ros2 run scx_slam_workload scx_slam_bag_adapter --ros-args \
-  -p imu_input:=/imu0 -p camera_input:=/cam0/image_raw
-```
-
-Run the existing pipeline without its periodic synthetic publishers in a
-second terminal:
-
-```bash
-ros2 run scx_slam_workload scx_slam_pipeline \
-  --duration 30 --input external --source-start-ns SOURCE_EPOCH_NS --window-stats
-```
-
-Then start playback in a third terminal:
-
-```bash
-ros2 bag play /path/to/bag \
-  --qos-profile-overrides-path /path/to/qos-overrides.yaml
-```
-
-The override file must set both selected sensor topics to `reliable`,
-`volatile`, `keep_last`, depth 1000. The matched harness below generates this
-file and verifies both endpoints with `ros2 topic info -v`; use the manual
-three-terminal form only for plumbing checks.
-
-External window statistics use source time, not pipeline process start. The
-matched harness reads `SOURCE_EPOCH_NS` directly from the bag,
-passes the same value to every CFS and SCX case, and rejects a result if any
-stage reports a different offered count or first/last source timestamp.
-
-Start the adapter and pipeline before playback, and choose a pipeline duration
-longer than the selected bag interval. External-mode `offered` fields count
-callbacks taken whose source timestamps fall inside the fixed interval. The
-adapter reports transport drops, while the harness verifies identical counts
-and source boundaries across cases. This still measures scheduler behavior,
-not estimator accuracy.
-
-For a matched 15-second CFS-versus-hinted capture, keep the bag outside the
-repository and use the dedicated harness:
-
-```bash
-sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 \
-  REPETITIONS=3 IMU_TOPIC=/imu0 CAMERA_TOPIC=/cam0/image_raw \
-  scripts/run_ros2_bag_eval.sh /absolute/path/to/ros2-bag
-```
-
-The adapter, rosbag player, pipeline dispatchers, and loader remain on the
-housekeeping CPU; only callback workers and optional matched hogs use the
-experimental CPU. Playback is fixed at rate 1.0. The result directory records
-the bag-file hash manifest, topics, QoS inspection, playback contract, kernel
-command line, source revision, dirty state, and binary hashes. A successful
-plumbing run is still exploratory and does not create a performance snapshot.
+Inputs and outputs use reliable, volatile, keep-last QoS with depth 1000.
+The harness creates matching playback overrides and inspects endpoints.
+For manual plumbing checks, set `imu_input` and `camera_input` ROS parameters,
+start the pipeline with `--input external --source-start-ns SOURCE_EPOCH_NS`,
+and start playback only after both consumers are ready. Use the harness for
+measured comparisons.
