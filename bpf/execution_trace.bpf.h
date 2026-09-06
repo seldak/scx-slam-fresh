@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /* Opt-in observations only. No dispatch, slice, or scheduling-state mutation. */
 const volatile int execution_trace_cpu = -1;
 static u64 execution_imu_key;

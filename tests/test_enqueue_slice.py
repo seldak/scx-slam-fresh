@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-2.0-only
 """Compile the production slice helper on the host; no BPF privileges needed."""
 
 import os

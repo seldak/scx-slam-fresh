@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Estimator lane/perf report tests; all inputs are synthetic."""
 
 import importlib.util

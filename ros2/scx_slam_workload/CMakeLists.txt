@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.16)
 project(scx_slam_workload VERSION 0.1.0 LANGUAGES CXX)
 
@@ -90,5 +91,8 @@ if(BUILD_TESTING)
     TIMEOUT 5
   )
 endif()
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../LICENSE"
+  DESTINATION share/${PROJECT_NAME})
 
 ament_package()

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: MIT */
 /*
  * slam_pipeline_demo: synthetic robotics pipeline stress test for scx_slam_fresh.
  *

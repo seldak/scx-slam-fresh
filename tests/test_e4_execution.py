@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Synthetic switch streams only; these tests are not scheduler evidence."""
 
 from copy import deepcopy

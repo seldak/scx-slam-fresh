@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Correlate estimator lane records with standard perf reports, not a switch tracer."""
 
 import csv

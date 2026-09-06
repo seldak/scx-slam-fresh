@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * scx_slam_fresh: freshness-aware sched_ext scheduler for SLAM-ish pipelines.
  *

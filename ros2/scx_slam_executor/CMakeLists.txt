@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 cmake_minimum_required(VERSION 3.16)
 project(scx_slam_executor VERSION 0.1.0 LANGUAGES C CXX)
 
@@ -86,4 +87,7 @@ endif()
 
 ament_export_targets(export_scx_slam_executor HAS_LIBRARY_TARGET)
 ament_export_dependencies(rclcpp)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../LICENSE"
+  DESTINATION share/${PROJECT_NAME})
+
 ament_package()

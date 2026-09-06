@@ -100,3 +100,9 @@ matched evaluations.
 Upstream references:
 [Linux sched_ext](https://docs.kernel.org/scheduler/sched-ext.html),
 [reference schedulers](https://github.com/sched-ext/scx).
+
+## License
+
+Application code, the client API, and documentation are MIT-licensed. The
+BPF scheduler and its loader remain GPL-2.0-only. See [licensing](LICENSING.md)
+for the file boundary and dependency notices.

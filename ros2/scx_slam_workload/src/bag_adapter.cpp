@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 #include <rclcpp/rclcpp.hpp>
 #include <scx_slam_msgs/msg/stamped_job.hpp>

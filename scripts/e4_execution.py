@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Loss-checked execution timelines. Synthetic tests are not E4 evidence."""
 
 from collections import defaultdict

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Inspect the built loader's embedded object without BPF load/attach privileges."""
 
 import os

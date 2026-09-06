@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Exercise the actual harness assertions without starting ROS or sched_ext."""
 import pathlib
 import re

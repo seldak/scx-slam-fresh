@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 #include <gtest/gtest.h>
 #include <scx_slam_workload/bag_adapter.hpp>

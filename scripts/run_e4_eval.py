@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Fixed-window E4 sweep and isolated diagnostic A/Bs; no regime verdicts."""
 
 import argparse

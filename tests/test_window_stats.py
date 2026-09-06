@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 """Non-root, single-core checks of the real demo's cutoff and drain counters."""
 
 import importlib.util
