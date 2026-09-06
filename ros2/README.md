@@ -144,7 +144,7 @@ The harness runs CFS followed by hinted partial-switch SCX. Useful controls:
 | `REPETITIONS` / `HOG_THREADS` | `3` / `0` | Runs per policy and contenders per run. |
 | `IMU_TOPIC` | `/imu0` | Bag IMU topic. |
 | `CAMERA_TOPIC` | `/cam0/image_raw` | Bag image topic. |
-| `DEADLINE_GRACE_US` | `1000` | BPF grace for unowned clients; executor expiry has no grace. |
+| `DEADLINE_GRACE_US` | unset | Historical age-demotion schedulers only (default 1000 there). Rejected by the harness with application-owned expiry. |
 | `BE_SLICE_CAP_US` | `0` | Optional BE insertion cap in microseconds; zero disables it. |
 | `HINTED_ONLY` | `0` | Set to one to skip CFS. |
 | `SCX_VARIANT` | `hinted` | `hinted`, `imu-only`, or `fe-only`. |

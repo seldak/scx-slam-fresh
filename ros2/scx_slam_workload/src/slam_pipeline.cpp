@@ -602,7 +602,9 @@ int main(int argc, char ** argv)
         auto result = options.input_mode == "external" ?
           profile(stage, class_id, deadline_us, stale_us, budget_us) :
           stage_profile(hint_mode, stage, class_id, deadline_us, stale_us, budget_us);
-        result.reject_expired = options.input_mode == "external";
+        // This workload retains every IMU sample; the executor does not infer
+        // admission policy from its service class or sensor identity.
+        result.reject_expired = options.input_mode == "external" && stage != SLAM_STAGE_IMU_PREINT;
         return result;
       };
 

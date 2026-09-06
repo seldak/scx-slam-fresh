@@ -17,6 +17,28 @@ MATCH = re.search(r"^assert_matched_source_windows\(\) \{\n.*?^\}", SCRIPT,
 
 
 class BagAccounting(unittest.TestCase):
+    def test_expiry_options_match_loaded_policy(self):
+        configure = re.search(r"^configure_expiry\(\) \{\n.*?^\}", SCRIPT,
+                              re.M | re.S).group()
+        command = configure + '''
+deadline_grace_us=$2
+configure_expiry "$1" || exit $?
+printf '%s|%s|%s' "$expiry_policy" "$deadline_grace_us" "${deadline_grace_args[*]}"
+'''
+        for config, grace, expected in (
+            ("expiry_policy=application", "", "application|not_applicable|"),
+            ("deadline_grace_us=1000", "", "scheduler_age_demotion|1000|--deadline-grace-us 1000"),
+            ("deadline_grace_us=1000", "0", "scheduler_age_demotion|0|--deadline-grace-us 0"),
+        ):
+            result = subprocess.run(["bash", "-c", command, "test", config, grace],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected)
+        result = subprocess.run(["bash", "-c", command, "test", "expiry_policy=application", "1000"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unset DEADLINE_GRACE_US", result.stderr)
+
     def test_ablation_validator_checks_all_cells_and_hog_windows(self):
         driver = (pathlib.Path(__file__).resolve().parents[1] /
                   "scripts/run_ros2_bag_ablation.sh").read_text()

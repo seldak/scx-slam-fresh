@@ -452,6 +452,13 @@ def parse_trace(text, metrics, cpu, mode):
     return events, summary
 
 
+def expiry_configuration(config, grace_probe=False):
+    application_owned = "expiry_policy=application" in config
+    if application_owned and grace_probe:
+        raise ValueError("the grace probe requires the historical age-demotion scheduler")
+    return "application" if application_owned else "scheduler_age_demotion"
+
+
 def run_one_case(case, args, output):
     if read_state("state") != "disabled":
         raise RuntimeError("another scheduler became active; refusing to replace it")
@@ -462,11 +469,16 @@ def run_one_case(case, args, output):
         config = subprocess.check_output(
             [str(build / "scx_slam_fresh_user"), "--print-config"], text=True)
         generic = "urgent_preempt=" in config
+        expiry_policy = expiry_configuration(config, args.grace_probe)
+        case["expiry_policy"] = expiry_policy
+        if expiry_policy == "application":
+            case["deadline_grace_us"] = "not_applicable"
         loader_command = ["stdbuf", "-oL", "-eL", str(build / "scx_slam_fresh_user"),
                           "--pin", str(pin_dir),
-                          "--urgent-preempt" if generic else "--imu-preempt", case["imu_preempt"],
-                          "--deadline-grace-us", str(case.get("deadline_grace_us",
-                                                               DEFAULT_DEADLINE_GRACE_US))]
+                          "--urgent-preempt" if generic else "--imu-preempt", case["imu_preempt"]]
+        if expiry_policy != "application":
+            loader_command.extend(["--deadline-grace-us", str(case.get(
+                "deadline_grace_us", DEFAULT_DEADLINE_GRACE_US))])
         if args.preempt_probe:
             loader_command.extend(["--trace-urgent", "--trace-worker-name", "imu_prop"]
                                   if generic else ["--trace-imu"])
@@ -655,6 +667,11 @@ def main():
         if not (build / name).is_file():
             parser.error(f"missing binary artifact: {build / name}")
     ops_flags = check_embedded_mode(build / "scx_slam_fresh_user")
+    config = subprocess.check_output([str(build / "scx_slam_fresh_user"), "--print-config"], text=True)
+    try:
+        expiry_configuration(config, args.grace_probe)
+    except ValueError as error:
+        parser.error(str(error))
     output = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix="scx-e4-"))
     if args.output:
         output.mkdir(parents=True, exist_ok=False)

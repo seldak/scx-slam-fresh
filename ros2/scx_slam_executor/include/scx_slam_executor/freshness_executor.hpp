@@ -23,7 +23,8 @@ struct CallbackProfile
   uint64_t slice_ns{0};
   uint32_t weight{0};
   // Opt in only for message-aware subscriptions. Deadline and stale age bound
-  // admission (no grace); accepted callbacks retain ownership through cleanup.
+  // admission (no grace) in any service class. This stays in userspace;
+  // accepted callbacks retain ownership through cleanup.
   bool reject_expired{false};
 };
 

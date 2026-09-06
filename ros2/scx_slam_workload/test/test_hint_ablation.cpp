@@ -14,7 +14,7 @@ TEST(HintAblation, CameraProjectionDoesNotChangeAdmissionHint)
   original.deadline_ts_ns = 1033000000;
   original.stale_ns = 66000000;
   original.budget_ns = 10000000;
-  original.flags = FRESH_HINT_EXECUTOR_OWNED;
+  original.flags = 0;
   const auto saved = original;
   const auto a = scx_slam_workload::project_hint(original, "imu-only");
   EXPECT_EQ(std::memcmp(&saved, &original, sizeof(original)), 0);
@@ -48,7 +48,7 @@ TEST(HintAblation, ImuAdmissionAndAgeProtectionSurviveRemovalOfDedicatedLane)
   EXPECT_EQ(b.deadline_ts_ns, imu.deadline_ts_ns);
   EXPECT_EQ(b.stale_ns, imu.stale_ns);
   EXPECT_EQ(b.budget_ns, imu.budget_ns);
-  EXPECT_EQ(b.flags, FRESH_HINT_EXECUTOR_OWNED);
+  EXPECT_EQ(b.flags, 0U);
   EXPECT_EQ(imu.flags, 0U);
 }
 

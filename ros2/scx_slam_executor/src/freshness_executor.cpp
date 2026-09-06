@@ -143,7 +143,8 @@ struct FreshnessExecutor::Impl
     PendingWork & operator=(const PendingWork &) = delete;
     PendingWork(PendingWork && other) noexcept
     : executable(other.executable), hint(other.hint), message(std::move(other.message)),
-      message_info(std::move(other.message_info)), observer(std::move(other.observer))
+      message_info(std::move(other.message_info)), observer(std::move(other.observer)),
+      reject_expired(other.reject_expired)
     {
       // AnyExecutable has a destructor but no move constructor. Its implicit
       // copy would let a moved-from destructor release our group's ownership.
@@ -154,6 +155,7 @@ struct FreshnessExecutor::Impl
     std::shared_ptr<void> message;
     std::unique_ptr<rclcpp::MessageInfo> message_info;
     MessageObserver observer;
+    bool reject_expired{false};
   };
 
   explicit Impl(std::shared_ptr<HintSink> sink, WorkerConfig config)
@@ -216,16 +218,13 @@ struct FreshnessExecutor::Impl
     hint.budget_ns = profile.budget_ns;
     hint.slice_ns = profile.slice_ns;
     hint.weight = profile.weight;
-    if (metadata && profile.reject_expired && profile.class_id != FRESH_CLASS_URGENT) {
-      hint.flags |= FRESH_HINT_EXECUTOR_OWNED;
-    }
     return hint;
   }
 
   static bool expired(const PendingWork & work)
   {
     const auto & h = work.hint;
-    if (!(h.flags & FRESH_HINT_EXECUTOR_OWNED)) {
+    if (!work.reject_expired) {
       return false;
     }
     const auto now = monotonic_now_ns();
@@ -483,6 +482,7 @@ void FreshnessExecutor::spin()
                     "message metadata must contain nonzero job_id and release_ts_ns");
           }
           work.hint = impl_->make_hint(binding.profile, metadata);
+          work.reject_expired = binding.profile.reject_expired;
           work.observer = binding.observer;
           if (work.observer) {
             work.observer(work.message, MessageEvent::Selected);

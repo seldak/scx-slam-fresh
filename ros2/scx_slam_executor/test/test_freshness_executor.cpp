@@ -388,7 +388,7 @@ TEST_F(AdmissionTest, ReleasesMessageAndGroupWhenDropObserverThrows)
 TEST_F(AdmissionTest, RechecksAfterHandoffDelayWithoutRunningExpiredCallback)
 {
   sink->after_publish = [](const fresh_task_hint & hint) {
-      EXPECT_NE(hint.flags & FRESH_HINT_EXECUTOR_OWNED, 0U);
+      EXPECT_EQ(hint.flags, 0U);  // Admission does not require a kernel flag.
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
     };
   unsigned selected = 0, dropped = 0;
@@ -409,7 +409,7 @@ TEST_F(AdmissionTest, KeepsInFlightIdentityAndBudgetThroughLateCallbackTail)
   run([&](Message::SharedPtr message) {
       const auto before = sink->hints().back();
       EXPECT_FALSE(group->can_be_taken_from().load());
-      EXPECT_NE(before.flags & FRESH_HINT_EXECUTOR_OWNED, 0U);
+      EXPECT_EQ(before.flags, 0U);
       EXPECT_EQ(before.budget_ns, profile.budget_ns);
       if (message->data[0] == 1) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -424,18 +424,38 @@ TEST_F(AdmissionTest, KeepsInFlightIdentityAndBudgetThroughLateCallbackTail)
   EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 2, 0}));
 }
 
-TEST_F(AdmissionTest, UrgentRemainsExemptFromAdmissionEviction)
+TEST_F(AdmissionTest, ApplicationCanRetainExpiredWork)
 {
   profile.stage_id = 12345;
-  profile.class_id = FRESH_CLASS_URGENT;
+  profile.reject_expired = false;
   unsigned completed = 0;
   run([&](Message::SharedPtr) {
-      EXPECT_EQ(sink->hints().back().flags & FRESH_HINT_EXECUTOR_OWNED, 0U);
+      EXPECT_EQ(sink->hints().back().flags, 0U);
       if (++completed == 2) {executor->cancel();}
     }, [](const std::shared_ptr<void> &, scx_slam_executor::MessageEvent event) {
       EXPECT_EQ(event, scx_slam_executor::MessageEvent::Selected);
     }, 2);
   EXPECT_EQ(completed, 2U);
+}
+
+TEST_F(AdmissionTest, ApplicationCanExpireUrgentWork)
+{
+  profile.class_id = FRESH_CLASS_URGENT;
+  unsigned dropped = 0, completed = 0;
+  run([&](Message::SharedPtr message) {
+      EXPECT_EQ(message->data[0], 2U);
+      EXPECT_EQ(dropped, 1U);
+      completed++;
+      executor->cancel();
+    }, [&](const std::shared_ptr<void> &, scx_slam_executor::MessageEvent event) {
+      if (event == scx_slam_executor::MessageEvent::DroppedBeforeStart) {
+        dropped++;
+        EXPECT_TRUE(sink->hints().empty());
+      }
+    }, 2);
+  EXPECT_EQ(completed + dropped, 2U);
+  EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{2, 0}));
+  EXPECT_TRUE(group->can_be_taken_from().load());
 }
 
 TEST_F(AdmissionTest, ReplacesCompletedSlotDirectlyAndClearsOnShutdown)

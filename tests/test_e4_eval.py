@@ -415,6 +415,13 @@ class E4Tests(unittest.TestCase):
         events, _ = e4.parse_trace(at_cutoff + summary, metrics, 0, "wakeup")
         self.assertEqual(events[0]["phase"], "drain")
 
+    def test_grace_probe_requires_age_demotion(self):
+        self.assertEqual(e4.expiry_configuration("expiry_policy=application"), "application")
+        self.assertEqual(e4.expiry_configuration("deadline_grace_us=1000", True),
+                         "scheduler_age_demotion")
+        with self.assertRaisesRegex(ValueError, "historical age-demotion"):
+            e4.expiry_configuration("expiry_policy=application", True)
+
     def test_changed_scheduler_rejected(self):
         loader = Mock()
         loader.poll.return_value = None

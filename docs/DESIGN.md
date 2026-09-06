@@ -8,7 +8,8 @@ single hint describing that selection and routes the worker accordingly.
 
 The BPF scheduler, loader, and MIT client API live in the external `scx_fresh`
 repository. This repository owns the workload, ROS adapter, and evaluation.
-The version 2 hint ABI selects Urgent, Deadline or Background service explicitly.
+The version 3 hint ABI selects Urgent, Deadline or Background service explicitly
+and leaves expiry to the application.
 The application assigns IMU propagation to Urgent, vision and estimation to
 Deadline, and mapping to Background. Sensor IDs remain application diagnostics;
 they no longer select a scheduler route.
@@ -61,12 +62,12 @@ and cleanup requirements.
 
 ## CPU scheduling
 
-The custom dispatch queues are served in order: IMU, FE, BE, STALE.
-A waking IMU worker can preempt through direct local insertion. FE ordering
+The custom dispatch queues are served in order: Urgent, Deadline, Background.
+A waking Urgent worker can preempt through direct local insertion. Deadline ordering
 alone does not interrupt the currently running slice; this is why background
 slice length affects a multi-hop callback chain.
 
-The [scheduler reference](DESIGN_SCHED_ALGO.md) defines the age exemptions,
+The [scheduler reference](DESIGN_SCHED_ALGO.md) defines deadline ordering,
 budget demotion, default slices, and optional BE cap. These rules schedule
 threads, not messages.
 

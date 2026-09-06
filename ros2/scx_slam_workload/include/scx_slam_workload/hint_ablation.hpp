@@ -23,9 +23,7 @@ inline fresh_task_hint project_hint(const fresh_task_hint & original, const std:
   } else if (mode == "fe-only" && hint.stage_id == SLAM_STAGE_IMU_PREINT) {
     hint.stage_id = SLAM_STAGE_MISC;
     hint.class_id = FRESH_CLASS_DEADLINE;
-    // Preserve the real IMU's age-demotion exemption without its DSQ/preempt
-    // route. Otherwise this ablation would reintroduce the ownership lock.
-    hint.flags |= FRESH_HINT_EXECUTOR_OWNED;
+    // Admission remains a runtime decision, independent of this projection.
   }
   return hint;
 }

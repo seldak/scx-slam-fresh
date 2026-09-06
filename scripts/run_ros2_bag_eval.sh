@@ -18,7 +18,7 @@ bag_offset=${BAG_OFFSET:-0}
 repetitions=${REPETITIONS:-3}
 hog_threads=${HOG_THREADS:-0}
 ext_policy=${EXT_POLICY:-7}
-deadline_grace_us=${DEADLINE_GRACE_US:-1000}
+deadline_grace_us=${DEADLINE_GRACE_US:-}
 be_slice_cap_us=${BE_SLICE_CAP_US:-0}
 hinted_only=${HINTED_ONLY:-0}
 scx_variant=${SCX_VARIANT:-hinted}
@@ -42,7 +42,7 @@ Run 'make && make ros2 && make test-ros2' as your normal user first.
 Defaults:
   CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 BAG_OFFSET=0
   REPETITIONS=3 HOG_THREADS=0 EXT_POLICY=7
-  DEADLINE_GRACE_US=1000
+  DEADLINE_GRACE_US=unset (historical age-demotion schedulers only)
   BE_SLICE_CAP_US=0 (disabled) HINTED_ONLY=0
   SCX_VARIANT=hinted (hinted, imu-only, or fe-only)
   BASELINE_DIR= (optional previous results for source-window comparison)
@@ -351,13 +351,17 @@ if (( cpu == housekeeping_cpu )); then
     exit 2
 fi
 for value in "$cpu" "$housekeeping_cpu" "$duration" "$warmup" "$bag_offset" \
-    "$repetitions" "$hog_threads" "$ext_policy" "$deadline_grace_us" \
+    "$repetitions" "$hog_threads" "$ext_policy" \
     "$be_slice_cap_us" "$hinted_only"; do
     if [[ ! $value =~ ^[0-9]+$ ]]; then
         echo "error: numeric options must contain non-negative integers" >&2
         exit 2
     fi
 done
+if [[ -n $deadline_grace_us && ! $deadline_grace_us =~ ^[0-9]+$ ]]; then
+    echo "error: DEADLINE_GRACE_US must be a non-negative integer" >&2
+    exit 2
+fi
 if [[ $hinted_only != 0 && $hinted_only != 1 ]]; then
     echo "error: HINTED_ONLY must be 0 or 1" >&2
     exit 2
@@ -409,7 +413,26 @@ source "$ros_setup"
 source "$local_setup"
 set -u
 
+configure_expiry() {
+    local config=$1
+    deadline_grace_args=()
+    if [[ $config == *"expiry_policy=application"* ]]; then
+        expiry_policy=application
+        if [[ -n $deadline_grace_us ]]; then
+            echo "error: unset DEADLINE_GRACE_US; expiry is application-owned in this scheduler" >&2
+            return 2
+        fi
+        deadline_grace_us=not_applicable
+    else
+        expiry_policy=scheduler_age_demotion
+        deadline_grace_us=${deadline_grace_us:-1000}
+        deadline_grace_args=(--deadline-grace-us "$deadline_grace_us")
+    fi
+}
+
 ops_flags=$("$loader_bin" --print-ops-flags)
+loader_config=$("$loader_bin" --print-config)
+configure_expiry "$loader_config"
 if [[ ! $ops_flags =~ ^0x[0-9a-fA-F]+$ ]] || (( (ops_flags & 8) == 0 )); then
     echo "error: embedded ops_flags=$ops_flags lacks SCX_OPS_SWITCH_PARTIAL" >&2
     exit 1
@@ -473,6 +496,7 @@ duration=$duration
 warmup=$warmup
 hog_threads=$hog_threads
 ext_policy=$ext_policy
+expiry_policy=$expiry_policy
 deadline_grace_us=$deadline_grace_us
 be_slice_cap_us=$be_slice_cap_us
 hinted_only=$hinted_only
@@ -500,7 +524,7 @@ if (( ! hinted_only )); then
 fi
 
 taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" \
-    --deadline-grace-us "$deadline_grace_us" \
+    "${deadline_grace_args[@]}" \
     --be-slice-cap-us "$be_slice_cap_us" \
     >"$output_dir/loader.txt" 2>&1 &
 loader_pid=$!
