@@ -55,14 +55,82 @@ The pipeline accepts `--worker-cpu`, `--ext-policy`, `--pin`,
 `--hint-mode`, `--hog`, and `--window-stats`. Its compute costs are synthetic,
 including when sensor input comes from a bag.
 
+## Prepare EuRoC MH_01_easy
+
+The recorded evaluation uses the Machine Hall 01 easy sequence from the
+[EuRoC MAV dataset](https://doi.org/10.3929/ethz-b-000690084).
+Start with its ROS 1 `.bag`, not the ZIP of images and CSV files. The commands
+below use the same [public mirror](https://huggingface.co/datasets/kavehsgh/EuRoC_MAV_Dataset_Machine_Hall_Easy_01)
+and pinned revision used for the evaluation. Allow about 5 GB for the download,
+converted bag, and conversion tools.
+
+### Download and verify
+
+Run these commands as your normal user. They store the data separately from
+the checkout and can resume an interrupted download:
+
+```bash
+euroc_dir="$HOME/datasets/euroc"
+mkdir -p "$euroc_dir"
+curl --fail --location --retry 3 --continue-at - \
+  --output "$euroc_dir/MH_01_easy.bag" \
+  'https://huggingface.co/datasets/kavehsgh/EuRoC_MAV_Dataset_Machine_Hall_Easy_01/resolve/19434bff2188ded1943d3a01d5b5e6672afb117e/MH_01_easy.bag'
+printf '%s  %s\n' \
+  '57f440ccd68ec8dc8f9461269f5909656b86198bac3adfd677b1fcc7a1428fa9' \
+  "$euroc_dir/MH_01_easy.bag" | sha256sum --check
+```
+
+Continue only when the checksum reports `OK`. The source file is 2,673,818,914
+bytes. The mirror is a download source; ETH Zurich is the dataset publisher.
+
+### Convert to ROS 2 MCAP
+
+[Rosbags](https://ternaris.gitlab.io/rosbags/topics/convert.html) converts the
+messages offline, without a ROS 1 installation or a running bridge. Install
+the version used for the recorded conversion in a separate Python environment
+(`python3-venv` is needed on Debian/Ubuntu):
+
+```bash
+python3 -m venv "$HOME/.venvs/euroc-tools"
+"$HOME/.venvs/euroc-tools/bin/python" -m pip install 'rosbags==0.11.5'
+"$HOME/.venvs/euroc-tools/bin/rosbags-convert" \
+  --src "$euroc_dir/MH_01_easy.bag" \
+  --dst "$euroc_dir/MH_01_easy_ros2_mcap" \
+  --dst-storage mcap --dst-version 9 --dst-typestore ros2_lyrical \
+  --include-topic /imu0 /cam0/image_raw
+```
+
+The destination must not already exist. This produces a ROS 2 bag directory
+containing `metadata.yaml` and an MCAP file. Only IMU and the left camera are
+included; this graph does not consume the right camera or ground truth.
+
+### Check the converted input
+
+From the repository root, using the same shell:
+
+```bash
+source /opt/ros/lyrical/setup.bash
+ros2 bag info "$euroc_dir/MH_01_easy_ros2_mcap"
+python3 scripts/ros2_bag_source_epoch.py \
+  "$euroc_dir/MH_01_easy_ros2_mcap" /imu0 /cam0/image_raw
+```
+
+If MCAP storage support is missing, install `ros-lyrical-rosbag2-storage-mcap`.
+Expected results are storage `mcap`, duration about 184.043 seconds,
+36,820 `sensor_msgs/msg/Imu` messages on `/imu0`, and 3,682
+`sensor_msgs/msg/Image` messages on `/cam0/image_raw`. The epoch script must print
+`1403636579758555500`. This is the sensor header epoch, not the bag's storage
+start time. The [evaluation report](../docs/evaluation/euroc.md) records the
+converted MCAP checksum and exact measured window.
+
 ## Bag evaluation
 
-Keep datasets outside the repository. Build as the normal user, then run:
+After preparing the bag and building the workspace, run:
 
 ```bash
 sudo env CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 \
   REPETITIONS=3 HOG_THREADS=0 \
-  scripts/run_ros2_bag_eval.sh /absolute/path/to/ros2-bag
+  scripts/run_ros2_bag_eval.sh "$HOME/datasets/euroc/MH_01_easy_ros2_mcap"
 ```
 
 The harness runs CFS followed by hinted partial-switch SCX. Useful controls:
