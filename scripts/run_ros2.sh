@@ -5,6 +5,7 @@ set -eo pipefail
 
 mode="${1:-build}"
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+scx_fresh_dir="${SCX_FRESH_DIR:-$repo_dir/../scx_fresh}"
 ros_setup="${ROS2_SETUP:-/opt/ros/lyrical/setup.bash}"
 expected_distro="${ROS2_DISTRO_EXPECTED:-lyrical}"
 
@@ -55,6 +56,7 @@ build_args=(
     --build-base "$repo_dir/.ros2-build"
     --install-base "$repo_dir/.ros2-install"
     --symlink-install
+    --cmake-args "-DSCX_FRESH_DIR=$scx_fresh_dir"
 )
 
 colcon --log-base "$repo_dir/.ros2-log" build "${build_args[@]}"

@@ -8,6 +8,15 @@ find_path(LIBBPF_INCLUDE_DIR bpf/bpf.h REQUIRED)
 find_library(LIBBPF_LIBRARY bpf REQUIRED)
 
 get_filename_component(SCX_SLAM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+if(DEFINED ENV{SCX_FRESH_DIR})
+  set(SCX_FRESH_DEFAULT "$ENV{SCX_FRESH_DIR}")
+else()
+  set(SCX_FRESH_DEFAULT "${SCX_SLAM_ROOT}/../scx_fresh")
+endif()
+set(SCX_FRESH_DIR "${SCX_FRESH_DEFAULT}" CACHE PATH "External scx_fresh source checkout")
+if(NOT EXISTS "${SCX_FRESH_DIR}/src/slamqos.c")
+  message(FATAL_ERROR "Set SCX_FRESH_DIR to the scx_fresh checkout")
+endif()
 set(SCX_SLAM_BUILD_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/include/scx_slam_executor")
 
 # Present the existing public API through the same namespaced include layout in
@@ -15,22 +24,22 @@ set(SCX_SLAM_BUILD_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/include/scx_slam_executo
 # around the standalone library instead of maintaining a second copy of it.
 file(MAKE_DIRECTORY "${SCX_SLAM_BUILD_INCLUDE}")
 configure_file(
-  "${SCX_SLAM_ROOT}/src/slamqos.h"
+  "${SCX_FRESH_DIR}/src/slamqos.h"
   "${SCX_SLAM_BUILD_INCLUDE}/slamqos.h"
   COPYONLY
 )
 configure_file(
-  "${SCX_SLAM_ROOT}/include/scx_slam_fresh_shared.h"
+  "${SCX_FRESH_DIR}/include/scx_slam_fresh_shared.h"
   "${SCX_SLAM_BUILD_INCLUDE}/scx_slam_fresh_shared.h"
   COPYONLY
 )
 configure_file(
-  "${SCX_SLAM_ROOT}/include/scx_execution_trace.h"
+  "${SCX_FRESH_DIR}/include/scx_execution_trace.h"
   "${SCX_SLAM_BUILD_INCLUDE}/scx_execution_trace.h"
   COPYONLY
 )
 
-add_library(slamqos SHARED "${SCX_SLAM_ROOT}/src/slamqos.c")
+add_library(slamqos SHARED "${SCX_FRESH_DIR}/src/slamqos.c")
 add_library(scx_slam_executor::slamqos ALIAS slamqos)
 target_compile_features(slamqos PUBLIC c_std_11)
 target_include_directories(slamqos
@@ -38,8 +47,8 @@ target_include_directories(slamqos
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
     "$<INSTALL_INTERFACE:include>"
   PRIVATE
-    "${SCX_SLAM_ROOT}/src"
-    "${SCX_SLAM_ROOT}/include"
+    "${SCX_FRESH_DIR}/src"
+    "${SCX_FRESH_DIR}/include"
     "${LIBBPF_INCLUDE_DIR}"
 )
 target_link_libraries(slamqos PUBLIC "${LIBBPF_LIBRARY}")

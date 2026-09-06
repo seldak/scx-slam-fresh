@@ -16,7 +16,9 @@ make test-ros2
 The helper sources `/opt/ros/lyrical/setup.bash` by default. Set `ROS2_SETUP`
 for another installation path. It rejects an active non-Lyrical overlay.
 The executor links libslamqos and needs the same libbpf development dependency
-as the standalone build.
+as the standalone build. Its client sources and ABI headers come from the
+external `scx_fresh` checkout, selected by `SCX_FRESH_DIR` (default:
+`../scx_fresh`). The ROS adapter remains here; it does not embed the scheduler.
 
 Generated state stays in the ignored `.ros2-build`, `.ros2-install`, and
 `.ros2-log` directories.

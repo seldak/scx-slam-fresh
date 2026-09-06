@@ -6,8 +6,12 @@ This page covers additional controls. ROS and bag commands are in the
 
 ## Build modes
 
-`make` generates a BTF header, compiles the BPF object, generates its skeleton,
-and builds the loader and standalone demo. ROS is not required.
+`make` builds the external `scx_fresh` checkout and the local standalone demo.
+Set `SCX_FRESH_DIR` to select the checkout; the default is `../scx_fresh`.
+The ignored local build directory contains copies of scheduler artifacts under
+their legacy names so existing evaluation commands continue to work. ROS is
+not required. `make test-scheduler-mode` and `make test-slice` run the external
+scheduler's tests.
 
 Check the embedded scheduler mode without attaching:
 
@@ -18,10 +22,11 @@ make test-scheduler-mode
 
 Default builds report `0x8` (partial switch). A full-switch build reports zero
 and is rejected by the evaluation runners. For an explicit full-switch test
-build, use `make clean` followed by `make SLAM_FULL_SWITCH=1`. This places all
+build, clean both the external scheduler build and the local build before
+running `make SLAM_FULL_SWITCH=1`. This places all
 eligible tasks under sched_ext and is outside the validated evaluation setup.
-Return to a clean default build afterward. Make does not track command-line
-flag changes; alternatively use a separate `BUILD_DIR`.
+Return to clean default builds afterward. Make does not track command-line
+flag changes. The local `BUILD_DIR` does not select a different external build.
 
 The loader pins `task_hints` and the `events` ring buffer beneath the supplied
 pin directory. In partial mode, workers must enter `SCHED_EXT`; the demo accepts

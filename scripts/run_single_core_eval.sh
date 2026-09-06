@@ -306,7 +306,7 @@ if [[ "$repo_dir/build/scx_slam_fresh.skel.h" -nt "$loader_bin" ]]; then
 fi
 
 if [[ "$repo_dir/demo/slam_pipeline_demo.cpp" -nt "$demo_bin" ]] ||
-   [[ "$repo_dir/src/slamqos.c" -nt "$demo_bin" ]]; then
+   [[ "${SCX_FRESH_DIR:-$repo_dir/../scx_fresh}/src/slamqos.c" -nt "$demo_bin" ]]; then
     echo "error: demo binary is older than its sources; run 'make' first" >&2
     exit 1
 fi
@@ -332,6 +332,7 @@ if [[ $eval_scope != e0 ]] && (( (ops_flags & 8) == 0 )); then
 fi
 
 mkdir -p -- "$output_dir"
+cp "$repo_dir/build/scx_fresh.revision" "$repo_dir/build/scx_fresh.diff" "$output_dir/"
 trap cleanup EXIT INT TERM
 
 if [[ $eval_scope == all ]]; then

@@ -9,7 +9,7 @@ describes one selected job.
 
 ## Functions
 
-Declarations are in `src/slamqos.h`; the shared layout is
+In the external `scx_fresh` checkout, declarations are in `src/slamqos.h`; the shared layout is
 `struct slam_task_hint` in `include/scx_slam_fresh_shared.h`.
 
 | Function | Use |

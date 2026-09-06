@@ -142,6 +142,7 @@ if [[ ! $ops_flags =~ ^0x[0-9a-fA-F]+$ ]] || (( (ops_flags & 8) == 0 )); then
 fi
 
 mkdir -p -- "$output_dir" "$pin_dir"
+cp "$repo_dir/build/scx_fresh.revision" "$repo_dir/build/scx_fresh.diff" "$output_dir/"
 trap cleanup EXIT INT TERM
 
 cat >"$output_dir/environment.txt" <<EOF

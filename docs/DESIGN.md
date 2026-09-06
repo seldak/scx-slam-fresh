@@ -6,6 +6,11 @@ single hint describing that selection and routes the worker accordingly.
 
 ## Components
 
+The BPF scheduler, loader, and MIT client API live in the external `scx_fresh`
+repository. This repository owns the workload, ROS adapter, and evaluation.
+The extraction preserves the existing policy and ABI; sensor-independent
+profiles are a separate change.
+
 | Component | Responsibility |
 | --- | --- |
 | BPF scheduler | Route runnable workers, account execution, apply budget and age rules. |

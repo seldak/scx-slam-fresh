@@ -1,8 +1,8 @@
 # scx-slam-fresh
 
-An experimental Linux `sched_ext` scheduler for sensor-processing pipelines.
-Userspace selects a job and publishes its scheduling metadata before waking
-the worker. The BPF scheduler uses that hint to choose CPU service.
+Application integration and evaluation for the external `scx_fresh` Linux
+`sched_ext` scheduler. Userspace selects a job and publishes its scheduling
+metadata before waking the worker.
 
 The repository includes a standalone synthetic workload and an optional ROS 2
 executor and bag adapter. Neither runs a SLAM estimator; they exercise callback
@@ -50,6 +50,17 @@ renamed kfuncs; kernel/API compatibility still needs checking on other builds.
 
 Typical Debian/Ubuntu packages are `clang`, `llvm`, `bpftool`, `libbpf-dev`,
 `build-essential`, `pkg-config`, `zlib1g-dev`, and `libelf-dev`.
+
+The build requires the separate [scx_fresh](https://github.com/seldak/scx_fresh)
+checkout. It defaults to the sibling
+directory `../scx_fresh`; set `SCX_FRESH_DIR` for another location. No scheduler
+sources are vendored here. The extraction was validated with scheduler revision
+`0426580`. Access to the private scheduler repository is currently required.
+
+```bash
+git clone https://github.com/seldak/scx_fresh.git ../scx_fresh
+git -C ../scx_fresh checkout 0426580
+```
 
 ```bash
 make
@@ -103,6 +114,6 @@ Upstream references:
 
 ## License
 
-Application code, the client API, and documentation are MIT-licensed. The
-BPF scheduler and its loader remain GPL-2.0-only. See [licensing](LICENSING.md)
-for the file boundary and dependency notices.
+This repository's application code and documentation are MIT-licensed. The
+external scheduler and loader remain GPL-2.0-only, with an MIT client API.
+See [licensing](LICENSING.md) for dependency and distribution notices.

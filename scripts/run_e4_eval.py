@@ -20,6 +20,7 @@ import time
 
 
 REPO = Path(__file__).resolve().parents[1]
+SCX_FRESH = Path(os.environ.get("SCX_FRESH_DIR", REPO.parent / "scx_fresh")).resolve()
 STATE = Path("/sys/kernel/sched_ext")
 STAGES = ("imu_prop", "vision_fe", "state_est", "lidar_pre", "lidar_reg", "mapping_be")
 DEFAULT_COSTS = "150,500,1000,2000,3000,4000,4500,4750,5000,5500,6000"
@@ -651,8 +652,13 @@ def main():
     print(f"Results: {output}\n{len(plan)} cases, {args.duration}s of releases each; drain can extend runs.",
           flush=True)
     artifacts = [str(build / name) for name in ("slam_pipeline_demo", "scx_slam_fresh_user", "scx_slam_fresh.bpf.o")]
+    if args.binary_dir is None:
+        for name in ("scx_fresh.revision", "scx_fresh.diff"):
+            artifacts.append(str(build / name))
+            (output / name).write_bytes((build / name).read_bytes())
     artifacts += ["scripts/run_e4_eval.py", "demo/window_metrics.h",
-                 "scripts/e4_execution.py", "bpf/execution_trace.bpf.h", "include/scx_execution_trace.h"]
+                 "scripts/e4_execution.py", str(SCX_FRESH / "bpf/execution_trace.bpf.h"),
+                 str(SCX_FRESH / "include/scx_execution_trace.h")]
     if args.perf_sched:
         artifacts.append("scripts/e4_perf.py")
     environment = {"date": datetime.now(timezone.utc).isoformat(), "kernel": os.uname().release,
@@ -678,7 +684,8 @@ def main():
         (output / "perf-version.txt").write_bytes(subprocess.check_output(["perf", "version"]))
     (output / "runner.py").write_bytes(Path(__file__).read_bytes())
     (output / "window_metrics.h").write_bytes((REPO / "demo/window_metrics.h").read_bytes())
-    for relative in ("scripts/e4_execution.py", "bpf/execution_trace.bpf.h", "include/scx_execution_trace.h"):
+    for relative in ("scripts/e4_execution.py", str(SCX_FRESH / "bpf/execution_trace.bpf.h"),
+                     str(SCX_FRESH / "include/scx_execution_trace.h")):
         (output / Path(relative).name).write_bytes((REPO / relative).read_bytes())
     (output / "source.diff").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO))
     (output / "cpu.txt").write_bytes(subprocess.check_output(["lscpu"]))
