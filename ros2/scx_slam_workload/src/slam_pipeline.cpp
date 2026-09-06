@@ -3,6 +3,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <scx_slam_executor/freshness_executor.hpp>
 #include <scx_slam_msgs/msg/stamped_job.hpp>
+#include <scx_slam_workload/hint_ablation.hpp>
+#include <scx_slam_workload/hog_metrics.hpp>
 
 #include <linux/sched/types.h>
 #include <pthread.h>
@@ -427,12 +429,14 @@ void configure_contender(int cpu, int ext_policy)
 
 void run_contender(
   std::atomic<bool> & running, int cpu, int ext_policy,
+  std::vector<uint64_t> & completions,
   std::mutex & error_mutex, std::exception_ptr & background_error)
 {
   try {
     configure_contender(cpu, ext_policy);
     while (running.load(std::memory_order_relaxed)) {
       busy_work_us(1000);
+      completions.push_back(monotonic_ns());
     }
   } catch (...) {
     std::lock_guard<std::mutex> lock(error_mutex);
@@ -494,6 +498,9 @@ int main(int argc, char ** argv)
       hint_sink = std::make_shared<scx_slam_executor::NullHintSink>();
     } else {
       hint_sink = std::make_shared<scx_slam_executor::PinnedMapHintSink>(options.pin_dir);
+    }
+    if (options.input_mode == "external") {
+      hint_sink = std::make_shared<scx_slam_workload::AblationHintSink>(hint_sink, hint_mode);
     }
     const scx_slam_executor::WorkerConfig worker_config{
       options.ext_policy, options.worker_cpu};
@@ -592,8 +599,9 @@ int main(int argc, char ** argv)
       };
     auto admission_profile = [&](uint32_t stage, uint32_t class_id,
       uint64_t deadline_us, uint64_t stale_us, uint64_t budget_us) {
-        auto result = stage_profile(hint_mode, stage, class_id,
-          deadline_us, stale_us, budget_us);
+        auto result = options.input_mode == "external" ?
+          profile(stage, class_id, deadline_us, stale_us, budget_us) :
+          stage_profile(hint_mode, stage, class_id, deadline_us, stale_us, budget_us);
         result.reject_expired = options.input_mode == "external";
         return result;
       };
@@ -723,11 +731,15 @@ int main(int argc, char ** argv)
     }
     std::atomic<bool> contenders_running{true};
     std::vector<std::thread> contenders;
+    std::vector<std::vector<uint64_t>> hog_completions(options.hog_threads);
     contenders.reserve(static_cast<size_t>(options.hog_threads));
     for (int index = 0; index < options.hog_threads; ++index) {
+      hog_completions[index].reserve(
+        static_cast<size_t>(options.duration_s + options.warmup_s + 30) * 1000);
       contenders.emplace_back(
         run_contender, std::ref(contenders_running), options.worker_cpu,
-        options.ext_policy, std::ref(error_mutex), std::ref(background_error));
+        options.ext_policy, std::ref(hog_completions[index]),
+        std::ref(error_mutex), std::ref(background_error));
     }
 
     uint64_t start_ns = 0;
@@ -825,6 +837,12 @@ int main(int argc, char ** argv)
     }
 
     if (options.window_stats) {
+      for (size_t index = 0; index < hog_completions.size(); ++index) {
+        std::cout << "hog_window: index=" << index <<
+          " iterations=" << scx_slam_workload::window_iterations(
+            hog_completions[index], start_ns, end_ns) <<
+          " iteration_work_us=1000 start_ns=" << start_ns << " end_ns=" << end_ns << '\n';
+      }
       print_stats("window_", "imu_prop", expected_imu, window_imu);
       print_stats("window_", "vision_fe", expected_vision, window_vision);
       print_stats("window_", "state_est", expected_estimator, window_estimator);

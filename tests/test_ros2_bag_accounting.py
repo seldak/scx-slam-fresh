@@ -17,6 +17,50 @@ MATCH = re.search(r"^assert_matched_source_windows\(\) \{\n.*?^\}", SCRIPT,
 
 
 class BagAccounting(unittest.TestCase):
+    def test_ablation_validator_checks_all_cells_and_hog_windows(self):
+        driver = (pathlib.Path(__file__).resolve().parents[1] /
+                  "scripts/run_ros2_bag_ablation.sh").read_text()
+        validator = driver.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        import csv
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            stage_fields = ["mode", "repetition", "stage", "offered", "completed",
+                            "dropped_before_start", "dropped_upstream", "unfinished",
+                            "first_source_ts_ns", "last_source_ts_ns", "first_job_id", "last_job_id"]
+            hog_fields = ["mode", "repetition", "hog", "iterations", "iteration_work_us",
+                          "start_ns", "end_ns"]
+            with (root / "summary.tsv").open("w") as stages, (root / "hog-summary.tsv").open("w") as hogs:
+                sw = csv.writer(stages, delimiter="\t")
+                hw = csv.writer(hogs, delimiter="\t")
+                sw.writerow(stage_fields)
+                hw.writerow(hog_fields)
+                for mode in ("hinted", "imu-only", "fe-only"):
+                    for stage in ("imu_prop", "vision_fe", "state_est", "mapping_be"):
+                        count = 3000 if stage == "imu_prop" else 300
+                        sw.writerow([mode, 1, stage, count, count, 0, 0, 0, 100, 200, 1, count])
+                    for hog in (0, 1):
+                        hw.writerow([mode, 1, hog, 5000, 1000, 100, 15000000100])
+                    case = root / (mode + "-1")
+                    case.mkdir()
+                    (case / "environment.txt").write_text(
+                        "source_start_ns=100\nduration=15\nwarmup=3\nhog_threads=2\n"
+                        "cpu=14\nhousekeeping_cpu=1\nbe_slice_cap_us=2000\n"
+                        "deadline_grace_us=1000\nops_flags=0x8\nbag_manifest_sha256=bag\n"
+                        "ros_pipeline_sha256=p\nros_adapter_sha256=a\nloader_sha256=l\nbpf_object_sha256=b\n")
+            def validate():
+                return subprocess.run([sys.executable, "-", str(root), "1"], input=validator,
+                                      capture_output=True, text=True)
+            result = validate()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            path = root / "fe-only-1/environment.txt"
+            path.write_text(path.read_text().replace("ros_pipeline_sha256=p", "ros_pipeline_sha256=changed"))
+            self.assertNotEqual(validate().returncode, 0)
+            path.write_text(path.read_text().replace("ros_pipeline_sha256=changed", "ros_pipeline_sha256=p"))
+            path = root / "hog-summary.tsv"
+            path.write_text(path.read_text().replace("15000000100", "15000000101", 1))
+            self.assertNotEqual(validate().returncode, 0)
+
     def test_hinted_only_windows_match_external_baseline_exactly(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -39,7 +83,7 @@ class BagAccounting(unittest.TestCase):
                     capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, offset == 0, result.stderr)
 
-    def check_case(self, changes=None, adapter_drops=0):
+    def check_case(self, changes=None, adapter_drops=0, case_name="hinted-1"):
         changes = changes or {}
         lines = []
         for stage in ("imu_prop", "vision_fe", "state_est", "mapping_be"):
@@ -60,9 +104,20 @@ class BagAccounting(unittest.TestCase):
                 "adapter_camera: dropped=0\n")
             result = subprocess.run(
                 ["bash", "-c", ASSERT + '\nduration=15\n'
-                 'assert_case_accounting "$1/pipeline" "$1/adapter" hinted-1',
-                 "test", directory], capture_output=True, text=True)
+                 'assert_case_accounting "$1/pipeline" "$1/adapter" "$2"',
+                 "test", directory, case_name], capture_output=True, text=True)
+            if result.returncode:
+                self.assertIn("in " + case_name, result.stderr)
             return result.returncode
+
+    def test_ablation_gate_reports_actual_case_and_keeps_imu_requirement(self):
+        for name in ("hinted-1", "imu-only-2", "fe-only-3"):
+            with self.subTest(name=name):
+                self.assertEqual(self.check_case(case_name=name), 0)
+                self.assertNotEqual(self.check_case(
+                    {"imu_prop": dict(late=1)}, case_name=name), 0)
+        self.assertEqual(self.check_case(
+            {"imu_prop": dict(late=1)}, case_name="cfs-1"), 0)
 
     def test_complete_window(self):
         self.assertEqual(self.check_case(), 0)

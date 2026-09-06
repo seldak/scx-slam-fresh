@@ -937,6 +937,81 @@ Capped scheduler binaries (SHA256):
 - Loader: `57b7102c92472b801cca8d4cb7ab4b996a6900e51d9ed66ef918d02fb2ec9db0`
 - BPF object: `7c1e55f9ee7b959bc261509db433e98aace56c758b125357e314f19b42e757b6`
 
+## Hint ablation after the 2ms result
+
+The scheduler is frozen at the validated default-off BE-cap implementation.
+The matrix contains three hinted cells on the same EuRoC window, with
+two hogs and a 2ms cap throughout: full hints (control), `imu-only` (A), and
+`fe-only` (B). No CFS, additional cap value, or new scheduler mechanism is
+part of this matrix.
+
+The 2026-09-06 run completed three repetitions per cell, using source epoch
+`1403636579758555500`, a 15s measured interval after 3s warmup, and identical
+binaries across all nine cases. Each case covered the same 3000 IMU and 300
+camera source opportunities, with zero adapter drops and zero unfinished work.
+Counts below sum three repetitions; p99 ranges are per-run percentiles, not
+pooled percentiles. Hog iterations are the combined mean per 15s window.
+
+| Metric | Full control | A: downstream MISC/BE | B: ordinary FE IMU |
+| --- | ---: | ---: | ---: |
+| IMU late / 9000 | 0 | 0 | 7370 |
+| IMU p99 start age | 1.59–1.77ms | 1.60–1.64ms | 27.76–29.13ms |
+| Estimator timely / 900 | 900 | 899; one dropped | 900 |
+| Estimator p99 completion age | 14.54–14.99ms | 20.02–22.97ms | 12.83–13.12ms |
+| Mapping completed / 900 | 900 | 899; one upstream drop | 900 |
+| Combined hog iterations, mean | 11940 | 11942.3 | 11940.3 |
+| Strict gates passed | 3/3 | 3/3 | 0/3 |
+
+On this EuRoC synthetic graph, two EXT hogs, cap=2ms: the IMU bundle keeps
+200Hz on time; the cap makes the shared 33ms chain completable; downstream
+FE hints cut estimator completion age by approximately 5–8ms at p99. Hog
+iteration count does not materially move between those hint variants.
+The cap comparison comes from the preceding uncapped/capped experiment;
+all cells in this matrix use the cap.
+
+A shows downstream FE is a latency refinement, not a requirement for nearly
+all camera-chain completions here. It does not separate FE class priority,
+EDF ordering, and budget effects. B fails solely on IMU lateness; accounting
+is complete. Its lower camera-chain ages are consistent with removing IMU
+preemption interruptions, but B removes the whole IMU queue/preemption bundle.
+Mapping CPU time is approximately 0.601s per window, except A repetition 1
+at 0.599s following the upstream drop. Full repetition 3 retains a completed
+mapping tail with maximum start age 56.353ms and completion age 62.966ms;
+the p99 values do not erase that observation.
+
+The instrumented pipeline SHA256 is
+`5c72c3f203f82ea2e11675cd959e52206722d0cea0762eec5b959a21448ada4f`.
+The adapter and capped scheduler hashes are unchanged from the preceding
+experiment. The cap remains default-off; no scheduler policy changed for
+this matrix.
+
+Bag-mode admission always uses the original application stage, deadline,
+stale window, and budget. A transport projection changes only the published
+BPF hint after selection. A projects downstream hints to MISC/BE with no
+deadline, stale window, or budget, retaining identity and executor ownership.
+B projects IMU to MISC/FE, retaining its deadline and budget. The existing
+executor-owned flag preserves its age-demotion exemption when the dedicated
+IMU stage is removed; otherwise B would also retest the old STALE lock.
+The real IMU admission profile remains unchanged and exempt from dropping.
+B removes the dedicated queue/preemption bundle, not just one of its parts.
+
+Each hog records completion timestamps for its unchanged 1000us CPU-work
+iterations. `hog_window` counts recorded completions in the same half-open
+wall interval used for the measured stage cutoff. An iteration crossing the
+start counts if it finishes inside; one finishing at/after the end does not.
+This is throughput, not an exact CPU-time measurement. Mapping retains its
+existing source-window CPU accounting, including an in-flight compute sample.
+All three cells, including the control, use the same newly instrumented
+workload binary. The prior uncapped run has no hog iteration counters, so
+this matrix alone cannot quantify cap overhead relative to that run.
+
+The ablation driver preserves each case's strict gate status and continues
+after a recorded performance/accounting rejection to collect the matrix.
+Infrastructure and adapter-input failures stop the run. All cells must have
+matching source windows, configuration, and binaries. Any rejected gate
+leaves the matrix with a nonzero exit status; diagnostic completion never
+turns rejected cases into successful validation.
+
 ## Harness diagram
 ```mermaid
 flowchart TD

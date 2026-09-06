@@ -21,6 +21,7 @@ ext_policy=${EXT_POLICY:-7}
 deadline_grace_us=${DEADLINE_GRACE_US:-1000}
 be_slice_cap_us=${BE_SLICE_CAP_US:-0}
 hinted_only=${HINTED_ONLY:-0}
+scx_variant=${SCX_VARIANT:-hinted}
 baseline_dir=${BASELINE_DIR:-}
 imu_topic=${IMU_TOPIC:-/imu0}
 camera_topic=${CAMERA_TOPIC:-/cam0/image_raw}
@@ -43,6 +44,7 @@ Defaults:
   REPETITIONS=3 HOG_THREADS=0 EXT_POLICY=7
   DEADLINE_GRACE_US=1000
   BE_SLICE_CAP_US=0 (disabled) HINTED_ONLY=0
+  SCX_VARIANT=hinted (hinted, imu-only, or fe-only)
   BASELINE_DIR= (optional previous results for source-window comparison)
   IMU_TOPIC=/imu0 CAMERA_TOPIC=/cam0/image_raw
 
@@ -209,7 +211,7 @@ assert_case_accounting() {
             if (value["unfinished"] != 0) exit 1
             if (value["arrivals"] != value["executed"] + value["dropped_before_start"]) exit 1
             if (value["executed"] != value["completed"]) exit 1
-            if (mode ~ /^hinted/ && $1 == "window_imu_prop:" &&
+            if (mode ~ /^(hinted|imu-only|fe-only)-/ && $1 == "window_imu_prop:" &&
                 (value["completed"] != expected || value["late"] != 0)) exit 1
         }
         END { if (rows != 4) exit 1 }
@@ -243,6 +245,18 @@ append_summary() {
                 value["first_job_id"], value["last_job_id"]
         }
     ' "$result_file" >>"$output_dir/summary.tsv"
+    awk -v mode="$mode" -v repetition="$repetition" '
+        /^hog_window:/ {
+            delete value
+            for (i = 2; i <= NF; i++) {
+                split($i, pair, "=")
+                value[pair[1]] = pair[2]
+            }
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", mode, repetition, \
+                value["index"], value["iterations"], value["iteration_work_us"], \
+                value["start_ns"], value["end_ns"]
+        }
+    ' "$result_file" >>"$output_dir/hog-summary.tsv"
 }
 
 assert_matched_source_windows() {
@@ -275,8 +289,10 @@ run_case() {
     local pipeline_args=(--duration "$duration" --warmup "$warmup" --input external
         --source-start-ns "$source_start_ns" --worker-cpu "$cpu" --hog "$hog_threads"
         --window-stats)
-    if [[ $mode == hinted ]]; then
-        pipeline_args+=(--pin "$pin_dir" --ext-policy "$ext_policy" --hint-mode full)
+    if [[ $mode != cfs ]]; then
+        local hint_mode=$mode
+        if [[ $mode == hinted ]]; then hint_mode=full; fi
+        pipeline_args+=(--pin "$pin_dir" --ext-policy "$ext_policy" --hint-mode "$hint_mode")
     fi
 
     mkdir -p "$case_dir"
@@ -309,8 +325,8 @@ run_case() {
     cleanup_process "$adapter_pid"
     adapter_pid=
     cat "$case_dir/pipeline.txt"
-    assert_case_accounting "$case_dir/pipeline.txt" "$case_dir/adapter.txt" "$name"
     append_summary "$mode" "$repetition" "$case_dir/pipeline.txt"
+    assert_case_accounting "$case_dir/pipeline.txt" "$case_dir/adapter.txt" "$name"
 }
 
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
@@ -346,6 +362,10 @@ if [[ $hinted_only != 0 && $hinted_only != 1 ]]; then
     echo "error: HINTED_ONLY must be 0 or 1" >&2
     exit 2
 fi
+case "$scx_variant" in
+    hinted|imu-only|fe-only) ;;
+    *) echo "error: SCX_VARIANT must be hinted, imu-only, or fe-only" >&2; exit 2 ;;
+esac
 if [[ -e $output_dir ]]; then
     echo "error: OUTPUT_DIR already exists; preserve prior results: $output_dir" >&2
     exit 2
@@ -455,6 +475,7 @@ ext_policy=$ext_policy
 deadline_grace_us=$deadline_grace_us
 be_slice_cap_us=$be_slice_cap_us
 hinted_only=$hinted_only
+scx_variant=$scx_variant
 baseline_dir=$baseline_dir
 ops_flags=$ops_flags
 repetitions=$repetitions
@@ -467,6 +488,7 @@ bpf_object_sha256=$(sha256sum "$repo_dir/build/scx_slam_fresh.bpf.o" | awk '{pri
 EOF
 
 printf "mode\trepetition\tstage\toffered\tcompleted\tlate\tstarted_stale\tunfinished\tcpu_us\tp99_start_age_us\tmax_start_age_us\tp99_age_us\tmax_age_us\tfirst_source_ts_ns\tlast_source_ts_ns\tarrivals\texecuted\tdropped_before_start\tdropped_upstream\tfirst_job_id\tlast_job_id\n" >"$output_dir/summary.tsv"
+printf "mode\trepetition\thog\titerations\titeration_work_us\tstart_ns\tend_ns\n" >"$output_dir/hog-summary.tsv"
 
 qos_preflight
 echo "source_start_ns=$source_start_ns" >>"$output_dir/environment.txt"
@@ -483,7 +505,7 @@ taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" \
 loader_pid=$!
 wait_for_scheduler
 for repetition in $(seq 1 "$repetitions"); do
-    run_case hinted "$repetition"
+    run_case "$scx_variant" "$repetition"
 done
 assert_matched_source_windows
 

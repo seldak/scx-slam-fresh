@@ -20,6 +20,7 @@ target_link_libraries(
 install(TARGETS scx_slam_workload_smoke DESTINATION lib/${PROJECT_NAME})
 
 add_executable(scx_slam_pipeline src/slam_pipeline.cpp)
+target_include_directories(scx_slam_pipeline PRIVATE include)
 target_compile_features(scx_slam_pipeline PRIVATE cxx_std_17)
 target_link_libraries(
   scx_slam_pipeline
@@ -51,6 +52,10 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_test REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  ament_add_gtest(test_hint_ablation test/test_hint_ablation.cpp)
+  target_include_directories(test_hint_ablation PRIVATE include)
+  target_compile_features(test_hint_ablation PRIVATE cxx_std_17)
+  target_link_libraries(test_hint_ablation scx_slam_executor::freshness_executor)
   ament_add_test(test_ros2_bag_accounting
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_ros2_bag_accounting.py
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
