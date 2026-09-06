@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include <scx_slam_executor/freshness_executor.hpp>
-#include <scx_slam_executor/slamqos.h>
+#include <scx_slam_executor/freshqos.h>
 
 #include <linux/sched/types.h>
 #include <pthread.h>
@@ -76,18 +76,18 @@ void configure_worker(const WorkerConfig & config)
   }
 }
 
-slam_task_hint clear_hint()
+fresh_task_hint clear_hint()
 {
-  slam_task_hint hint{};
-  hint.api_version = SLAM_SCX_API_VERSION;
-  hint.stage_id = SLAM_STAGE_MISC;
-  hint.class_id = SLAM_SCX_CLASS_BE;
+  fresh_task_hint hint{};
+  hint.api_version = FRESH_API_VERSION;
+  hint.stage_id = FRESH_STAGE_UNSPECIFIED;
+  hint.class_id = FRESH_CLASS_BACKGROUND;
   return hint;
 }
 
 }  // namespace
 
-void NullHintSink::publish(uint64_t, const slam_task_hint &)
+void NullHintSink::publish(uint64_t, const fresh_task_hint &)
 {
 }
 
@@ -97,28 +97,28 @@ void NullHintSink::clear(uint64_t)
 
 struct PinnedMapHintSink::Impl
 {
-  slamqos qos{-1};
+  freshqos qos{-1};
 };
 
 PinnedMapHintSink::PinnedMapHintSink(const std::string & pin_dir)
 : impl_(std::make_unique<Impl>())
 {
-  const int error = slamqos_open(&impl_->qos, pin_dir.c_str());
+  const int error = freshqos_open(&impl_->qos, pin_dir.c_str());
   if (error != 0) {
-    throw std::system_error(-error, std::generic_category(), "slamqos_open");
+    throw std::system_error(-error, std::generic_category(), "freshqos_open");
   }
 }
 
 PinnedMapHintSink::~PinnedMapHintSink()
 {
-  slamqos_close(&impl_->qos);
+  freshqos_close(&impl_->qos);
 }
 
-void PinnedMapHintSink::publish(uint64_t worker_pid_tgid, const slam_task_hint & hint)
+void PinnedMapHintSink::publish(uint64_t worker_pid_tgid, const fresh_task_hint & hint)
 {
-  const int error = slamqos_publish_hint_for(&impl_->qos, worker_pid_tgid, &hint);
+  const int error = freshqos_publish_hint_for(&impl_->qos, worker_pid_tgid, &hint);
   if (error != 0) {
-    throw std::system_error(-error, std::generic_category(), "slamqos_publish_hint_for");
+    throw std::system_error(-error, std::generic_category(), "freshqos_publish_hint_for");
   }
 }
 
@@ -150,7 +150,7 @@ struct FreshnessExecutor::Impl
       other.executable.callback_group.reset();
     }
     rclcpp::AnyExecutable executable;
-    slam_task_hint hint{};
+    fresh_task_hint hint{};
     std::shared_ptr<void> message;
     std::unique_ptr<rclcpp::MessageInfo> message_info;
     MessageObserver observer;
@@ -199,13 +199,13 @@ struct FreshnessExecutor::Impl
     return found == profiles.end() ? ProfileBinding{} : found->second;
   }
 
-  slam_task_hint make_hint(
+  fresh_task_hint make_hint(
     const CallbackProfile & profile,
     const std::optional<MessageMetadata> & metadata = std::nullopt)
   {
     const uint64_t release_ns = metadata ? metadata->release_ts_ns : monotonic_now_ns();
-    slam_task_hint hint{};
-    hint.api_version = SLAM_SCX_API_VERSION;
+    fresh_task_hint hint{};
+    hint.api_version = FRESH_API_VERSION;
     hint.stage_id = profile.stage_id;
     hint.class_id = profile.class_id;
     hint.job_id = metadata ? metadata->job_id : next_job_id++;
@@ -216,8 +216,8 @@ struct FreshnessExecutor::Impl
     hint.budget_ns = profile.budget_ns;
     hint.slice_ns = profile.slice_ns;
     hint.weight = profile.weight;
-    if (metadata && profile.reject_expired && profile.stage_id != SLAM_STAGE_IMU_PREINT) {
-      hint.flags |= SLAM_HINT_EXECUTOR_OWNED;
+    if (metadata && profile.reject_expired && profile.class_id != FRESH_CLASS_URGENT) {
+      hint.flags |= FRESH_HINT_EXECUTOR_OWNED;
     }
     return hint;
   }
@@ -225,7 +225,7 @@ struct FreshnessExecutor::Impl
   static bool expired(const PendingWork & work)
   {
     const auto & h = work.hint;
-    if (!(h.flags & SLAM_HINT_EXECUTOR_OWNED)) {
+    if (!(h.flags & FRESH_HINT_EXECUTOR_OWNED)) {
       return false;
     }
     const auto now = monotonic_now_ns();
@@ -296,10 +296,8 @@ void FreshnessExecutor::add_callback_group_with_profile(
   if (is_spinning()) {
     throw std::runtime_error("callback profiles cannot change while the executor is spinning");
   }
-  if (profile.stage_id >= SLAM_STAGE_MAX) {
-    throw std::invalid_argument("callback profile has an invalid stage_id");
-  }
-  if (profile.class_id != SLAM_SCX_CLASS_BE && profile.class_id != SLAM_SCX_CLASS_FE) {
+  if (profile.class_id != FRESH_CLASS_BACKGROUND && profile.class_id != FRESH_CLASS_DEADLINE &&
+    profile.class_id != FRESH_CLASS_URGENT) {
     throw std::invalid_argument("callback profile has an invalid class_id");
   }
 
@@ -360,7 +358,7 @@ void FreshnessExecutor::spin()
         configure_worker(impl_->worker_config);
         {
           std::lock_guard<std::mutex> lock(impl_->mutex);
-          impl_->worker_id = slamqos_pid_tgid_self();
+          impl_->worker_id = freshqos_pid_tgid_self();
           impl_->worker_ready = true;
         }
         impl_->condition.notify_all();

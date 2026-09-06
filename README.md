@@ -54,12 +54,14 @@ Typical Debian/Ubuntu packages are `clang`, `llvm`, `bpftool`, `libbpf-dev`,
 The build requires the separate [scx_fresh](https://github.com/seldak/scx_fresh)
 checkout. It defaults to the sibling
 directory `../scx_fresh`; set `SCX_FRESH_DIR` for another location. No scheduler
-sources are vendored here. The extraction was validated with scheduler revision
-`0426580`. Access to the private scheduler repository is currently required.
+sources are vendored here. This tree requires the scheduler's version 2 hint ABI
+(`freshqos` and explicit service classes), validated with scheduler revision
+`2a744c8`. The earlier extraction revision is not compatible. Access to the
+private scheduler repository is currently required.
 
 ```bash
 git clone https://github.com/seldak/scx_fresh.git ../scx_fresh
-git -C ../scx_fresh checkout 0426580
+git -C ../scx_fresh checkout 2a744c8635d79e3fee6f801c2aa7ed233ba6c907
 ```
 
 ```bash

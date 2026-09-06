@@ -313,11 +313,11 @@ scx_slam_executor::CallbackProfile stage_profile(
   uint64_t deadline_us, uint64_t stale_us, uint64_t budget_us)
 {
   if (hint_mode == "imu-only" && stage != SLAM_STAGE_IMU_PREINT) {
-    return profile(SLAM_STAGE_MISC, SLAM_SCX_CLASS_BE, 0, 0, 0);
+    return profile(SLAM_STAGE_MISC, FRESH_CLASS_BACKGROUND, 0, 0, 0);
   }
   if (hint_mode == "fe-only" && stage == SLAM_STAGE_IMU_PREINT) {
-    // Preserve IMU deadlines and budgets while removing its dedicated stage.
-    return profile(SLAM_STAGE_MISC, SLAM_SCX_CLASS_FE, deadline_us, stale_us, budget_us);
+    // Preserve IMU deadlines and budgets while removing Urgent service.
+    return profile(SLAM_STAGE_MISC, FRESH_CLASS_DEADLINE, deadline_us, stale_us, budget_us);
   }
   return profile(stage, class_id, deadline_us, stale_us, budget_us);
 }
@@ -682,19 +682,19 @@ int main(int argc, char ** argv)
 
     executors[0]->add_subscription_callback_group_with_profile<Message>(
       imu_group, imu_node->get_node_base_interface(),
-      admission_profile(SLAM_STAGE_IMU_PREINT, SLAM_SCX_CLASS_FE, 5000, 10000, 1000),
+      admission_profile(SLAM_STAGE_IMU_PREINT, FRESH_CLASS_URGENT, 5000, 10000, 1000),
       metadata, true, observe(imu_stats, {}));
     executors[1]->add_subscription_callback_group_with_profile<Message>(
       vision_group, vision_node->get_node_base_interface(),
-      admission_profile(SLAM_STAGE_VISION_FE, SLAM_SCX_CLASS_FE, 33000, 66000, 12000),
+      admission_profile(SLAM_STAGE_VISION_FE, FRESH_CLASS_DEADLINE, 33000, 66000, 12000),
       metadata, true, observe(vision_stats, {&estimator_stats, &mapping_stats}));
     executors[2]->add_subscription_callback_group_with_profile<Message>(
       estimator_group, estimator_node->get_node_base_interface(),
-      admission_profile(SLAM_STAGE_STATE_EST, SLAM_SCX_CLASS_FE, 33000, 66000, 10000),
+      admission_profile(SLAM_STAGE_STATE_EST, FRESH_CLASS_DEADLINE, 33000, 66000, 10000),
       metadata, true, observe(estimator_stats, {&mapping_stats}));
     executors[3]->add_subscription_callback_group_with_profile<Message>(
       mapping_group, mapping_node->get_node_base_interface(),
-      admission_profile(SLAM_STAGE_MAPPING_BE, SLAM_SCX_CLASS_BE, 0, 0, 0),
+      admission_profile(SLAM_STAGE_MAPPING_BE, FRESH_CLASS_BACKGROUND, 0, 0, 0),
       metadata, true, observe(mapping_stats, {}));
 
     std::mutex error_mutex;

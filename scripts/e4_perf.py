@@ -22,11 +22,11 @@ def parse_estimator(text, metrics, cpu):
     start = metrics["measurement"]["start_ns"]
     end = metrics["measurement"]["end_ns"]
     for line in text.splitlines():
-        if line.startswith("est_trace_summary:"):
+        if line.startswith(("stage_trace_summary:", "est_trace_summary:")):
             if counters is not None:
                 raise ValueError("duplicate estimator trace summary")
             counters = fields(line)
-        elif line.startswith("[est_enqueue] "):
+        elif line.startswith(("[stage_enqueue] ", "[est_enqueue] ")):
             e = fields(line)
             required = {"ts_ns", "pid_tgid", "job", "stage", "release_ns", "deadline_ns", "enq_flags",
                         "dsq", "slice_ns", "vruntime", "exec_ns", "policy", "cpu", "overrun", "state_present"}

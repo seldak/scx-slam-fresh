@@ -27,13 +27,13 @@ def metrics():
 
 def trace(lost=0, ts=1_100_000_000):
     key = (100 << 32) | 102
-    enqueue = (f"[est_enqueue] ts_ns={ts} pid_tgid={key} job=4 stage=2 release_ns=1066000000 "
+    enqueue = (f"[stage_enqueue] ts_ns={ts} pid_tgid={key} job=4 stage=2 release_ns=1066000000 "
                "deadline_ns=1099000000 enq_flags=0x1 dsq=0x5a1e slice_ns=20000000 vruntime=3 "
                "exec_ns=100 policy=7 cpu=0 overrun=0 state_present=1")
-    job5 = (f"[est_enqueue] ts_ns={ts + 50_000_000} pid_tgid={key} job=5 stage=2 release_ns=1099000000 "
+    job5 = (f"[stage_enqueue] ts_ns={ts + 50_000_000} pid_tgid={key} job=5 stage=2 release_ns=1099000000 "
             "deadline_ns=1132000000 enq_flags=0x1 dsq=0xfe01 slice_ns=20000000 vruntime=4 "
             "exec_ns=0 policy=7 cpu=0 overrun=0 state_present=1")
-    job6 = (f"[est_enqueue] ts_ns={ts + 100_000_000} pid_tgid={key} job=6 stage=2 release_ns=1132000000 "
+    job6 = (f"[stage_enqueue] ts_ns={ts + 100_000_000} pid_tgid={key} job=6 stage=2 release_ns=1132000000 "
             "deadline_ns=1165000000 enq_flags=0x1 dsq=0x5a1e slice_ns=20000000 vruntime=5 "
             "exec_ns=0 policy=7 cpu=0 overrun=0 state_present=1")
     event = (f"[evt] DEADLINE_MISS stage=2 job=4 pid_tgid=0x{key:x} age=34.000ms exec=0.100ms "
@@ -44,7 +44,7 @@ def trace(lost=0, ts=1_100_000_000):
     lpre_demotion = (f"[evt] BUDGET_DEMOTION stage=5 job=1 pid_tgid=0x{lpre_key:x} age=99.100ms "
                       f"exec=7.100ms ts_ns={ts - 900_000} release_ns={ts - 100_000_000} deadline_ns={ts}")
     return (f"{enqueue}\n{job5}\n{job6}\n{event}\n{lpre_overrun}\n{lpre_demotion}\n"
-            f"est_trace_summary: enqueues=3 emitted=3 lost={lost}\n")
+            f"stage_trace_summary: enqueues=3 emitted=3 lost={lost}\n")
 
 
 def case(name, cost, with_miss, grace=1000, budget=10000, class_id=1, ts=1_100_000_000):
@@ -69,6 +69,10 @@ class PerfTests(unittest.TestCase):
         self.assertLess(parsed["lidar_pre_events"][1]["deadline_delta_ns"], 0)
 
     def test_lane_stream_rejects_loss_identity_policy_and_unknown_lane(self):
+        legacy = trace().replace("stage_trace_summary", "est_trace_summary").replace(
+            "stage_enqueue", "est_enqueue")
+        self.assertEqual(e4_perf.parse_estimator(legacy, metrics(), 0),
+                         e4_perf.parse_estimator(trace(), metrics(), 0))
         for old, new in (("lost=0", "lost=1"), ("emitted=3", "emitted=2"),
                          ("policy=7", "policy=0"), ("cpu=0", "cpu=1"),
                          ("dsq=0x5a1e", "dsq=0x123"), ("stage=2", "stage=1")):

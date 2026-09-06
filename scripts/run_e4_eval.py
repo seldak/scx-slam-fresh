@@ -410,10 +410,13 @@ def parse_trace(text, metrics, cpu, mode):
     events, summary = [], None
     timing, identity = metrics["measurement"], metrics["imu_identity"]
     for line in text.splitlines():
-        if line.startswith("[imu_enqueue] ") or line.startswith("imu_trace_summary:"):
+        line = line.replace("[imu_enqueue]", "[urgent_enqueue]").replace(
+            "imu_trace_summary:", "urgent_trace_summary:").replace(
+            "dsq_imu=", "dsq_urgent=").replace("wrong_stage=", "wrong_class=")
+        if line.startswith("[urgent_enqueue] ") or line.startswith("urgent_trace_summary:"):
             fields = {k: int(v, 16 if v.startswith("0x") else 10) for k, v in
                       re.findall(r"\b([a-z_]+)=(0x[0-9a-fA-F]+|[0-9]+)(?=\s|$)", line)}
-            if line.startswith("imu_trace_summary:"):
+            if line.startswith("urgent_trace_summary:"):
                 if summary is not None:
                     raise ValueError("duplicate IMU trace summary")
                 summary = fields
@@ -440,7 +443,7 @@ def parse_trace(text, metrics, cpu, mode):
                     raise ValueError("IMU probe destination does not match the selected preemption mode")
             events.append(fields)
     required = {"enqueues", "wakeup", "nonwakeup", "late_wakeup", "late_nonwakeup", "local_preempt",
-                "dsq_imu", "missing_hint", "wrong_stage", "wrong_policy", "emitted", "lost"}
+                "dsq_urgent", "missing_hint", "wrong_class", "wrong_policy", "emitted", "lost"}
     if summary is None or not required <= summary.keys():
         raise ValueError("missing IMU trace counters")
     if (summary["wakeup"] + summary["nonwakeup"] != summary["enqueues"] or
@@ -456,16 +459,24 @@ def run_one_case(case, args, output):
     loader = demo = None
     try:
         build = args.binary_dir or REPO / "build"
+        config = subprocess.check_output(
+            [str(build / "scx_slam_fresh_user"), "--print-config"], text=True)
+        generic = "urgent_preempt=" in config
         loader_command = ["stdbuf", "-oL", "-eL", str(build / "scx_slam_fresh_user"),
-                          "--pin", str(pin_dir), "--imu-preempt", case["imu_preempt"],
+                          "--pin", str(pin_dir),
+                          "--urgent-preempt" if generic else "--imu-preempt", case["imu_preempt"],
                           "--deadline-grace-us", str(case.get("deadline_grace_us",
                                                                DEFAULT_DEADLINE_GRACE_US))]
         if args.preempt_probe:
-            loader_command.append("--trace-imu")
+            loader_command.extend(["--trace-urgent", "--trace-worker-name", "imu_prop"]
+                                  if generic else ["--trace-imu"])
         if args.perf_sched:
-            loader_command = [*observer_prefix(args.cpu), *loader_command, "--trace-estimator"]
+            loader_command = [*observer_prefix(args.cpu), *loader_command,
+                              *(["--trace-stage", "2"] if generic else ["--trace-estimator"])]
         if args.execution_probe:
             loader_command.extend(["--trace-execution-cpu", str(args.cpu)])
+            if generic:
+                loader_command.extend(["--trace-worker-name", "imu_prop"])
             # Keep the high-volume trace consumer off the measured CPU. This
             # is an observer affinity, not a workload/policy change.
             observer_cpus = sorted(os.sched_getaffinity(0) - {args.cpu})
@@ -622,12 +633,12 @@ def main():
             if args.perf_sched:
                 command = perf_command(command, args.cpu, f"<results>/{case['name']}.perf.data")
             print(case["name"], " ".join(command),
-                  f"[loader: --imu-preempt {case['imu_preempt']}, trace_imu={int(args.preempt_probe)}, "
+                  f"[loader: --urgent-preempt {case['imu_preempt']}, trace_imu={int(args.preempt_probe)}, "
                   f"execution_cpu={args.cpu if args.execution_probe else -1}, "
                   f"deadline_grace_us={case['deadline_grace_us']}, "
                   f"lidar_pre_budget_us={case['lidar_pre_budget_us']}, "
                   f"lidar_pre_class={'fe' if case['lidar_pre_class_id'] else 'be'}]",
-                  "[--trace-estimator; perf_sched=1]" if args.perf_sched else "")
+                  "[--trace-stage 2; perf_sched=1]" if args.perf_sched else "")
         return 0
     if os.geteuid() != 0:
         parser.error("run with sudo to attach sched_ext; --dry-run needs no privileges")
@@ -690,7 +701,7 @@ def main():
     (output / "source.diff").write_bytes(subprocess.check_output(["git", "diff", "HEAD"], cwd=REPO))
     (output / "cpu.txt").write_bytes(subprocess.check_output(["lscpu"]))
     if args.binary_dir:
-        for name in ("scx_slam_fresh.bpf.c", "execution_trace.bpf.h"):
+        for name in ("scx_fresh.bpf.c", "scx_slam_fresh.bpf.c", "execution_trace.bpf.h"):
             source = build / name
             if source.is_file():
                 (output / f"archived-{name}").write_bytes(source.read_bytes())

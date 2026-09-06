@@ -27,7 +27,7 @@ def fixture():
                 "comm_hex": ("imu_prop" if key == IMU else "lidar_reg" if key == BE else "generator").encode().ljust(16, b"\0").hex()}
 
     def event(kind, ts, prev=IMU, nxt=BE, runnable=1, preempt=0, state=0, syscall="none", cpu=0):
-        e = {"kind": kind, "ts_ns": ts, "imu_key": IMU, "cpu": cpu, "runnable": runnable,
+        e = {"kind": kind, "ts_ns": ts, "urgent_key": IMU, "cpu": cpu, "runnable": runnable,
              "preempt": preempt, "prev_state": state, "callback_delta_ns": 0,
              "syscall_id": 230 if syscall == "clock_nanosleep" else (1 << 64) - 1, "syscall": syscall}
         e.update({f"task_{k}": v for k, v in task(prev).items()})
@@ -87,6 +87,10 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(changed[field], original[field])
 
     def test_preemption_ignores_nonzero_raw_state(self):
+        metrics, events = fixture()
+        current = log(events)
+        self.assertEqual(execution.parse_execution(current, metrics, 0),
+                         execution.parse_execution(current.replace("urgent_key=", "imu_key="), metrics, 0))
         summary, _, _, _ = analyze()
         self.assertEqual(summary["imu_blocked_ns"], 10)
         metrics, events = fixture()
@@ -125,7 +129,7 @@ class ExecutionTests(unittest.TestCase):
 
     def test_identity_policy_and_migration_rejected(self):
         metrics, events = fixture()
-        for index, key, value in ((2, "imu_key", BE), (2, "task_policy", 0),
+        for index, key, value in ((2, "urgent_key", BE), (2, "task_policy", 0),
                                    (2, "task_stage", 6), (2, "cpu", 1), (3, "cpu", 1)):
             bad = deepcopy(events)
             bad[index][key] = value

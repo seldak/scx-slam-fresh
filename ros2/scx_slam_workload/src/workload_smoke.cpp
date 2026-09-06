@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#include <scx_slam_executor/application_stages.hpp>
 
 #include <rclcpp/rclcpp.hpp>
 #include <scx_slam_executor/freshness_executor.hpp>
@@ -16,7 +17,7 @@ int main(int argc, char ** argv)
 
   scx_slam_executor::CallbackProfile profile;
   profile.stage_id = SLAM_STAGE_VISION_FE;
-  profile.class_id = SLAM_SCX_CLASS_FE;
+  profile.class_id = FRESH_CLASS_DEADLINE;
   profile.relative_deadline_ns = 33000000ULL;
   profile.stale_ns = 66000000ULL;
   profile.budget_ns = 12000000ULL;

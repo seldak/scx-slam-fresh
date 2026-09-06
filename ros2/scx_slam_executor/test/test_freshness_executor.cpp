@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 #include <scx_slam_executor/freshness_executor.hpp>
-#include <scx_slam_executor/slamqos.h>
+#include <scx_slam_executor/freshqos.h>
+#include <scx_slam_executor/application_stages.hpp>
 
 #include <gtest/gtest.h>
 #include <rclcpp/rclcpp.hpp>
@@ -22,9 +23,9 @@ namespace
 class RecordingHintSink final : public scx_slam_executor::HintSink
 {
 public:
-  std::function<void(const slam_task_hint &)> after_publish;
+  std::function<void(const fresh_task_hint &)> after_publish;
   std::function<void()> after_clear;
-  void publish(uint64_t worker_pid_tgid, const slam_task_hint & hint) override
+  void publish(uint64_t worker_pid_tgid, const fresh_task_hint & hint) override
   {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -63,7 +64,7 @@ public:
     return cleared_worker_ids_;
   }
 
-  std::vector<slam_task_hint> hints() const
+  std::vector<fresh_task_hint> hints() const
   {
     std::lock_guard<std::mutex> lock(mutex_);
     return hints_;
@@ -80,7 +81,7 @@ private:
   std::atomic<bool> published_{false};
   std::vector<uint64_t> worker_ids_;
   std::vector<uint64_t> cleared_worker_ids_;
-  std::vector<slam_task_hint> hints_;
+  std::vector<fresh_task_hint> hints_;
   std::vector<uint64_t> operations_;
 };
 
@@ -100,7 +101,7 @@ TEST(FreshnessExecutor, PublishesAssignedJobBeforeCallbackAndClearsAfterward)
 
   scx_slam_executor::CallbackProfile profile;
   profile.stage_id = SLAM_STAGE_VISION_FE;
-  profile.class_id = SLAM_SCX_CLASS_FE;
+  profile.class_id = FRESH_CLASS_DEADLINE;
   profile.relative_deadline_ns = 33000000ULL;
   profile.stale_ns = 66000000ULL;
   profile.budget_ns = 12000000ULL;
@@ -108,12 +109,12 @@ TEST(FreshnessExecutor, PublishesAssignedJobBeforeCallbackAndClearsAfterward)
 
   std::atomic<bool> callback_ran{false};
   std::atomic<uint64_t> callback_worker{0};
-  const uint64_t dispatcher = slamqos_pid_tgid_self();
+  const uint64_t dispatcher = freshqos_pid_tgid_self();
   auto timer = node->create_wall_timer(
     std::chrono::milliseconds(1),
     [&]() {
       EXPECT_TRUE(sink->published());
-      callback_worker.store(slamqos_pid_tgid_self());
+      callback_worker.store(freshqos_pid_tgid_self());
       callback_ran.store(true);
       executor.cancel();
     },
@@ -134,9 +135,9 @@ TEST(FreshnessExecutor, PublishesAssignedJobBeforeCallbackAndClearsAfterward)
   ASSERT_EQ(cleared_workers.size(), 1U);
   EXPECT_EQ(workers.front(), executor.worker_pid_tgid());
   EXPECT_EQ(cleared_workers.front(), executor.worker_pid_tgid());
-  EXPECT_EQ(hints.front().api_version, SLAM_SCX_API_VERSION);
+  EXPECT_EQ(hints.front().api_version, FRESH_API_VERSION);
   EXPECT_EQ(hints.front().stage_id, SLAM_STAGE_VISION_FE);
-  EXPECT_EQ(hints.front().class_id, SLAM_SCX_CLASS_FE);
+  EXPECT_EQ(hints.front().class_id, FRESH_CLASS_DEADLINE);
   EXPECT_EQ(hints.front().job_id, 1U);
   EXPECT_EQ(
     hints.front().deadline_ts_ns - hints.front().release_ts_ns,
@@ -224,20 +225,20 @@ TEST(FreshnessExecutor, TakesMessageMetadataBeforeWakingSubscriptionWorker)
     "freshness_executor_message", rclcpp::QoS(10),
     [&](const Message::SharedPtr message) {
       EXPECT_EQ(message->data.at(0), 77U);
-      callback_thread.store(slamqos_pid_tgid_self());
+      callback_thread.store(freshqos_pid_tgid_self());
       executor.cancel();
     },
     options);
 
   scx_slam_executor::CallbackProfile profile;
   profile.stage_id = SLAM_STAGE_STATE_EST;
-  profile.class_id = SLAM_SCX_CLASS_FE;
+  profile.class_id = FRESH_CLASS_DEADLINE;
   profile.relative_deadline_ns = 20000000ULL;
   std::atomic<uint64_t> extractor_thread{0};
   executor.add_subscription_callback_group_with_profile<Message>(
     group, node->get_node_base_interface(), profile,
     [&](const Message & message) {
-      extractor_thread.store(slamqos_pid_tgid_self());
+      extractor_thread.store(freshqos_pid_tgid_self());
       return scx_slam_executor::MessageMetadata{message.data.at(0), message.data.at(1)};
     });
 
@@ -288,7 +289,7 @@ protected:
     sink = std::make_shared<RecordingHintSink>();
     executor = std::make_unique<scx_slam_executor::FreshnessExecutor>(sink);
     profile.stage_id = SLAM_STAGE_STATE_EST;
-    profile.class_id = SLAM_SCX_CLASS_FE;
+    profile.class_id = FRESH_CLASS_DEADLINE;
     profile.relative_deadline_ns = 20000000ULL;
     profile.stale_ns = 40000000ULL;
     profile.budget_ns = 10000000ULL;
@@ -344,6 +345,8 @@ protected:
 
 TEST_F(AdmissionTest, RejectsStaleBacklogBeforePublicationAndRecovers)
 {
+  // The former sensor-special ID must obey this Deadline profile's admission.
+  profile.stage_id = 0;
   unsigned selected = 0, dropped = 0, completed = 0;
   std::weak_ptr<void> dropped_message;
   run([&](Message::SharedPtr message) {
@@ -384,8 +387,8 @@ TEST_F(AdmissionTest, ReleasesMessageAndGroupWhenDropObserverThrows)
 
 TEST_F(AdmissionTest, RechecksAfterHandoffDelayWithoutRunningExpiredCallback)
 {
-  sink->after_publish = [](const slam_task_hint & hint) {
-      EXPECT_NE(hint.flags & SLAM_HINT_EXECUTOR_OWNED, 0U);
+  sink->after_publish = [](const fresh_task_hint & hint) {
+      EXPECT_NE(hint.flags & FRESH_HINT_EXECUTOR_OWNED, 0U);
       std::this_thread::sleep_for(std::chrono::milliseconds(30));
     };
   unsigned selected = 0, dropped = 0;
@@ -406,7 +409,7 @@ TEST_F(AdmissionTest, KeepsInFlightIdentityAndBudgetThroughLateCallbackTail)
   run([&](Message::SharedPtr message) {
       const auto before = sink->hints().back();
       EXPECT_FALSE(group->can_be_taken_from().load());
-      EXPECT_NE(before.flags & SLAM_HINT_EXECUTOR_OWNED, 0U);
+      EXPECT_NE(before.flags & FRESH_HINT_EXECUTOR_OWNED, 0U);
       EXPECT_EQ(before.budget_ns, profile.budget_ns);
       if (message->data[0] == 1) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -421,12 +424,13 @@ TEST_F(AdmissionTest, KeepsInFlightIdentityAndBudgetThroughLateCallbackTail)
   EXPECT_EQ(sink->operations(), (std::vector<uint64_t>{1, 2, 0}));
 }
 
-TEST_F(AdmissionTest, ImuRemainsExemptFromAdmissionEviction)
+TEST_F(AdmissionTest, UrgentRemainsExemptFromAdmissionEviction)
 {
-  profile.stage_id = SLAM_STAGE_IMU_PREINT;
+  profile.stage_id = 12345;
+  profile.class_id = FRESH_CLASS_URGENT;
   unsigned completed = 0;
   run([&](Message::SharedPtr) {
-      EXPECT_EQ(sink->hints().back().flags & SLAM_HINT_EXECUTOR_OWNED, 0U);
+      EXPECT_EQ(sink->hints().back().flags & FRESH_HINT_EXECUTOR_OWNED, 0U);
       if (++completed == 2) {executor->cancel();}
     }, [](const std::shared_ptr<void> &, scx_slam_executor::MessageEvent event) {
       EXPECT_EQ(event, scx_slam_executor::MessageEvent::Selected);
@@ -436,18 +440,18 @@ TEST_F(AdmissionTest, ImuRemainsExemptFromAdmissionEviction)
 
 TEST_F(AdmissionTest, ReplacesCompletedSlotDirectlyAndClearsOnShutdown)
 {
-  const auto dispatcher = slamqos_pid_tgid_self();
+  const auto dispatcher = freshqos_pid_tgid_self();
   std::atomic<unsigned> completed{0};
   unsigned cleared = 0;
   std::weak_ptr<void> message_reference;
-  sink->after_publish = [&](const slam_task_hint & hint) {
-      EXPECT_EQ(slamqos_pid_tgid_self(), dispatcher);
+  sink->after_publish = [&](const fresh_task_hint & hint) {
+      EXPECT_EQ(freshqos_pid_tgid_self(), dispatcher);
       EXPECT_EQ(completed.load(), hint.job_id - 1);
       EXPECT_TRUE(message_reference.expired());
       EXPECT_EQ(cleared, 0U);
     };
   sink->after_clear = [&]() {
-      EXPECT_EQ(slamqos_pid_tgid_self(), dispatcher);
+      EXPECT_EQ(freshqos_pid_tgid_self(), dispatcher);
       EXPECT_EQ(completed.load(), 2U);
       ++cleared;
       EXPECT_TRUE(message_reference.expired());

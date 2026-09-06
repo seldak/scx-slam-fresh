@@ -2,7 +2,7 @@
 #pragma once
 
 #include <rclcpp/executor.hpp>
-#include <scx_slam_executor/scx_slam_fresh_shared.h>
+#include <scx_slam_executor/scx_fresh_shared.h>
 
 #include <cstdint>
 #include <functional>
@@ -15,8 +15,8 @@ namespace scx_slam_executor
 
 struct CallbackProfile
 {
-  uint32_t stage_id{SLAM_STAGE_MISC};
-  uint32_t class_id{SLAM_SCX_CLASS_BE};
+  uint32_t stage_id{FRESH_STAGE_UNSPECIFIED};
+  uint32_t class_id{FRESH_CLASS_BACKGROUND};
   uint64_t relative_deadline_ns{0};
   uint64_t stale_ns{0};
   uint64_t budget_ns{0};
@@ -56,14 +56,14 @@ class HintSink
 public:
   virtual ~HintSink() = default;
 
-  virtual void publish(uint64_t worker_pid_tgid, const slam_task_hint & hint) = 0;
+  virtual void publish(uint64_t worker_pid_tgid, const fresh_task_hint & hint) = 0;
   virtual void clear(uint64_t worker_pid_tgid) = 0;
 };
 
 class NullHintSink final : public HintSink
 {
 public:
-  void publish(uint64_t worker_pid_tgid, const slam_task_hint & hint) override;
+  void publish(uint64_t worker_pid_tgid, const fresh_task_hint & hint) override;
   void clear(uint64_t worker_pid_tgid) override;
 };
 
@@ -76,7 +76,7 @@ public:
   PinnedMapHintSink(const PinnedMapHintSink &) = delete;
   PinnedMapHintSink & operator=(const PinnedMapHintSink &) = delete;
 
-  void publish(uint64_t worker_pid_tgid, const slam_task_hint & hint) override;
+  void publish(uint64_t worker_pid_tgid, const fresh_task_hint & hint) override;
   void clear(uint64_t worker_pid_tgid) override;
 
 private:

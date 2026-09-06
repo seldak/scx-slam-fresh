@@ -306,7 +306,7 @@ if [[ "$repo_dir/build/scx_slam_fresh.skel.h" -nt "$loader_bin" ]]; then
 fi
 
 if [[ "$repo_dir/demo/slam_pipeline_demo.cpp" -nt "$demo_bin" ]] ||
-   [[ "${SCX_FRESH_DIR:-$repo_dir/../scx_fresh}/src/slamqos.c" -nt "$demo_bin" ]]; then
+   [[ "${SCX_FRESH_DIR:-$repo_dir/../scx_fresh}/src/freshqos.c" -nt "$demo_bin" ]]; then
     echo "error: demo binary is older than its sources; run 'make' first" >&2
     exit 1
 fi

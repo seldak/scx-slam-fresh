@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-#include <scx_slam_executor/slamqos.h>
+#include <scx_slam_executor/freshqos.h>
 
 #include <gtest/gtest.h>
 
 #include <sys/syscall.h>
 #include <unistd.h>
 
-TEST(SlamqosIdentity, PacksCurrentProcessAndThread)
+TEST(FreshqosIdentity, PacksCurrentProcessAndThread)
 {
-  const uint64_t pid_tgid = slamqos_pid_tgid_self();
+  const uint64_t pid_tgid = freshqos_pid_tgid_self();
   EXPECT_EQ(static_cast<uint32_t>(pid_tgid >> 32), static_cast<uint32_t>(getpid()));
   EXPECT_EQ(
     static_cast<uint32_t>(pid_tgid),

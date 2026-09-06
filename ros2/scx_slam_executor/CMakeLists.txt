@@ -14,7 +14,7 @@ else()
   set(SCX_FRESH_DEFAULT "${SCX_SLAM_ROOT}/../scx_fresh")
 endif()
 set(SCX_FRESH_DIR "${SCX_FRESH_DEFAULT}" CACHE PATH "External scx_fresh source checkout")
-if(NOT EXISTS "${SCX_FRESH_DIR}/src/slamqos.c")
+if(NOT EXISTS "${SCX_FRESH_DIR}/src/freshqos.c")
   message(FATAL_ERROR "Set SCX_FRESH_DIR to the scx_fresh checkout")
 endif()
 set(SCX_SLAM_BUILD_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/include/scx_slam_executor")
@@ -24,13 +24,13 @@ set(SCX_SLAM_BUILD_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/include/scx_slam_executo
 # around the standalone library instead of maintaining a second copy of it.
 file(MAKE_DIRECTORY "${SCX_SLAM_BUILD_INCLUDE}")
 configure_file(
-  "${SCX_FRESH_DIR}/src/slamqos.h"
-  "${SCX_SLAM_BUILD_INCLUDE}/slamqos.h"
+  "${SCX_FRESH_DIR}/src/freshqos.h"
+  "${SCX_SLAM_BUILD_INCLUDE}/freshqos.h"
   COPYONLY
 )
 configure_file(
-  "${SCX_FRESH_DIR}/include/scx_slam_fresh_shared.h"
-  "${SCX_SLAM_BUILD_INCLUDE}/scx_slam_fresh_shared.h"
+  "${SCX_FRESH_DIR}/include/scx_fresh_shared.h"
+  "${SCX_SLAM_BUILD_INCLUDE}/scx_fresh_shared.h"
   COPYONLY
 )
 configure_file(
@@ -39,10 +39,10 @@ configure_file(
   COPYONLY
 )
 
-add_library(slamqos SHARED "${SCX_FRESH_DIR}/src/slamqos.c")
-add_library(scx_slam_executor::slamqos ALIAS slamqos)
-target_compile_features(slamqos PUBLIC c_std_11)
-target_include_directories(slamqos
+add_library(freshqos SHARED "${SCX_FRESH_DIR}/src/freshqos.c")
+add_library(scx_slam_executor::freshqos ALIAS freshqos)
+target_compile_features(freshqos PUBLIC c_std_11)
+target_include_directories(freshqos
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
     "$<INSTALL_INTERFACE:include>"
@@ -51,8 +51,8 @@ target_include_directories(slamqos
     "${SCX_FRESH_DIR}/include"
     "${LIBBPF_INCLUDE_DIR}"
 )
-target_link_libraries(slamqos PUBLIC "${LIBBPF_LIBRARY}")
-set_target_properties(slamqos PROPERTIES VERSION "${PROJECT_VERSION}" SOVERSION 0)
+target_link_libraries(freshqos PUBLIC "${LIBBPF_LIBRARY}")
+set_target_properties(freshqos PROPERTIES VERSION "${PROJECT_VERSION}" SOVERSION 0)
 
 add_library(freshness_executor SHARED src/freshness_executor.cpp)
 add_library(scx_slam_executor::freshness_executor ALIAS freshness_executor)
@@ -63,13 +63,13 @@ target_include_directories(freshness_executor
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
     "$<INSTALL_INTERFACE:include>"
 )
-target_link_libraries(freshness_executor PUBLIC slamqos rclcpp::rclcpp)
+target_link_libraries(freshness_executor PUBLIC freshqos rclcpp::rclcpp)
 set_target_properties(
   freshness_executor PROPERTIES VERSION "${PROJECT_VERSION}" SOVERSION 0
 )
 
 install(
-  TARGETS slamqos freshness_executor
+  TARGETS freshqos freshness_executor
   EXPORT export_scx_slam_executor
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
@@ -78,8 +78,8 @@ install(
 install(DIRECTORY include/ DESTINATION include)
 install(
   FILES
-    "${SCX_SLAM_BUILD_INCLUDE}/slamqos.h"
-    "${SCX_SLAM_BUILD_INCLUDE}/scx_slam_fresh_shared.h"
+    "${SCX_SLAM_BUILD_INCLUDE}/freshqos.h"
+    "${SCX_SLAM_BUILD_INCLUDE}/scx_fresh_shared.h"
     "${SCX_SLAM_BUILD_INCLUDE}/scx_execution_trace.h"
   DESTINATION include/scx_slam_executor
 )
@@ -87,8 +87,8 @@ install(
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(std_msgs REQUIRED)
-  ament_add_gtest(test_slamqos test/test_slamqos.cpp)
-  target_link_libraries(test_slamqos slamqos)
+  ament_add_gtest(test_freshqos test/test_freshqos.cpp)
+  target_link_libraries(test_freshqos freshqos)
 
   ament_add_gtest(test_freshness_executor test/test_freshness_executor.cpp)
   target_link_libraries(test_freshness_executor freshness_executor std_msgs::std_msgs)

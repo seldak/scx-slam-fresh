@@ -23,11 +23,11 @@ and stale window without grace. A rejected message is returned, its callback
 group is released, and the observer receives `DroppedBeforeStart`. This never
 cancels an already-running callback.
 
-Accepted non-IMU work in this recovery path carries
-`SLAM_HINT_EXECUTOR_OWNED`. BPF age demotion cannot revoke its service before
+Accepted non-Urgent work in this recovery path carries
+`FRESH_HINT_EXECUTOR_OWNED`. BPF age demotion cannot revoke its service before
 it reaches the recheck, completion, or parking path. Normal class routing and
-budget demotion still apply. Real IMU profiles remain unflagged and retain
-the scheduler's IMU exemption.
+budget demotion still apply. The workload assigns IMU propagation to Urgent
+service, which remains unflagged and retains its age-demotion exemption.
 
 The completed job's hint remains through parking. Once completion is
 established, the dispatcher directly replaces it with the next selected job.

@@ -70,7 +70,8 @@
 #include <sched.h>
 
 extern "C" {
-#include "../src/slamqos.h"
+#include "freshqos.h"
+#include "../ros2/scx_slam_executor/include/scx_slam_executor/application_stages.hpp"
 #include <linux/sched/types.h>
 }
 
@@ -226,7 +227,7 @@ static inline bool is_stale(uint64_t now, const WorkItem &w, const StageCfg &cfg
 }
 
 struct HintTarget {
-    struct slamqos *pub;                 /* shared map fd */
+    struct freshqos *pub;                 /* shared map fd */
     std::atomic<uint64_t> *pid_tgid;     /* consumer pid_tgid */
     const StageCfg *cfg;                /* consumer scheduling metadata */
 };
@@ -349,7 +350,7 @@ private:
 
         const StageCfg &c = *ht_.cfg;
         uint64_t dl = c.deadline_rel_ns ? v.ts_ns + c.deadline_rel_ns : 0;
-        (void)slamqos_publish_job_for(ht_.pub,
+        (void)freshqos_publish_job_for(ht_.pub,
                                      key,
                                      c.stage_id,
                                      c.class_id,
@@ -386,7 +387,7 @@ static void stage_worker(BlockingQueue<WorkItem> *in,
     set_thread_name(cfg.name);
     (void)set_sched_ext_policy(ext_policy);
     if (pid_out)
-        pid_out->store(slamqos_pid_tgid_self(), std::memory_order_release);
+        pid_out->store(freshqos_pid_tgid_self(), std::memory_order_release);
 
     while (running->load()) {
         WorkItem w;
@@ -446,7 +447,7 @@ static void stage_worker(BlockingQueue<WorkItem> *in,
 }
 
 static void imu_thread(const StageCfg &cfg,
-                       struct slamqos *pub,
+                       struct freshqos *pub,
                        int ext_policy,
                        StageStats *stats,
                        double imu_hz,
@@ -464,7 +465,7 @@ static void imu_thread(const StageCfg &cfg,
     if (stats->actual_policy < 0 || (ext_policy >= 0 && stats->actual_policy != ext_policy))
         _exit(EXIT_FAILURE);
 
-    uint64_t self = slamqos_pid_tgid_self();
+    uint64_t self = freshqos_pid_tgid_self();
     if (pid_out)
         pid_out->store(self, std::memory_order_release);
 
@@ -481,7 +482,7 @@ static void imu_thread(const StageCfg &cfg,
         if (pub && pub->map_fd >= 0) {
             uint64_t release = next;
             uint64_t dl = (cfg.deadline_rel_ns) ? (release + cfg.deadline_rel_ns) : 0;
-            (void)slamqos_publish_job_for(pub,
+            (void)freshqos_publish_job_for(pub,
                                          self,
                                          cfg.stage_id,
                                          cfg.class_id,
@@ -771,9 +772,9 @@ int main(int argc, char **argv)
     }
 
     /* Shared hint publisher used by producers (threads share the fd safely). */
-    struct slamqos pub;
+    struct freshqos pub;
     pub.map_fd = -1;
-    if (!no_hints && slamqos_open(&pub, pin_dir) != 0) {
+    if (!no_hints && freshqos_open(&pub, pin_dir) != 0) {
         fprintf(stderr, "error: hints are required when --pin is used\n");
         return 1;
     }
@@ -786,25 +787,25 @@ int main(int argc, char **argv)
     BlockingQueue<WorkItem> q_map;
 
     /* Stage configuration: slices are left as 0 (scheduler default) to avoid micro-fragmentation. */
-    StageCfg cfg_imu { "imu_prop",   SLAM_STAGE_IMU_PREINT,  SLAM_SCX_CLASS_FE,
+    StageCfg cfg_imu { "imu_prop",   SLAM_STAGE_IMU_PREINT,  FRESH_CLASS_URGENT,
                        5'000'000ULL, 10'000'000ULL, 300'000ULL, 0, 0 };
 
-    StageCfg cfg_vis { "vision_fe",  SLAM_STAGE_VISION_FE,   SLAM_SCX_CLASS_FE,
+    StageCfg cfg_vis { "vision_fe",  SLAM_STAGE_VISION_FE,   FRESH_CLASS_DEADLINE,
                        vision_deadline_us * 1'000ULL, 66'000'000ULL,
                        vision_budget_us * 1'000ULL, 0, 0 };
 
-    StageCfg cfg_est { "state_est",  SLAM_STAGE_STATE_EST,   SLAM_SCX_CLASS_FE,
+    StageCfg cfg_est { "state_est",  SLAM_STAGE_STATE_EST,   FRESH_CLASS_DEADLINE,
                        33'000'000ULL, 66'000'000ULL, 12'000'000ULL, 0, 0 };
 
-    const uint32_t lidar_pre_class_id = lidar_pre_class == "fe" ? SLAM_SCX_CLASS_FE : SLAM_SCX_CLASS_BE;
+    const uint32_t lidar_pre_class_id = lidar_pre_class == "fe" ? FRESH_CLASS_DEADLINE : FRESH_CLASS_BACKGROUND;
     StageCfg cfg_lpre{ "lidar_pre",  SLAM_STAGE_LIDAR_PREINT,lidar_pre_class_id,
                        100'000'000ULL, 150'000'000ULL,
                        lidar_pre_budget_us * 1'000ULL, 0, 0 };
 
-    StageCfg cfg_lreg{ "lidar_reg",  SLAM_STAGE_LIDAR_REG,   SLAM_SCX_CLASS_BE,
+    StageCfg cfg_lreg{ "lidar_reg",  SLAM_STAGE_LIDAR_REG,   FRESH_CLASS_BACKGROUND,
                        200'000'000ULL, 250'000'000ULL, 0, 0, 0 };
 
-    StageCfg cfg_map { "mapping_be", SLAM_STAGE_MAPPING_BE,  SLAM_SCX_CLASS_BE,
+    StageCfg cfg_map { "mapping_be", SLAM_STAGE_MAPPING_BE,  FRESH_CLASS_BACKGROUND,
                        400'000'000ULL, 800'000'000ULL, 0, 0, 0 };
 
     StageStats st_imu, st_vis, st_est, st_lpre, st_lreg, st_map;
@@ -1133,6 +1134,6 @@ int main(int argc, char **argv)
     printf("Test burst recovery with --camera-burst-count 12 --camera-burst-at-ms 3000.\n");
     printf("Test budget demotion with --vision-work-us 12000 --vision-deadline-us 30000 --vision-budget-us 1000.\n");
 
-    slamqos_close(&pub);
+    freshqos_close(&pub);
     return 0;
 }

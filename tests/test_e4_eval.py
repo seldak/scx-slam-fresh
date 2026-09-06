@@ -210,7 +210,7 @@ class E4Tests(unittest.TestCase):
         for line in lines:
             self.assertIn("--duration 15", line)
             self.assertIn("--lidar heavy --hog 0 --drop-stale 0", line)
-            self.assertIn("--imu-preempt wakeup, trace_imu=0, execution_cpu=-1", line)
+            self.assertIn("--urgent-preempt wakeup, trace_imu=0, execution_cpu=-1", line)
 
     def test_perf_cli_is_a_narrow_default_off_diagnostic(self):
         import os
@@ -226,13 +226,13 @@ class E4Tests(unittest.TestCase):
             self.assertIn("perf record -a -k mono", line)
             self.assertIn("-e sched:sched_switch -e sched:sched_waking", line)
             self.assertNotIn("sched_stat_runtime", line)
-            self.assertIn("--trace-estimator; perf_sched=1", line)
+            self.assertIn("--trace-stage 2; perf_sched=1", line)
             self.assertNotIn("--trace-execution-cpu", line)
-            self.assertNotIn("--trace-imu]", line)
+            self.assertNotIn("--trace-urgent]", line)
         ordinary = subprocess.run([sys.executable, str(SCRIPT), "--costs", "150,3250,3500", "--cpu", str(cpu),
                                    "--dry-run"], capture_output=True, text=True, check=True)
         self.assertNotIn("perf record", ordinary.stdout)
-        self.assertNotIn("--trace-estimator", ordinary.stdout)
+        self.assertNotIn("--trace-stage 2", ordinary.stdout)
         for conflict in ("--preempt-probe", "--execution-probe", "--binary-dir /tmp/archive"):
             bad = subprocess.run([sys.executable, str(SCRIPT), "--perf-sched", *conflict.split(), "--cpu", str(cpu),
                                   "--dry-run"], capture_output=True, text=True)
@@ -252,8 +252,8 @@ class E4Tests(unittest.TestCase):
         for line in lines:
             self.assertIn("perf record -a -k mono", line)
             self.assertNotIn("sched_stat_runtime", line)
-            self.assertIn("--imu-preempt wakeup", line)
-            self.assertIn("--trace-estimator; perf_sched=1", line)
+            self.assertIn("--urgent-preempt wakeup", line)
+            self.assertIn("--trace-stage 2; perf_sched=1", line)
         for conflict in ("--costs 150,3500", "--preempt-probe", "--execution-probe",
                          "--wakeup-only", "--binary-dir /tmp/archive"):
             bad = subprocess.run([sys.executable, str(SCRIPT), "--grace-probe", *conflict.split(),
@@ -369,8 +369,8 @@ class E4Tests(unittest.TestCase):
                                  "--costs", "150,2000,3000", "--cpu", str(cpu), "--dry-run"],
                                 capture_output=True, text=True, check=True)
         self.assertEqual(len(result.stdout.splitlines()), 4)
-        self.assertNotIn("--imu-preempt always", result.stdout)
-        self.assertEqual(result.stdout.count("--imu-preempt wakeup"), 4)
+        self.assertNotIn("--urgent-preempt always", result.stdout)
+        self.assertEqual(result.stdout.count("--urgent-preempt wakeup"), 4)
         bad = subprocess.run([sys.executable, str(SCRIPT), "--wakeup-only", "--dry-run"],
                              capture_output=True, text=True)
         self.assertNotEqual(bad.returncode, 0)
@@ -389,12 +389,16 @@ class E4Tests(unittest.TestCase):
 
     def test_enqueue_probe_parsing(self):
         metrics = e4.parse_metrics(fixture(), 150, 1)
-        event = ("[imu_enqueue] ts_ns=1000000100 pid_tgid=123 job=1 stage=0 "
+        event = ("[urgent_enqueue] ts_ns=1000000100 pid_tgid=123 job=1 stage=0 "
                  "release_ns=1000000000 deadline_ns=1000000050 enq_flags=0x0 dsq=0x1a01 "
                  "policy=7 cpu=0 wakeup=0 late=1 hint_present=1\n")
-        summary = ("imu_trace_summary: enqueues=1 wakeup=0 nonwakeup=1 late_wakeup=0 late_nonwakeup=1 "
-                   "local_preempt=0 dsq_imu=1 missing_hint=0 wrong_stage=0 wrong_policy=0 emitted=1 lost=0\n")
+        summary = ("urgent_trace_summary: enqueues=1 wakeup=0 nonwakeup=1 late_wakeup=0 late_nonwakeup=1 "
+                   "local_preempt=0 dsq_urgent=1 missing_hint=0 wrong_class=0 wrong_policy=0 emitted=1 lost=0\n")
         events, counters = e4.parse_trace(event + summary, metrics, 0, "wakeup")
+        legacy = (event + summary).replace("urgent_enqueue", "imu_enqueue").replace(
+            "urgent_trace_summary", "imu_trace_summary").replace(
+            "dsq_urgent=", "dsq_imu=").replace("wrong_class=", "wrong_stage=")
+        self.assertEqual(e4.parse_trace(legacy, metrics, 0, "wakeup"), (events, counters))
         self.assertEqual(events[0]["phase"], "window")
         self.assertEqual(events[0]["route"], "DSQ_IMU")
         self.assertEqual(counters["late_nonwakeup"], 1)

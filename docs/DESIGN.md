@@ -8,14 +8,16 @@ single hint describing that selection and routes the worker accordingly.
 
 The BPF scheduler, loader, and MIT client API live in the external `scx_fresh`
 repository. This repository owns the workload, ROS adapter, and evaluation.
-The extraction preserves the existing policy and ABI; sensor-independent
-profiles are a separate change.
+The version 2 hint ABI selects Urgent, Deadline or Background service explicitly.
+The application assigns IMU propagation to Urgent, vision and estimation to
+Deadline, and mapping to Background. Sensor IDs remain application diagnostics;
+they no longer select a scheduler route.
 
 | Component | Responsibility |
 | --- | --- |
 | BPF scheduler | Route runnable workers, account execution, apply budget and age rules. |
 | Loader | Attach the scheduler, pin maps, configure options, and read events. |
-| libslamqos | Publish a hint for the current thread or an explicitly identified worker. |
+| libfreshqos | Publish a hint for the current thread or an explicitly identified worker. |
 | Standalone demo | Generate synthetic sensor jobs and manage FIFO stage queues. |
 | ROS FreshnessExecutor | Select callbacks, publish before wake, and release selected messages. |
 | Bag adapter | Translate ROS sensor messages into jobs with source identity and monotonic release time. |

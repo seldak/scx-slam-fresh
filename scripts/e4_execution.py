@@ -8,7 +8,7 @@ import re
 
 KINDS = {1: "switch", 2: "wakeup", 3: "running", 4: "stopping"}
 TASK_FIELDS = ("key", "policy", "stage", "slice_ns", "last_dsq", "insert_ns", "requested_slice_ns")
-EVENT_FIELDS = ("kind", "ts_ns", "imu_key", "cpu", "runnable", "preempt", "prev_state",
+EVENT_FIELDS = ("kind", "ts_ns", "urgent_key", "cpu", "runnable", "preempt", "prev_state",
                 "callback_delta_ns", "syscall_id")
 
 
@@ -29,6 +29,8 @@ def parse_execution(text, metrics, cpu):
         if not line.startswith("[execution] "):
             continue
         fields = dict(part.split("=", 1) for part in line.split()[1:])
+        if "imu_key" in fields and "urgent_key" not in fields:
+            fields["urgent_key"] = fields.pop("imu_key")
         required = {*EVENT_FIELDS, "syscall",
                     *(f"{prefix}_{k}" for prefix in ("task", "next") for k in (*TASK_FIELDS, "comm_hex"))}
         if set(fields) != required:
@@ -51,7 +53,7 @@ def parse_execution(text, metrics, cpu):
             raise ValueError("invalid syscall label")
         event["phase"] = phase(event["ts_ns"], timing)
         event["relative_ns"] = event["ts_ns"] - timing["start_ns"]
-        if event["imu_key"] not in (0, imu) or (event["phase"] == "window" and event["imu_key"] != imu):
+        if event["urgent_key"] not in (0, imu) or (event["phase"] == "window" and event["urgent_key"] != imu):
             raise ValueError("execution IMU identity mismatch")
         if event["kind"] == 1:
             if event["cpu"] != cpu:
