@@ -8,6 +8,7 @@ find_package(rclcpp REQUIRED)
 find_package(scx_slam_executor REQUIRED)
 find_package(scx_slam_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 add_executable(scx_slam_workload_smoke src/workload_smoke.cpp)
 target_compile_features(scx_slam_workload_smoke PRIVATE cxx_std_17)
@@ -45,6 +46,7 @@ target_link_libraries(
     rclcpp::rclcpp
     scx_slam_msgs::scx_slam_msgs
     sensor_msgs::sensor_msgs
+    std_srvs::std_srvs
 )
 
 install(TARGETS scx_slam_bag_adapter DESTINATION lib/${PROJECT_NAME})

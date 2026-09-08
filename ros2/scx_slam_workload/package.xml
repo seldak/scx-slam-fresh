@@ -12,6 +12,7 @@
   <depend>scx_slam_executor</depend>
   <depend>scx_slam_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_cmake_test</test_depend>

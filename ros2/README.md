@@ -157,6 +157,13 @@ offline, keeps QoS preflight paused, and resumes playback after endpoints are
 ready. Ordinals make IDs and ID-dependent compute costs properties of the bag,
 rather than startup timing.
 
+Before resume, the harness also queries a service unique to that adapter
+instance. It requires middleware matches for both sensor inputs and both job
+outputs (two subscribers per output for the workload and source audit).
+QoS preflight expects no job subscribers. Readiness queries do not take sensor
+messages; playback remains paused. This checks the adapter's local matches,
+not an acknowledgment of future delivery or the player's matching state.
+
 The Background server shares its allocation between native Background workers
 and budget-demoted Deadline workers, ahead of other Deadline work. Urgent stays
 outside the pool. This option is separate from the BE slice cap; enabling it

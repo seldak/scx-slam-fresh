@@ -33,6 +33,8 @@ adapter_pid=
 pipeline_pid=
 player_pid=
 source_start_ns=
+adapter_generation=0
+adapter_readiness_service=
 
 usage() {
     cat <<EOF
@@ -129,14 +131,36 @@ EOF
 
 start_adapter() {
     local log=$1
+    local required_job_subscribers=${2:-0}
+    adapter_generation=$((adapter_generation + 1))
+    adapter_readiness_service="/scx_bag_ready_$$_${adapter_generation}"
     taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$adapter_bin" --ros-args \
         -p "imu_input:=$imu_topic" -p "camera_input:=$camera_topic" \
         -p "imu_source_index:=$output_dir/source-index/topic-0.tsv" \
         -p "camera_source_index:=$output_dir/source-index/topic-1.tsv" \
+        -p "readiness_service:=$adapter_readiness_service" \
+        -p "required_job_subscribers:=$required_job_subscribers" \
         >"$log" 2>&1 &
     adapter_pid=$!
     wait_for_topic_endpoints /imu/jobs 1 0
     wait_for_topic_endpoints /camera/jobs 1 0
+}
+
+wait_for_adapter_ready() {
+    local log=$1
+    local response
+    for _ in {1..10}; do
+        if ! kill -0 "$adapter_pid" 2>/dev/null; then
+            echo "error: adapter exited before matching endpoints" >&2
+            return 1
+        fi
+        response=$(timeout 3s taskset -c "$housekeeping_cpu" ros2 service call \
+            "$adapter_readiness_service" std_srvs/srv/Trigger 2>&1) || response="${response:-}"
+        printf '%s\n' "$response" >>"$log"
+        if grep -q 'success=True' <<<"$response"; then return 0; fi
+    done
+    echo "error: adapter middleware endpoints did not match; see readiness log" >&2
+    return 1
 }
 
 start_player() {
@@ -167,6 +191,7 @@ qos_preflight() {
     start_player "$output_dir/qos-player.txt" 1
     wait_for_topic_endpoints "$imu_topic" 1 1
     wait_for_topic_endpoints "$camera_topic" 1 1
+    wait_for_adapter_ready "$output_dir/qos-readiness.txt"
     ros2 topic info -v "$imu_topic" >"$output_dir/qos-imu.txt"
     ros2 topic info -v "$camera_topic" >"$output_dir/qos-camera.txt"
     if ! grep -q 'Topic type: sensor_msgs/msg/Imu' "$output_dir/qos-imu.txt" ||
@@ -300,7 +325,7 @@ run_case() {
     mkdir -p "$case_dir"
     echo
     echo "=== $name ==="
-    start_adapter "$case_dir/adapter.txt"
+    start_adapter "$case_dir/adapter.txt" 2
     taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$pipeline_bin" \
         "${pipeline_args[@]}" >"$case_dir/pipeline.txt" 2>&1 &
     pipeline_pid=$!
@@ -309,6 +334,7 @@ run_case() {
     wait_for_topic_endpoints "$camera_topic" 1 1
     wait_for_topic_endpoints /imu/jobs 1 2
     wait_for_topic_endpoints /camera/jobs 1 2
+    wait_for_adapter_ready "$case_dir/readiness.txt"
     ros2 service call /rosbag2_player/resume rosbag2_interfaces/srv/Resume \
         >"$case_dir/resume.txt" 2>&1
     if ! grep -q 'return_code=0' "$case_dir/resume.txt"; then
@@ -499,6 +525,7 @@ play_start_offset=$bag_offset
 play_duration=$play_duration
 play_start_paused=1
 play_resume=after_sensor_and_pipeline_endpoints_connect
+adapter_readiness=middleware_matched_endpoints
 play_command=$play_command
 qos=reliable,volatile,keep_last,depth_1000
 cpu=$cpu

@@ -5,6 +5,7 @@
 #include <scx_slam_workload/bag_adapter.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <time.h>
 
@@ -60,6 +61,24 @@ public:
       camera_input, sensor_qos,
       [this](const sensor_msgs::msg::Image::ConstSharedPtr message) {
         publish_job(camera_jobs_, camera_counts_, camera_index_, message->header.stamp, "camera");
+      });
+
+    const auto required = declare_parameter<int>("required_job_subscribers", 0);
+    if (required < 0) {throw std::invalid_argument("required_job_subscribers must be non-negative");}
+    readiness_ = create_service<std_srvs::srv::Trigger>(
+      declare_parameter<std::string>("readiness_service", "~/ready"),
+      [this, required](const std_srvs::srv::Trigger::Request::SharedPtr,
+      std_srvs::srv::Trigger::Response::SharedPtr response) {
+        const auto imu = imu_subscription_->get_publisher_count();
+        const auto camera = camera_subscription_->get_publisher_count();
+        const auto imu_jobs = imu_jobs_->get_subscription_count();
+        const auto camera_jobs = camera_jobs_->get_subscription_count();
+        response->success = imu == 1 && camera == 1 &&
+          imu_jobs == static_cast<size_t>(required) && camera_jobs == static_cast<size_t>(required);
+        response->message = "imu_publishers=" + std::to_string(imu) +
+          " camera_publishers=" + std::to_string(camera) +
+          " imu_job_subscribers=" + std::to_string(imu_jobs) +
+          " camera_job_subscribers=" + std::to_string(camera_jobs);
       });
 
     RCLCPP_INFO(
@@ -123,6 +142,7 @@ private:
   rclcpp::Publisher<Job>::SharedPtr camera_jobs_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr camera_subscription_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr readiness_;
 };
 
 }  // namespace

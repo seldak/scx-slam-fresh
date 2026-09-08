@@ -17,6 +17,26 @@ MATCH = re.search(r"^assert_matched_source_windows\(\) \{\n.*?^\}", SCRIPT,
 
 
 class BagAccounting(unittest.TestCase):
+    def test_adapter_readiness_requires_positive_live_response(self):
+        function = re.search(r"^wait_for_adapter_ready\(\) \{\n.*?^\}",
+                             SCRIPT, re.M | re.S).group()
+        command = function + '''
+adapter_pid=$$
+adapter_readiness_service=/test_ready
+housekeeping_cpu=1
+timeout() { shift; "$@"; }
+taskset() { shift 2; "$@"; }
+ros2() { printf 'success=%s\\n' "$response_value"; }
+response_value=$1
+wait_for_adapter_ready "$2"
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            for value, expected in (("True", 0), ("False", 1), ("", 1)):
+                result = subprocess.run(
+                    ["bash", "-c", command, "test", value, directory + '/ready.log'],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+
     def test_background_server_option_uses_loader_validation(self):
         configure = re.search(r"^configure_background_server\(\) \{\n.*?^\}",
                               SCRIPT, re.M | re.S).group()
