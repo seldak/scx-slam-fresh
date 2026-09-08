@@ -55,28 +55,6 @@ def case_plan(costs, repetitions, seed, probe=False, wakeup_only=False):
                        "lidar_pre_class_id": DEFAULT_LIDAR_PRE_CLASS_ID}
 
 
-def grace_case_plan(repetitions, seed):
-    rng = random.Random(seed)
-    for repetition in range(1, repetitions + 1):
-        variants = [DEFAULT_DEADLINE_GRACE_US, 0]
-        rng.shuffle(variants)
-        yield {"name": f"r{repetition}-wakeup-grace-{DEFAULT_DEADLINE_GRACE_US}-control-start-150",
-               "repetition": repetition, "role": "control-start", "imu_work_us": 150,
-               "imu_preempt": "wakeup", "deadline_grace_us": DEFAULT_DEADLINE_GRACE_US,
-               "lidar_pre_budget_us": DEFAULT_LIDAR_PRE_BUDGET_US,
-               "lidar_pre_class_id": DEFAULT_LIDAR_PRE_CLASS_ID}
-        for grace_us in variants:
-            yield {"name": f"r{repetition}-wakeup-grace-{grace_us}-sweep-3500",
-                   "repetition": repetition, "role": "sweep", "imu_work_us": 3500,
-                   "imu_preempt": "wakeup", "deadline_grace_us": grace_us,
-                   "lidar_pre_budget_us": DEFAULT_LIDAR_PRE_BUDGET_US,
-                   "lidar_pre_class_id": DEFAULT_LIDAR_PRE_CLASS_ID}
-        yield {"name": f"r{repetition}-wakeup-grace-{DEFAULT_DEADLINE_GRACE_US}-control-end-150",
-               "repetition": repetition, "role": "control-end", "imu_work_us": 150,
-               "imu_preempt": "wakeup", "deadline_grace_us": DEFAULT_DEADLINE_GRACE_US,
-               "lidar_pre_budget_us": DEFAULT_LIDAR_PRE_BUDGET_US,
-               "lidar_pre_class_id": DEFAULT_LIDAR_PRE_CLASS_ID}
-
 
 def lidar_pre_budget_case_plan(repetitions, seed):
     rng = random.Random(seed)
@@ -452,10 +430,8 @@ def parse_trace(text, metrics, cpu, mode):
     return events, summary
 
 
-def expiry_configuration(config, grace_probe=False):
+def expiry_configuration(config):
     application_owned = "expiry_policy=application" in config
-    if application_owned and grace_probe:
-        raise ValueError("the grace probe requires the historical age-demotion scheduler")
     return "application" if application_owned else "scheduler_age_demotion"
 
 
@@ -469,7 +445,7 @@ def run_one_case(case, args, output):
         config = subprocess.check_output(
             [str(build / "scx_slam_fresh_user"), "--print-config"], text=True)
         generic = "urgent_preempt=" in config
-        expiry_policy = expiry_configuration(config, args.grace_probe)
+        expiry_policy = expiry_configuration(config)
         case["expiry_policy"] = expiry_policy
         if expiry_policy == "application":
             case["deadline_grace_us"] = "not_applicable"
@@ -539,7 +515,7 @@ def run_one_case(case, args, output):
                                                                  DEFAULT_LIDAR_PRE_BUDGET_US),
                                     lidar_pre_class_id=case.get("lidar_pre_class_id",
                                                                 DEFAULT_LIDAR_PRE_CLASS_ID))
-            if ((args.grace_probe or args.lidar_pre_budget_probe or args.lidar_pre_class_probe) and
+            if ((args.lidar_pre_budget_probe or args.lidar_pre_class_probe) and
                     not {"focus_vision_fe", "focus_state_est"} <= metrics.keys()):
                 raise RuntimeError("focused E4 probe requires completed vision and estimator job-4 metrics")
             case = dict(case, process_elapsed_s=elapsed, enable_seq=enable_seq, metrics=metrics)
@@ -590,12 +566,10 @@ def main():
     parser.add_argument("--costs", type=costs_arg)
     parser.add_argument("--perf-sched", action="store_true",
                         help="standard perf sched plus estimator enqueue lanes; defaults to 3/65/70/3 percent")
-    parser.add_argument("--grace-probe", action="store_true",
-                        help="70%% default-grace versus zero-grace A/B with lean perf and estimator lanes")
     parser.add_argument("--lidar-pre-budget-probe", action="store_true",
-                        help="70%% LiDAR-pre 10ms versus 6ms budget A/B with 1ms grace and lean perf")
+                        help="70%% LiDAR-pre 10ms versus 6ms budget A/B with lean perf")
     parser.add_argument("--lidar-pre-class-probe", action="store_true",
-                        help="70%% LiDAR-pre FE versus BE class A/B with default budget/grace and lean perf")
+                        help="70%% LiDAR-pre FE versus BE class A/B with the default budget and lean perf")
     parser.add_argument("--preempt-probe", action="store_true",
                         help="pair wakeup/always preemption with IMU tracing (default costs: 150,2000,3000)")
     parser.add_argument("--execution-probe", action="store_true",
@@ -609,7 +583,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     explicit_perf_sched = args.perf_sched
-    focused_probes = (args.grace_probe, args.lidar_pre_budget_probe, args.lidar_pre_class_probe)
+    focused_probes = (args.lidar_pre_budget_probe, args.lidar_pre_class_probe)
     if any(focused_probes):
         if args.costs or args.preempt_probe or args.execution_probe or args.wakeup_only or args.binary_dir:
             parser.error("focused E4 probes are fixed current-binary wakeup-policy A/Bs")
@@ -631,14 +605,15 @@ def main():
     costs = args.costs or costs_arg("150,3250,3500" if explicit_perf_sched else
                                    "150,3000" if args.execution_probe else
                                    "150,2000,3000" if args.preempt_probe else DEFAULT_COSTS)
-    if args.grace_probe:
-        plan = list(grace_case_plan(args.repetitions, args.seed))
-    elif args.lidar_pre_budget_probe:
+    if args.lidar_pre_budget_probe:
         plan = list(lidar_pre_budget_case_plan(args.repetitions, args.seed))
     elif args.lidar_pre_class_probe:
         plan = list(lidar_pre_class_case_plan(args.repetitions, args.seed))
     else:
         plan = list(case_plan(costs, args.repetitions, args.seed, args.preempt_probe, args.wakeup_only))
+    if not args.binary_dir:
+        for case in plan:
+            case["deadline_grace_us"] = "not_applicable"
     if args.dry_run:
         for case in plan:
             command = command_for(case, args, "<unique-pin-dir>")
@@ -667,11 +642,6 @@ def main():
         if not (build / name).is_file():
             parser.error(f"missing binary artifact: {build / name}")
     ops_flags = check_embedded_mode(build / "scx_slam_fresh_user")
-    config = subprocess.check_output([str(build / "scx_slam_fresh_user"), "--print-config"], text=True)
-    try:
-        expiry_configuration(config, args.grace_probe)
-    except ValueError as error:
-        parser.error(str(error))
     output = args.output.resolve() if args.output else Path(tempfile.mkdtemp(prefix="scx-e4-"))
     if args.output:
         output.mkdir(parents=True, exist_ok=False)
@@ -695,7 +665,6 @@ def main():
                    "ext_policy": 7, "ops_flags": ops_flags, "observation": "fixed-window",
                    "preempt_probe": args.preempt_probe, "execution_probe": args.execution_probe, "schema": 8,
                    "perf_sched": args.perf_sched,
-                   "grace_probe": args.grace_probe,
                    "lidar_pre_budget_probe": args.lidar_pre_budget_probe,
                    "lidar_pre_class_probe": args.lidar_pre_class_probe,
                    "wakeup_only": args.wakeup_only, "binary_dir": str(build),

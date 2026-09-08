@@ -238,39 +238,7 @@ class E4Tests(unittest.TestCase):
                                   "--dry-run"], capture_output=True, text=True)
             self.assertNotEqual(bad.returncode, 0)
 
-    def test_grace_probe_is_bracketed_randomized_and_uses_lean_perf(self):
-        import os
-        cpu = min(os.sched_getaffinity(0))
-        result = subprocess.run([sys.executable, str(SCRIPT), "--grace-probe", "--cpu", str(cpu), "--dry-run"],
-                                capture_output=True, text=True, check=True)
-        lines = result.stdout.splitlines()
-        self.assertEqual(len(lines), 4)
-        self.assertIn("grace-1000-control-start-150", lines[0])
-        self.assertIn("grace-1000-control-end-150", lines[-1])
-        self.assertEqual({int(re.search(r"grace-(\d+)-sweep", line).group(1)) for line in lines[1:-1]},
-                         {0, 1000})
-        for line in lines:
-            self.assertIn("perf record -a -k mono", line)
-            self.assertNotIn("sched_stat_runtime", line)
-            self.assertIn("--urgent-preempt wakeup", line)
-            self.assertIn("--trace-stage 2; perf_sched=1", line)
-        for conflict in ("--costs 150,3500", "--preempt-probe", "--execution-probe",
-                         "--wakeup-only", "--binary-dir /tmp/archive"):
-            bad = subprocess.run([sys.executable, str(SCRIPT), "--grace-probe", *conflict.split(),
-                                  "--cpu", str(cpu), "--dry-run"], capture_output=True, text=True)
-            self.assertNotEqual(bad.returncode, 0)
-
-    def test_grace_plan_uses_one_binary_policy_and_default_controls(self):
-        plan = list(e4.grace_case_plan(2, 4))
-        self.assertEqual(len(plan), 8)
-        for repetition in (1, 2):
-            rows = [row for row in plan if row["repetition"] == repetition]
-            self.assertEqual(rows[0]["deadline_grace_us"], 1000)
-            self.assertEqual(rows[-1]["deadline_grace_us"], 1000)
-            self.assertEqual({row["deadline_grace_us"] for row in rows[1:-1]}, {0, 1000})
-            self.assertEqual({row["imu_preempt"] for row in rows}, {"wakeup"})
-
-    def test_lidar_pre_budget_probe_is_bracketed_and_keeps_grace_fixed(self):
+    def test_lidar_pre_budget_probe_is_bracketed_with_application_expiry(self):
         import os
         cpu = min(os.sched_getaffinity(0))
         result = subprocess.run([sys.executable, str(SCRIPT), "--lidar-pre-budget-probe",
@@ -283,7 +251,7 @@ class E4Tests(unittest.TestCase):
         self.assertEqual({int(re.search(r"lpre-budget-(\d+)-sweep", line).group(1))
                          for line in lines[1:-1]}, {6000, 10000})
         for line in lines:
-            self.assertIn("deadline_grace_us=1000", line)
+            self.assertIn("deadline_grace_us=not_applicable", line)
             self.assertIn("perf record -a -k mono", line)
             self.assertNotIn("sched_stat_runtime", line)
             self.assertIn("--lidar-pre-budget-us", line)
@@ -312,7 +280,7 @@ class E4Tests(unittest.TestCase):
         self.assertEqual({re.search(r"lpre-class-(fe|be)-sweep", line).group(1)
                           for line in lines[1:-1]}, {"fe", "be"})
         for line in lines:
-            self.assertIn("deadline_grace_us=1000", line)
+            self.assertIn("deadline_grace_us=not_applicable", line)
             self.assertIn("lidar_pre_budget_us=10000", line)
             self.assertIn("perf record -a -k mono", line)
             self.assertNotIn("sched_stat_runtime", line)
@@ -415,12 +383,17 @@ class E4Tests(unittest.TestCase):
         events, _ = e4.parse_trace(at_cutoff + summary, metrics, 0, "wakeup")
         self.assertEqual(events[0]["phase"], "drain")
 
-    def test_grace_probe_requires_age_demotion(self):
+    def test_removed_grace_probe_is_rejected(self):
+        result = subprocess.run([sys.executable, str(SCRIPT), "--grace-probe", "--dry-run"],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized arguments", result.stderr)
+
+
+    def test_archived_expiry_configuration_remains_readable(self):
         self.assertEqual(e4.expiry_configuration("expiry_policy=application"), "application")
-        self.assertEqual(e4.expiry_configuration("deadline_grace_us=1000", True),
+        self.assertEqual(e4.expiry_configuration("deadline_grace_us=1000"),
                          "scheduler_age_demotion")
-        with self.assertRaisesRegex(ValueError, "historical age-demotion"):
-            e4.expiry_configuration("expiry_policy=application", True)
 
     def test_changed_scheduler_rejected(self):
         loader = Mock()
