@@ -135,7 +135,6 @@ TEST(FreshnessExecutor, PublishesAssignedJobBeforeCallbackAndClearsAfterward)
   ASSERT_EQ(cleared_workers.size(), 1U);
   EXPECT_EQ(workers.front(), executor.worker_pid_tgid());
   EXPECT_EQ(cleared_workers.front(), executor.worker_pid_tgid());
-  EXPECT_EQ(hints.front().api_version, FRESH_API_VERSION);
   EXPECT_EQ(hints.front().stage_id, SLAM_STAGE_VISION_FE);
   EXPECT_EQ(hints.front().class_id, FRESH_CLASS_DEADLINE);
   EXPECT_EQ(hints.front().job_id, 1U);

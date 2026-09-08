@@ -79,7 +79,6 @@ void configure_worker(const WorkerConfig & config)
 fresh_task_hint clear_hint()
 {
   fresh_task_hint hint{};
-  hint.api_version = FRESH_API_VERSION;
   hint.stage_id = FRESH_STAGE_UNSPECIFIED;
   hint.class_id = FRESH_CLASS_BACKGROUND;
   return hint;
@@ -207,7 +206,6 @@ struct FreshnessExecutor::Impl
   {
     const uint64_t release_ns = metadata ? metadata->release_ts_ns : monotonic_now_ns();
     fresh_task_hint hint{};
-    hint.api_version = FRESH_API_VERSION;
     hint.stage_id = profile.stage_id;
     hint.class_id = profile.class_id;
     hint.job_id = metadata ? metadata->job_id : next_job_id++;
