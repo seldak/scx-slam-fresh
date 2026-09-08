@@ -10,15 +10,24 @@ scheduling with repeatable compute costs.
 
 ## How it works
 
+In the current ROS workload, an independent IMU callback runs alongside a
+camera-triggered vision → estimation → mapping chain. These callbacks consume
+synthetic CPU work; they do not fuse measurements. The application assigns IMU
+to Urgent, vision and estimation to Deadline, and mapping and hogs to Background.
+The scheduler itself knows only those service classes, not sensor identities.
+
 - **IMU fast path:** wakeup preemption and a dedicated dispatch queue protect
   the 200 Hz propagation worker.
 - **Front-end service:** vision and estimator workers use effective-deadline
   ordering. CPU-budget overruns demote eligible work to background service.
-- **Executor ownership:** stale subscriptions can be rejected before callback
-  entry. An accepted owner can finish its handoff and completion path without
-  being stranded by age demotion.
+- **Application-owned expiry:** the executor can reject stale messages before
+  callback entry. The scheduler never demotes work because of its age;
+  per-job CPU-budget demotion remains separate.
 - **Optional BE cap:** shorter background insertion slices reduce handoff
   waits under contention. The cap is disabled by default.
+- **Optional Background server:** native Background and budget-demoted Deadline
+  workers share service ahead of Deadline while the allocation is funded.
+  Urgent remains outside the pool. The server is disabled by default.
 
 The hint map contains one selected job per worker, not an application queue.
 See the [architecture](docs/DESIGN.md) and
@@ -56,11 +65,12 @@ checkout. It defaults to the sibling
 directory `../scx_fresh`; set `SCX_FRESH_DIR` for another location. No scheduler
 sources are vendored here. This tree requires the scheduler's version 3 hint ABI
 (`freshqos`, explicit service classes and application-owned expiry), validated
-with scheduler revision `5c3bcce`. The earlier version 2 baseline is not compatible.
+with scheduler revision `c0552e5`, including the optional Background server.
+The earlier version 2 baseline is not compatible.
 
 ```bash
 git clone https://github.com/seldak/scx_fresh.git ../scx_fresh
-git -C ../scx_fresh checkout 5c3bccedbded4ad34699b1a1ee4ea03c0a9aceb6
+git -C ../scx_fresh checkout c0552e5ebec770f7a1a9d1a4d8abbb6e7917cd1f
 ```
 
 ```bash

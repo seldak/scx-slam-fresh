@@ -12,7 +12,6 @@ CC ?= gcc
 PYTHON ?= python3
 
 BUILD_DIR ?= build
-PIN_DIR_DEFAULT ?= /sys/fs/bpf/scx_slam_fresh
 SCX_FRESH_DIR ?= $(abspath ../scx_fresh)
 export SCX_FRESH_DIR
 
@@ -49,8 +48,6 @@ $(BUILD_DIR)/slam_pipeline_demo: demo/slam_pipeline_demo.cpp demo/window_metrics
 	$(CXX) -O2 -g -I"$(SCX_FRESH_DIR)/include" -I"$(SCX_FRESH_DIR)/src" demo/slam_pipeline_demo.cpp "$(SCX_FRESH_DIR)/src/freshqos.c" \
 		-lbpf -lelf -lz -lpthread -o $@
 
-userspace: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo
-
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -81,4 +78,4 @@ ros2:
 test-ros2:
 	scripts/run_ros2.sh test
 
-.PHONY: all clean test-demo test-e4 test-scheduler-mode test-window test-slice ros2 test-ros2
+.PHONY: all bpf userspace clean test-demo test-e4 test-scheduler-mode test-window test-slice ros2 test-ros2

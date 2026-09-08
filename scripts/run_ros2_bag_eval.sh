@@ -46,7 +46,6 @@ Run 'make && make ros2 && make test-ros2' as your normal user first.
 Defaults:
   CPU=14 HOUSEKEEPING_CPU=1 DURATION=15 WARMUP=3 BAG_OFFSET=0
   REPETITIONS=3 HOG_THREADS=0 EXT_POLICY=7
-  DEADLINE_GRACE_US=unset (historical age-demotion schedulers only)
   BE_SLICE_CAP_US=0 (disabled) HINTED_ONLY=0
   BACKGROUND_SERVER_US=unset (disabled; optional runtime/period in microseconds)
   TRACE_DELIVERY=0 (1 buffers adapter delivery timestamps until shutdown)
@@ -452,19 +451,16 @@ set -u
 
 configure_expiry() {
     local config=$1
-    deadline_grace_args=()
-    if [[ $config == *"expiry_policy=application"* ]]; then
-        expiry_policy=application
-        if [[ -n $deadline_grace_us ]]; then
-            echo "error: unset DEADLINE_GRACE_US; expiry is application-owned in this scheduler" >&2
-            return 2
-        fi
-        deadline_grace_us=not_applicable
-    else
-        expiry_policy=scheduler_age_demotion
-        deadline_grace_us=${deadline_grace_us:-1000}
-        deadline_grace_args=(--deadline-grace-us "$deadline_grace_us")
+    if [[ $config != *"expiry_policy=application"* ]]; then
+        echo "error: this harness requires a scheduler with application-owned expiry" >&2
+        return 2
     fi
+    if [[ -n $deadline_grace_us ]]; then
+        echo "error: unset DEADLINE_GRACE_US; expiry is application-owned in this scheduler" >&2
+        return 2
+    fi
+    expiry_policy=application
+    deadline_grace_us=not_applicable
 }
 
 configure_background_server() {
@@ -473,7 +469,7 @@ configure_background_server() {
         background_server_args=(--background-server-us "$background_server_us")
     fi
     # Use the loader's validation, including range/overflow checks, before
-    # creating results or starting playback. Omission preserves older loaders.
+    # creating results or starting playback.
     loader_config=$("$loader_bin" --print-config "${background_server_args[@]}")
 }
 
@@ -574,7 +570,6 @@ if (( ! hinted_only )); then
 fi
 
 taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" \
-    "${deadline_grace_args[@]}" \
     "${background_server_args[@]}" \
     --be-slice-cap-us "$be_slice_cap_us" \
     >"$output_dir/loader.txt" 2>&1 &

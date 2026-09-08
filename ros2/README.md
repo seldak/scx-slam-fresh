@@ -144,7 +144,6 @@ The harness runs CFS followed by hinted partial-switch SCX. Useful controls:
 | `REPETITIONS` / `HOG_THREADS` | `3` / `0` | Runs per policy and contenders per run. |
 | `IMU_TOPIC` | `/imu0` | Bag IMU topic. |
 | `CAMERA_TOPIC` | `/cam0/image_raw` | Bag image topic. |
-| `DEADLINE_GRACE_US` | unset | Historical age-demotion schedulers only (default 1000 there). Rejected by the harness with application-owned expiry. |
 | `BE_SLICE_CAP_US` | `0` | Optional BE insertion cap in microseconds; zero disables it. |
 | `BACKGROUND_SERVER_US` | unset | Optional Background allocation as runtime/period in microseconds, e.g. `2000/10000`. Omit to disable. |
 | `TRACE_DELIVERY` | `0` | Set to `1` for buffered adapter delivery timestamps in each adapter log. Diagnostic runs only. |
@@ -157,6 +156,10 @@ Playback uses rate 1.0. The harness reads the source epoch and topic ordinals
 offline, keeps QoS preflight paused, and resumes playback after endpoints are
 ready. Ordinals make IDs and ID-dependent compute costs properties of the bag,
 rather than startup timing.
+
+The bag harness requires application-owned expiry. An inherited
+`DEADLINE_GRACE_US` setting is rejected; unset it rather than applying a
+scheduler-side age allowance. Historical results retain their recorded settings.
 
 Before resume, the harness also queries a service unique to that adapter
 instance. It requires middleware matches for both sensor inputs and both job

@@ -69,12 +69,10 @@ printf '%s|%s' "${background_server_args[*]}" "$loader_config"
         command = configure + '''
 deadline_grace_us=$2
 configure_expiry "$1" || exit $?
-printf '%s|%s|%s' "$expiry_policy" "$deadline_grace_us" "${deadline_grace_args[*]}"
+printf '%s|%s' "$expiry_policy" "$deadline_grace_us"
 '''
         for config, grace, expected in (
-            ("expiry_policy=application", "", "application|not_applicable|"),
-            ("deadline_grace_us=1000", "", "scheduler_age_demotion|1000|--deadline-grace-us 1000"),
-            ("deadline_grace_us=1000", "0", "scheduler_age_demotion|0|--deadline-grace-us 0"),
+            ("expiry_policy=application", "", "application|not_applicable"),
         ):
             result = subprocess.run(["bash", "-c", command, "test", config, grace],
                                     capture_output=True, text=True)
@@ -84,6 +82,11 @@ printf '%s|%s|%s' "$expiry_policy" "$deadline_grace_us" "${deadline_grace_args[*
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("unset DEADLINE_GRACE_US", result.stderr)
+        result = subprocess.run(
+            ["bash", "-c", command, "test", "deadline_grace_us=1000", ""],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires a scheduler with application-owned expiry", result.stderr)
 
     def test_ablation_validator_checks_all_cells_and_hog_windows(self):
         driver = (pathlib.Path(__file__).resolve().parents[1] /
