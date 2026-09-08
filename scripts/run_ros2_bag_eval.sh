@@ -21,6 +21,7 @@ ext_policy=${EXT_POLICY:-7}
 deadline_grace_us=${DEADLINE_GRACE_US:-}
 be_slice_cap_us=${BE_SLICE_CAP_US:-0}
 background_server_us=${BACKGROUND_SERVER_US:-}
+trace_delivery=${TRACE_DELIVERY:-0}
 hinted_only=${HINTED_ONLY:-0}
 scx_variant=${SCX_VARIANT:-hinted}
 baseline_dir=${BASELINE_DIR:-}
@@ -48,6 +49,7 @@ Defaults:
   DEADLINE_GRACE_US=unset (historical age-demotion schedulers only)
   BE_SLICE_CAP_US=0 (disabled) HINTED_ONLY=0
   BACKGROUND_SERVER_US=unset (disabled; optional runtime/period in microseconds)
+  TRACE_DELIVERY=0 (1 buffers adapter delivery timestamps until shutdown)
   SCX_VARIANT=hinted (hinted, imu-only, or fe-only)
   BASELINE_DIR= (optional previous results for source-window comparison)
   IMU_TOPIC=/imu0 CAMERA_TOPIC=/cam0/image_raw
@@ -134,12 +136,15 @@ start_adapter() {
     local required_job_subscribers=${2:-0}
     adapter_generation=$((adapter_generation + 1))
     adapter_readiness_service="/scx_bag_ready_$$_${adapter_generation}"
+    local trace_args=()
+    if [[ $trace_delivery == 1 ]]; then trace_args=(-p trace_delivery:=true); fi
     taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$adapter_bin" --ros-args \
         -p "imu_input:=$imu_topic" -p "camera_input:=$camera_topic" \
         -p "imu_source_index:=$output_dir/source-index/topic-0.tsv" \
         -p "camera_source_index:=$output_dir/source-index/topic-1.tsv" \
         -p "readiness_service:=$adapter_readiness_service" \
         -p "required_job_subscribers:=$required_job_subscribers" \
+        "${trace_args[@]}" \
         >"$log" 2>&1 &
     adapter_pid=$!
     wait_for_topic_endpoints /imu/jobs 1 0
@@ -390,6 +395,10 @@ if [[ -n $deadline_grace_us && ! $deadline_grace_us =~ ^[0-9]+$ ]]; then
     echo "error: DEADLINE_GRACE_US must be a non-negative integer" >&2
     exit 2
 fi
+if [[ $trace_delivery != 0 && $trace_delivery != 1 ]]; then
+    echo "error: TRACE_DELIVERY must be 0 or 1" >&2
+    exit 2
+fi
 if [[ $hinted_only != 0 && $hinted_only != 1 ]]; then
     echo "error: HINTED_ONLY must be 0 or 1" >&2
     exit 2
@@ -540,6 +549,7 @@ deadline_grace_us=$deadline_grace_us
 be_slice_cap_us=$be_slice_cap_us
 background_server_us=${background_server_us:-disabled}
 hinted_only=$hinted_only
+trace_delivery=$trace_delivery
 scx_variant=$scx_variant
 baseline_dir=$baseline_dir
 ops_flags=$ops_flags

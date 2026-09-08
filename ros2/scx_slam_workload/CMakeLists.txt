@@ -55,6 +55,12 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_test REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  ament_add_test(test_delivery_trace
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_delivery_trace.py
+      $<TARGET_FILE:scx_slam_bag_adapter>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 30
+  )
   ament_add_gtest(test_hint_ablation test/test_hint_ablation.cpp)
   target_include_directories(test_hint_ablation PRIVATE include)
   target_compile_features(test_hint_ablation PRIVATE cxx_std_17)

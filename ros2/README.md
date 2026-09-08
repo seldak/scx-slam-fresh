@@ -147,6 +147,7 @@ The harness runs CFS followed by hinted partial-switch SCX. Useful controls:
 | `DEADLINE_GRACE_US` | unset | Historical age-demotion schedulers only (default 1000 there). Rejected by the harness with application-owned expiry. |
 | `BE_SLICE_CAP_US` | `0` | Optional BE insertion cap in microseconds; zero disables it. |
 | `BACKGROUND_SERVER_US` | unset | Optional Background allocation as runtime/period in microseconds, e.g. `2000/10000`. Omit to disable. |
+| `TRACE_DELIVERY` | `0` | Set to `1` for buffered adapter delivery timestamps in each adapter log. Diagnostic runs only. |
 | `HINTED_ONLY` | `0` | Set to one to skip CFS. |
 | `SCX_VARIANT` | `hinted` | `hinted`, `imu-only`, or `fe-only`. |
 | `BASELINE_DIR` | unset | Prior results for exact source-window comparison. |
@@ -173,6 +174,21 @@ the same source-window and accounting gates.
 The adapter samples monotonic release time when taking a sensor message.
 Recorded header stamps identify the source window separately. Camera identity
 and release time propagate through vision, estimation, and mapping.
+
+For delivery-stall diagnosis, `TRACE_DELIVERY=1` records middleware source and
+receive timestamps, adapter entry, job release, and publish return for each
+message. Entry includes adjacent monotonic and realtime samples; release and
+exit use monotonic time, matching `perf --clockid mono`. Middleware timestamps
+are recorded as supplied by the RMW implementation: zero can mean unavailable,
+and their clock must be established before subtracting them from other clocks.
+Source header timestamps remain bag identities, not host execution times.
+
+Records are buffered in memory (at most 100,000) and written to the adapter log
+on clean shutdown. The trace summary reports omitted records separately from
+message drops. A killed or crashed adapter cannot flush this buffer. Tracing
+changes the adapter binary and adds timestamp overhead, so treat these runs as
+diagnostics, not replacements for the preserved performance results. It does
+not change perf output filenames.
 
 An independent audit counts each camera input as an offer to all three stages.
 `arrivals` counts subscription selections; `dropped_before_start` records
