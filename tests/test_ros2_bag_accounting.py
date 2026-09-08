@@ -17,6 +17,32 @@ MATCH = re.search(r"^assert_matched_source_windows\(\) \{\n.*?^\}", SCRIPT,
 
 
 class BagAccounting(unittest.TestCase):
+    def test_background_server_option_uses_loader_validation(self):
+        configure = re.search(r"^configure_background_server\(\) \{\n.*?^\}",
+                              SCRIPT, re.M | re.S).group()
+        loader = pathlib.Path(__file__).resolve().parents[1] / "build/scx_slam_fresh_user"
+        command = configure + '''
+loader_bin=$1
+background_server_us=$2
+configure_background_server || exit $?
+printf '%s|%s' "${background_server_args[*]}" "$loader_config"
+'''
+        for setting, expected_args, expected_runtime in (
+            ("", "", "background_runtime_us=0 background_period_us=0"),
+            ("2000/10000", "--background-server-us 2000/10000",
+             "background_runtime_us=2000 background_period_us=10000"),
+        ):
+            result = subprocess.run(["bash", "-c", command, "test", str(loader), setting],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.stdout.startswith(expected_args + "|"))
+            self.assertIn(expected_runtime, result.stdout)
+        for setting in ("0/10000", "10001/10000", "2000", "bad", "1/18446744073709551615"):
+            with self.subTest(setting=setting):
+                result = subprocess.run(["bash", "-c", command, "test", str(loader), setting],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_expiry_options_match_loaded_policy(self):
         configure = re.search(r"^configure_expiry\(\) \{\n.*?^\}", SCRIPT,
                               re.M | re.S).group()

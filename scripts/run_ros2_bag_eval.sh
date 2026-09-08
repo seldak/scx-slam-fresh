@@ -20,6 +20,7 @@ hog_threads=${HOG_THREADS:-0}
 ext_policy=${EXT_POLICY:-7}
 deadline_grace_us=${DEADLINE_GRACE_US:-}
 be_slice_cap_us=${BE_SLICE_CAP_US:-0}
+background_server_us=${BACKGROUND_SERVER_US:-}
 hinted_only=${HINTED_ONLY:-0}
 scx_variant=${SCX_VARIANT:-hinted}
 baseline_dir=${BASELINE_DIR:-}
@@ -44,6 +45,7 @@ Defaults:
   REPETITIONS=3 HOG_THREADS=0 EXT_POLICY=7
   DEADLINE_GRACE_US=unset (historical age-demotion schedulers only)
   BE_SLICE_CAP_US=0 (disabled) HINTED_ONLY=0
+  BACKGROUND_SERVER_US=unset (disabled; optional runtime/period in microseconds)
   SCX_VARIANT=hinted (hinted, imu-only, or fe-only)
   BASELINE_DIR= (optional previous results for source-window comparison)
   IMU_TOPIC=/imu0 CAMERA_TOPIC=/cam0/image_raw
@@ -430,8 +432,18 @@ configure_expiry() {
     fi
 }
 
+configure_background_server() {
+    background_server_args=()
+    if [[ -n $background_server_us ]]; then
+        background_server_args=(--background-server-us "$background_server_us")
+    fi
+    # Use the loader's validation, including range/overflow checks, before
+    # creating results or starting playback. Omission preserves older loaders.
+    loader_config=$("$loader_bin" --print-config "${background_server_args[@]}")
+}
+
 ops_flags=$("$loader_bin" --print-ops-flags)
-loader_config=$("$loader_bin" --print-config)
+configure_background_server
 configure_expiry "$loader_config"
 if [[ ! $ops_flags =~ ^0x[0-9a-fA-F]+$ ]] || (( (ops_flags & 8) == 0 )); then
     echo "error: embedded ops_flags=$ops_flags lacks SCX_OPS_SWITCH_PARTIAL" >&2
@@ -499,6 +511,7 @@ ext_policy=$ext_policy
 expiry_policy=$expiry_policy
 deadline_grace_us=$deadline_grace_us
 be_slice_cap_us=$be_slice_cap_us
+background_server_us=${background_server_us:-disabled}
 hinted_only=$hinted_only
 scx_variant=$scx_variant
 baseline_dir=$baseline_dir
@@ -525,6 +538,7 @@ fi
 
 taskset -c "$housekeeping_cpu" stdbuf -oL -eL "$loader_bin" --pin "$pin_dir" \
     "${deadline_grace_args[@]}" \
+    "${background_server_args[@]}" \
     --be-slice-cap-us "$be_slice_cap_us" \
     >"$output_dir/loader.txt" 2>&1 &
 loader_pid=$!
