@@ -28,7 +28,10 @@ SCX_SOURCES := $(wildcard $(SCX_FRESH_DIR)/bpf/* $(SCX_FRESH_DIR)/src/* $(SCX_FR
 
 all: bpf userspace
 
-userspace: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo
+userspace: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo $(BUILD_DIR)/dependent_workload
+
+$(BUILD_DIR)/dependent_workload: demo/dependent_workload.cpp demo/dependent_graph.h $(SCX_FRESH_DIR)/src/freshqos.c $(wildcard $(SCX_FRESH_DIR)/include/* $(SCX_FRESH_DIR)/src/*.h) | $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -I"$(SCX_FRESH_DIR)/include" -I"$(SCX_FRESH_DIR)/src" $< "$(SCX_FRESH_DIR)/src/freshqos.c" -lbpf -lpthread -o $@
 
 bpf: $(SKEL_H) $(BUILD_DIR)/scx_fresh.revision $(BUILD_DIR)/scx_fresh.diff
 
@@ -50,6 +53,14 @@ $(BUILD_DIR)/slam_pipeline_demo: demo/slam_pipeline_demo.cpp demo/window_metrics
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+$(BUILD_DIR)/test_dependent_graph: tests/test_dependent_graph.cpp demo/dependent_graph.h | $(BUILD_DIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: test-graph
+test-graph: $(BUILD_DIR)/test_dependent_graph $(BUILD_DIR)/dependent_workload
+	$(BUILD_DIR)/test_dependent_graph
+	$(PYTHON) tests/test_dependent_workload.py
 
 test-demo: $(BUILD_DIR)/slam_pipeline_demo
 	DEMO_BIN="$(abspath $(BUILD_DIR)/slam_pipeline_demo)" $(PYTHON) tests/test_demo_cli.py

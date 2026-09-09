@@ -4,6 +4,64 @@ The root [README](../README.md) contains the minimal build and run commands.
 This page covers additional controls. ROS and bag commands are in the
 [ROS guide](../ros2/README.md).
 
+## Dependent threaded workload
+
+`dependent_workload` is a separate synthetic scheduling workload. IMU and camera
+processing feed a bounded-batch estimator; periodic control selects the latest
+completed snapshot and a predetermined setpoint. Mapping consumes snapshots from
+batches containing camera input. No estimation mathematics or physical plant is
+implemented. The existing `slam_pipeline_demo` remains available for reproducing
+earlier experiments.
+
+```bash
+make test-graph
+build/dependent_workload --cpu 14 --housekeeping-cpu 1 --duration 2 --hogs 2
+```
+
+The fixed profile uses these experimental parameters, not measured algorithm costs:
+
+| Worker | Activation | CPU work | Service class | Completion bound |
+| --- | --- | --- | --- | --- |
+| IMU processing | Every 5 ms | 0.15 ms | Deadline | 5 ms from release |
+| Camera processing | Every 50 ms | 4 ms | Deadline | 33 ms from release |
+| Estimator | Available measurements, up to 8 per batch | 0.3 ms plus 0.1 ms per IMU and 2 ms per camera input | Deadline | 33 ms from first selected input's source time |
+| Control | Every 10 ms | 0.2 ms | Urgent | 10 ms from tick |
+| Mapping | Completed batch containing camera input | 2 ms | Background | 100 ms from retained camera source time, measured only |
+| Optional background workers | Dispatcher replenishes an idle worker during the source window | 1 ms per job | Background | 100 ms from assignment offer, measured only |
+
+Background workers are finite CPU jobs with dispatcher handoffs, not continuously
+runnable hogs. No job budgets are requested by this profile. Queue capacity is
+32 per processing queue or measurement inbox, with reject-new overflow. Control
+drops a tick if its previous job is still outstanding. A snapshot is eligible
+when its retained IMU measurement is at most 20 ms old at selection; this is a
+synthetic consumer rule, not a claim of estimator confidence or control safety.
+
+Workers enroll and park before the source epoch is chosen. The dispatcher owns
+selection and publishes a job hint before waking its worker. Completed hints
+remain intact until replacement; after the workload drains, the dispatcher
+retires them before waking workers for shutdown. Source offers stop at the fixed
+window boundary; outstanding work drains afterward. CPU totals include that
+drain, whose duration is reported separately.
+
+`--pin DIRECTORY` enables hints and SCHED_EXT enrollment. `--trace FILE` buffers
+per-job release, assignment, start, completion and dispatcher-observation times,
+then writes CSV after shutdown. Lifecycle records include worker TIDs. Batching
+can differ between runs and changes total estimator CPU work; compare consumed
+measurements and CPU totals as well as callback counts.
+
+For a self-contained loaded lifecycle/accounting check, with no other scheduler
+attached:
+
+```bash
+sudo python3 scripts/test_dependent_loaded.py --cpu 14 --housekeeping-cpu 1
+```
+
+The runner uses a 2 ms Background slice cap and a 2 ms / 10 ms Background server,
+captures loader and job logs, and cleans up its own pinned maps. It checks
+enrollment, completed work and source conservation. Callback misses remain
+reported; passing accounting is not a latency guarantee. Use an external timeout
+when invoking the workload directly under a policy that may starve a worker.
+
 ## Build modes
 
 `make` builds the external `scx_fresh` checkout and the local standalone demo.
