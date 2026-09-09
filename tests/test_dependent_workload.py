@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from test_dependent_loaded import validate
+from test_dependent_loaded import validate, summarize
 
 
 class ThreadedGraph(unittest.TestCase):
@@ -63,6 +63,11 @@ class ThreadedGraph(unittest.TestCase):
                     self.assertEqual(late, summary['late'])
                 if hogs == 2:
                     validate(result.stdout, trace, False)
+                    summary = summarize(result.stdout, trace, 'ordinary', 1)
+                    self.assertEqual(len(summary), 7)
+                    for row in summary:
+                        self.assertLessEqual(row['p99_start_us'], row['p99_completion_us'])
+                        self.assertEqual(int(row['completed']), workers[row['worker']]['completed'])
                     with self.assertRaises(RuntimeError):
                         validate(result.stdout.replace('offered=400', 'offered=399'), trace, False)
                     with self.assertRaises(RuntimeError):

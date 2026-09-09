@@ -208,6 +208,7 @@ int main(int argc,char **argv) {
         Time begin=clock_ns()+100*ms, end=begin+Time(seconds)*1000*ms;
         Time next_imu=begin,next_camera=begin,next_control=begin;
         uint64_t imu_id=0,camera_id=0,control_id=0,usable=0,stale=0,missing=0;
+        std::vector<Time> control_ages;
         std::cout<<"profile=dependent-v1 synthetic=1 duration_s="<<seconds
                  <<" hints="<<!pin.empty()<<" worker_cpu="<<cpu<<" housekeeping_cpu="<<housekeeping
                  <<" hogs="<<hog_count
@@ -242,6 +243,8 @@ int main(int argc,char **argv) {
                     usable+=selection.outcome==Outcome::usable;
                     stale+=selection.outcome==Outcome::stale;
                     missing+=selection.outcome==Outcome::missing;
+                    if(selection.snapshot && selection.snapshot->imu)
+                        control_ages.push_back(selection.release-selection.snapshot->imu->source_time);
                 }});
                 (void)accepted;
                 next_control+=10*ms;
@@ -297,6 +300,10 @@ int main(int argc,char **argv) {
                      <<" in_flight="<<graph.in_flight(s)<<"\n";
         }
         std::cout<<"control usable="<<usable<<" stale="<<stale<<" missing="<<missing<<"\n";
+        std::sort(control_ages.begin(),control_ages.end());
+        std::cout<<"control_age samples="<<control_ages.size()
+                 <<" p99_us="<<(control_ages.empty()?0:control_ages[(control_ages.size()*99+99)/100-1]/1000)
+                 <<" max_us="<<(control_ages.empty()?0:control_ages.back()/1000)<<"\n";
         // q remains open until worker destructors clear their hints; process exit closes it.
         return 0;
     } catch(const std::exception &e) {std::cerr<<e.what()<<"\n"; return 1;}

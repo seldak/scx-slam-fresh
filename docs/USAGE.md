@@ -56,8 +56,12 @@ attached:
 sudo python3 scripts/test_dependent_loaded.py --cpu 14 --housekeeping-cpu 1
 ```
 
-The runner uses a 2 ms Background slice cap and a 2 ms / 10 ms Background server,
-captures loader and job logs, and cleans up its own pinned maps. It checks
+The runner writes evidence under the Git-ignored `results/` directory and
+executes three ordinary-Linux runs followed by three hinted runs,
+each with a two-second source window and two background workers. Hinted runs
+use a 2 ms Background slice cap and a 2 ms / 10 ms Background server. It captures
+binary hashes, source changes, loader and job logs, writes a per-run summary,
+and cleans up its own pinned maps. It checks
 enrollment, completed work and source conservation. Callback misses remain
 reported; passing accounting is not a latency guarantee. Use an external timeout
 when invoking the workload directly under a policy that may starve a worker.

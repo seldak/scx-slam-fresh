@@ -3,6 +3,9 @@
 """Run the dependent workload with a fixed scheduler configuration and audit lifecycle."""
 import argparse
 import csv
+import hashlib
+import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -11,6 +14,24 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def summarize(text, trace, variant, repetition):
+    with trace.open() as file:
+        jobs = list(csv.DictReader(file))
+    result = []
+    for line in text.splitlines():
+        if not line.startswith('worker='):
+            continue
+        fields = dict(item.split('=', 1) for item in line.split())
+        name = fields.pop('worker')
+        row = dict(variant=variant, repetition=repetition, worker=name, **fields)
+        selected = [j for j in jobs if j['worker'] == name]
+        for metric, end in [('start', 'start_ns'), ('completion', 'end_ns')]:
+            ages = sorted(int(j[end]) - int(j['release_ns']) for j in selected)
+            row[f'p99_{metric}_us'] = ages[math.ceil(.99 * len(ages))-1] / 1000 if ages else ''
+        result.append(row)
+    return result
 
 
 def validate(text, trace, hinted):
@@ -74,11 +95,45 @@ def main():
         parser.error('requires root and distinct nonnegative CPUs')
     if Path('/sys/kernel/sched_ext/state').read_text().strip() != 'disabled':
         parser.error('stop the existing scheduler first')
-    output = Path(tempfile.mkdtemp(prefix='dependent-loaded-'))
+    results = ROOT / 'results'
+    results.mkdir(exist_ok=True)
+    output = Path(tempfile.mkdtemp(prefix='dependent-loaded-', dir=results))
     pin = Path('/sys/fs/bpf') / f'dependent-loaded-{os.getpid()}'
     print(f'Raw logs: {output}', flush=True)
+    summaries = []
+    metadata = {'kernel': os.uname().release, 'cpu': args.cpu,
+                'housekeeping_cpu': args.housekeeping_cpu, 'duration_s': 2,
+                'hogs': 2, 'repetitions': 3, 'order': 'ordinary-1..3, hinted-1..3',
+                'be_slice_cap_us': 2000, 'background_server_us': '2000/10000'}
+    for name in ('dependent_workload', 'scx_slam_fresh_user'):
+        metadata[name + '_sha256'] = hashlib.sha256((ROOT / 'build' / name).read_bytes()).hexdigest()
+    metadata['application_revision'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    metadata['scheduler_revision'] = (ROOT / 'build/scx_fresh.revision').read_text().strip()
+    (output / 'scheduler.diff').write_bytes((ROOT / 'build/scx_fresh.diff').read_bytes())
+    (output / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    (output / 'application.diff').write_bytes(subprocess.check_output(['git', 'diff', 'HEAD'], cwd=ROOT))
+    def workload(variant, repetition):
+        prefix = f'{variant}-{repetition}'
+        trace = output / f'{prefix}.csv'
+        command = [str(ROOT / 'build/dependent_workload'), '--cpu', str(args.cpu),
+                   '--housekeeping-cpu', str(args.housekeeping_cpu), '--duration', '2',
+                   '--hogs', '2', '--trace', str(trace)]
+        if variant == 'hinted':
+            command += ['--pin', str(pin)]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        (output / f'{prefix}.log').write_text(result.stdout + result.stderr)
+        if result.returncode:
+            raise RuntimeError(f'{prefix}: workload failed')
+        validate(result.stdout, trace, variant == 'hinted')
+        summaries.extend(summarize(result.stdout, trace, variant, repetition))
+        print(f'{prefix}: lifecycle and accounting passed', flush=True)
+        for line in result.stdout.splitlines():
+            if line.startswith(('control ', 'control_age ')):
+                print(line, flush=True)
     loader = None
     try:
+        for repetition in range(1, 4):
+            workload('ordinary', repetition)
         with (output / 'loader.log').open('w') as log:
             loader = subprocess.Popen(['taskset', '-c', str(args.housekeeping_cpu),
                 str(ROOT / 'build/scx_slam_fresh_user'), '--pin', str(pin),
@@ -89,16 +144,14 @@ def main():
                 if loader.poll() is not None or time.monotonic() > end:
                     raise RuntimeError('scheduler attachment failed')
                 time.sleep(.05)
-            result = subprocess.run([str(ROOT / 'build/dependent_workload'),
-                '--cpu', str(args.cpu), '--housekeeping-cpu', str(args.housekeeping_cpu),
-                '--duration', '2', '--hogs', '2', '--pin', str(pin),
-                '--trace', str(output / 'jobs.csv')], capture_output=True, text=True, timeout=15)
-            (output / 'workload.log').write_text(result.stdout + result.stderr)
-            print(result.stdout, end='', flush=True)
-            if result.returncode or loader.poll() is not None:
-                raise RuntimeError('workload/scheduler failed')
-            validate(result.stdout, output / 'jobs.csv', True)
-            print('Lifecycle and accounting gates passed; callback misses remain reported.')
+            for repetition in range(1, 4):
+                workload('hinted', repetition)
+                if loader.poll() is not None:
+                    raise RuntimeError('scheduler failed')
+        with (output / 'summary.csv').open('w') as file:
+            writer = csv.DictWriter(file, fieldnames=list(summaries[0]))
+            writer.writeheader(); writer.writerows(summaries)
+        print('Six runs complete; callback misses remain reported in summary.csv.')
     finally:
         if loader is not None:
             if loader.poll() is None:
