@@ -44,20 +44,26 @@ class Worker {
     std::exception_ptr error;
     freshqos *qos;
     unsigned cls, stage;
+    bool fifo;
     void run(int cpu) {
         try {
             pin_cpu(cpu);
             std::unique_lock<std::mutex> lock(mutex);
             tid=freshqos_pid_tgid_self();
             bool enrolled=false;
-            if(qos) {
+            if(qos || (fifo && cls!=FRESH_CLASS_BACKGROUND)) {
                 enrollment_begin=clock_ns();
-                if(freshqos_clear_hint(qos)) throw std::runtime_error("initial hint clear failed");
+                if(qos && freshqos_clear_hint(qos)) throw std::runtime_error("initial hint clear failed");
                 sched_param p{};
-                if(sched_setscheduler(0,7,&p)) throw std::runtime_error("SCHED_EXT enrollment failed");
+                p.sched_priority=fifo ? (cls==FRESH_CLASS_URGENT ? 70 : (stage==0 ? 60 : 50)) : 0;
+                if(sched_setscheduler(0,fifo?SCHED_FIFO:7,&p)) throw std::runtime_error("worker enrollment failed");
                 enrolled=true;
                 enrollment_end=clock_ns();
             }
+            actual_policy=sched_getscheduler(0);
+            sched_param actual{};
+            if(actual_policy<0 || sched_getparam(0,&actual)) throw std::runtime_error("read worker policy failed");
+            actual_priority=actual.sched_priority;
             ready=true; cv.notify_all();
             while(true) {
                 cv.wait(lock,[&]{return stopping || slot.has_value();});
@@ -88,13 +94,14 @@ public:
     uint64_t offered=0,dropped=0,completed=0,late=0;
     Time cpu_time=0,max_start=0,max_age=0;
     Time enrollment_begin=0,enrollment_end=0,shutdown_begin=0,shutdown_end=0;
+    int actual_policy=0,actual_priority=0;
     struct Trace { uint64_t id; Time release, assigned, start, end, observed, deadline, cpu; };
     std::vector<Trace> traces;
     bool tracing=false;
     std::deque<Job> queue;
     bool busy=false;
-    Worker(std::string name,unsigned cls,unsigned stage,int cpu,freshqos *qos):
-        qos(qos),cls(cls),stage(stage),name(std::move(name)) {
+    Worker(std::string name,unsigned cls,unsigned stage,int cpu,freshqos *qos,bool fifo=false):
+        qos(qos),cls(cls),stage(stage),fifo(fifo),name(std::move(name)) {
         thread=std::thread([this,cpu]{run(cpu);});
         std::unique_lock<std::mutex> lock(mutex);
         cv.wait(lock,[&]{return ready;});
@@ -157,17 +164,18 @@ public:
 int main(int argc,char **argv) {
     try {
         int cpu=-1, housekeeping=-1, seconds=2, hog_count=0;
-        std::string pin, trace_path;
+        std::string pin, trace_path, policy="ordinary";
         for(int i=1;i<argc;i++) {
             std::string a=argv[i];
             if(a=="--help") {
-                std::cout<<"--cpu N --housekeeping-cpu N [--duration SECONDS] [--hogs 0..2] [--pin BPF_DIRECTORY] [--trace FILE]\n";
+                std::cout<<"--cpu N --housekeeping-cpu N [--duration SECONDS] [--hogs 0..2] [--policy ordinary|fifo] [--pin BPF_DIRECTORY] [--trace FILE]\n";
                 return 0;
             }
             if(i+1==argc) throw std::invalid_argument("missing option value");
             std::string v=argv[++i];
             if(a=="--pin") pin=v;
             else if(a=="--trace") trace_path=v;
+            else if(a=="--policy") policy=v;
             else {
                 size_t used; int n=std::stoi(v,&used);
                 if(used!=v.size()) throw std::invalid_argument("invalid integer");
@@ -178,6 +186,8 @@ int main(int argc,char **argv) {
                 else throw std::invalid_argument("unknown option");
             }
         }
+        if((policy!="ordinary" && policy!="fifo") || (policy=="fifo" && !pin.empty()))
+            throw std::invalid_argument("require ordinary or fifo policy; fifo cannot use hints");
         if(cpu<0 || housekeeping<0 || cpu>=CPU_SETSIZE || housekeeping>=CPU_SETSIZE ||
            cpu==housekeeping || seconds<1 || seconds>60 || hog_count<0 || hog_count>2)
             throw std::invalid_argument("require distinct CPUs and duration 1..60 seconds");
@@ -192,10 +202,10 @@ int main(int argc,char **argv) {
         Graph graph(32,8);
         freshqos *hints=pin.empty()?nullptr:&q;
         // Deliberate synthetic profile, not measured robotics execution costs.
-        Worker imu("imu_processing",FRESH_CLASS_DEADLINE,0,cpu,hints);
-        Worker camera("camera_processing",FRESH_CLASS_DEADLINE,1,cpu,hints);
-        Worker estimator("estimator",FRESH_CLASS_DEADLINE,2,cpu,hints);
-        Worker control("control",FRESH_CLASS_URGENT,3,cpu,hints);
+        Worker imu("imu_processing",FRESH_CLASS_DEADLINE,0,cpu,hints,policy=="fifo");
+        Worker camera("camera_processing",FRESH_CLASS_DEADLINE,1,cpu,hints,policy=="fifo");
+        Worker estimator("estimator",FRESH_CLASS_DEADLINE,2,cpu,hints,policy=="fifo");
+        Worker control("control",FRESH_CLASS_URGENT,3,cpu,hints,policy=="fifo");
         Worker mapping("mapping",FRESH_CLASS_BACKGROUND,4,cpu,hints);
         std::vector<Worker *> workers{&imu,&camera,&estimator,&control,&mapping};
         std::vector<std::unique_ptr<Worker>> hogs;
@@ -211,6 +221,7 @@ int main(int argc,char **argv) {
         std::vector<Time> control_ages;
         std::cout<<"profile=dependent-v1 synthetic=1 duration_s="<<seconds
                  <<" hints="<<!pin.empty()<<" worker_cpu="<<cpu<<" housekeeping_cpu="<<housekeeping
+                 <<" policy="<<(hints?"hinted":policy)
                  <<" hogs="<<hog_count
                  <<" queue_capacity=32 batch_limit=8 imu_period_us=5000 camera_period_us=50000"
                  <<" control_period_us=10000 max_imu_age_us=20000\n";
@@ -286,6 +297,7 @@ int main(int argc,char **argv) {
         for(auto *w:workers)
             std::cout<<"lifecycle worker="<<w->name<<" enrollment_begin_ns="<<w->enrollment_begin
                      <<" tid="<<(w->identity() & 0xffffffffULL)<<" class="<<w->service_class()
+                     <<" policy="<<w->actual_policy<<" priority="<<w->actual_priority
                      <<" enrollment_end_ns="<<w->enrollment_end<<" shutdown_begin_ns="<<w->shutdown_begin
                      <<" shutdown_end_ns="<<w->shutdown_end<<"\n";
         for(auto *w:workers)

@@ -14,6 +14,13 @@ from test_dependent_loaded import validate, summarize
 
 
 class ThreadedGraph(unittest.TestCase):
+    def test_invalid_policy(self):
+        for options in (['--policy', 'unknown'], ['--policy', 'fifo', '--pin', '/unused']):
+            result = subprocess.run([str(ROOT / 'build/dependent_workload'), *options],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('fifo', result.stderr)
+
     def test_accounting_with_and_without_contention(self):
         allowed = sorted(os.sched_getaffinity(0))
         if len(allowed) < 2:
@@ -72,6 +79,10 @@ class ThreadedGraph(unittest.TestCase):
                         validate(result.stdout.replace('offered=400', 'offered=399'), trace, False)
                     with self.assertRaises(RuntimeError):
                         validate(result.stdout, trace, True)  # Unenrolled workers must fail.
+                    with self.assertRaises(RuntimeError):
+                        validate(result.stdout, trace, False, True)
+                    with self.assertRaises(RuntimeError):
+                        validate(result.stdout.replace('priority=0', 'priority=70'), trace, False)
 
 
 if __name__ == '__main__':

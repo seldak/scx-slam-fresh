@@ -57,7 +57,7 @@ sudo python3 scripts/test_dependent_loaded.py --cpu 14 --housekeeping-cpu 1
 ```
 
 The runner writes evidence under the Git-ignored `results/` directory and
-executes three ordinary-Linux runs followed by three hinted runs,
+executes three ordinary-Linux runs, three FIFO runs, then three hinted runs,
 each with a two-second source window and two background workers. Hinted runs
 use a 2 ms Background slice cap and a 2 ms / 10 ms Background server. It captures
 binary hashes, source changes, loader and job logs, writes a per-run summary,
@@ -65,6 +65,19 @@ and cleans up its own pinned maps. It checks
 enrollment, completed work and source conservation. Callback misses remain
 reported; passing accounting is not a latency guarantee. Use an external timeout
 when invoking the workload directly under a policy that may starve a worker.
+
+The fixed-priority baseline uses `--policy fifo`: control runs at FIFO priority
+70, IMU processing at 60, and camera processing and estimation at 50. Mapping
+and both background workers stay SCHED_OTHER. Higher numbers mean higher Linux
+RT priority; equal-priority FIFO workers do not time-slice. This is a chosen
+application priority assignment, not a claim of optimal priorities. See the
+[Linux scheduling rules](https://man7.org/linux/man-pages/man7/sched.7.html).
+The dispatcher remains on its housekeeping CPU under SCHED_OTHER. Work, queues,
+deadlines and source counts are identical across variants; the FIFO baseline
+does not publish hints or attach sched_ext. It cannot be combined with `--pin`.
+The runner verifies actual worker policies and priorities and records the
+unchanged kernel RT runtime/period limits. Neither a Background reservation nor
+the sched_ext slice cap applies to FIFO. All workers enroll before source release.
 
 ## Build modes
 

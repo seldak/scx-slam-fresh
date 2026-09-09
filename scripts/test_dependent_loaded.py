@@ -34,7 +34,7 @@ def summarize(text, trace, variant, repetition):
     return result
 
 
-def validate(text, trace, hinted):
+def validate(text, trace, hinted, fifo=False):
     workers, lifecycle, streams = {}, {}, {}
     window = None
     outcomes = None
@@ -63,7 +63,12 @@ def validate(text, trace, hinted):
         if w['offered'] != w['completed'] + w['dropped'] or w['pending'] or w['in_flight']:
             raise RuntimeError(f'{name}: incomplete accounting')
         life = lifecycle[name]
-        if hinted and not 0 < life['enrollment_begin_ns'] <= life['enrollment_end_ns'] < window['begin_ns']:
+        priority = {'control': 70, 'imu_processing': 60, 'camera_processing': 50,
+                    'estimator': 50}.get(name, 0) if fifo else 0
+        policy = 7 if hinted else (1 if priority else 0)
+        if life['policy'] != policy or life['priority'] != priority:
+            raise RuntimeError(f'{name}: scheduler policy/priority mismatch')
+        if (hinted or priority) and not 0 < life['enrollment_begin_ns'] <= life['enrollment_end_ns'] < window['begin_ns']:
             raise RuntimeError(f'{name}: enrollment overlaps measured releases')
         jobs = [r for r in rows if r['worker'] == name]
         if len(jobs) != w['completed'] or len({r['job'] for r in jobs}) != len(jobs):
@@ -97,14 +102,21 @@ def main():
         parser.error('stop the existing scheduler first')
     results = ROOT / 'results'
     results.mkdir(exist_ok=True)
+    if 'SUDO_UID' in os.environ:
+        os.chown(results, int(os.environ['SUDO_UID']), int(os.environ['SUDO_GID']))
     output = Path(tempfile.mkdtemp(prefix='dependent-loaded-', dir=results))
     pin = Path('/sys/fs/bpf') / f'dependent-loaded-{os.getpid()}'
     print(f'Raw logs: {output}', flush=True)
     summaries = []
     metadata = {'kernel': os.uname().release, 'cpu': args.cpu,
                 'housekeeping_cpu': args.housekeeping_cpu, 'duration_s': 2,
-                'hogs': 2, 'repetitions': 3, 'order': 'ordinary-1..3, hinted-1..3',
+                'hogs': 2, 'repetitions': 3, 'order': 'ordinary-1..3, fifo-1..3, hinted-1..3',
+                'fifo_priorities': {'control': 70, 'imu_processing': 60,
+                                    'camera_processing': 50, 'estimator': 50},
+                'fifo_background_policy': 'SCHED_OTHER',
                 'be_slice_cap_us': 2000, 'background_server_us': '2000/10000'}
+    for setting in ('sched_rt_runtime_us', 'sched_rt_period_us'):
+        metadata[setting] = int((Path('/proc/sys/kernel') / setting).read_text())
     for name in ('dependent_workload', 'scx_slam_fresh_user'):
         metadata[name + '_sha256'] = hashlib.sha256((ROOT / 'build' / name).read_bytes()).hexdigest()
     metadata['application_revision'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
@@ -120,11 +132,13 @@ def main():
                    '--hogs', '2', '--trace', str(trace)]
         if variant == 'hinted':
             command += ['--pin', str(pin)]
+        elif variant == 'fifo':
+            command += ['--policy', 'fifo']
         result = subprocess.run(command, capture_output=True, text=True, timeout=15)
         (output / f'{prefix}.log').write_text(result.stdout + result.stderr)
         if result.returncode:
             raise RuntimeError(f'{prefix}: workload failed')
-        validate(result.stdout, trace, variant == 'hinted')
+        validate(result.stdout, trace, variant == 'hinted', variant == 'fifo')
         summaries.extend(summarize(result.stdout, trace, variant, repetition))
         print(f'{prefix}: lifecycle and accounting passed', flush=True)
         for line in result.stdout.splitlines():
@@ -134,6 +148,8 @@ def main():
     try:
         for repetition in range(1, 4):
             workload('ordinary', repetition)
+        for repetition in range(1, 4):
+            workload('fifo', repetition)
         with (output / 'loader.log').open('w') as log:
             loader = subprocess.Popen(['taskset', '-c', str(args.housekeeping_cpu),
                 str(ROOT / 'build/scx_slam_fresh_user'), '--pin', str(pin),
@@ -151,7 +167,7 @@ def main():
         with (output / 'summary.csv').open('w') as file:
             writer = csv.DictWriter(file, fieldnames=list(summaries[0]))
             writer.writeheader(); writer.writerows(summaries)
-        print('Six runs complete; callback misses remain reported in summary.csv.')
+        print('Nine runs complete; callback misses remain reported in summary.csv.')
     finally:
         if loader is not None:
             if loader.poll() is None:
