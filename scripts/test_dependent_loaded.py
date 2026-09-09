@@ -16,6 +16,42 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def burst_metrics(text, trace):
+    fields = dict(x.split('=') for x in next(l for l in text.splitlines()
+                                            if l.startswith('burst ')).split()[1:])
+    with trace.open() as file:
+        rows = list(csv.DictReader(file))
+    bursts = [r for r in rows if r['worker'] == 'estimator' and int(r['work_ns']) >= 80000000]
+    if len(bursts) != 1 or bursts[0]['job'] != fields['job']:
+        raise RuntimeError('missing or duplicate burst')
+    b = bursts[0]
+    if any(int(r['budget_ns']) != (4000000 if r['worker'] == 'estimator' else 0) for r in rows):
+        raise RuntimeError('incorrect burst profile budget')
+    start, end = int(b['start_ns']), int(b['end_ns'])
+    control = [r for r in rows if r['worker'] == 'control']
+    recovered = [int(r['assigned_ns']) for r in control
+                 if int(r['assigned_ns']) >= end and r['control_outcome'] == '0']
+    metrics = {'burst_wall_ms': (end-start)/1e6, 'burst_cpu_ms': int(b['cpu_ns'])/1e6,
+               'control_late': sum(int(r['end_ns']) > int(r['deadline_ns']) for r in control),
+               'control_stale': sum(r['control_outcome'] == '1' for r in control),
+               'recovery_ms': (min(recovered)-end)/1e6 if recovered else None}
+    for line in text.splitlines():
+        if line.startswith('stream='):
+            source = dict(x.split('=') for x in line.split())
+            metrics[source['stream'] + '_input_dropped'] = int(source['dropped'])
+    for worker in ('imu_processing', 'estimator', 'mapping'):
+        metrics[worker + '_late'] = sum(int(r['end_ns']) > int(r['deadline_ns'])
+                                        for r in rows if r['worker'] == worker)
+    for worker in ('mapping', 'hog0', 'hog1'):
+        # Count only jobs wholly served within the burst; do not attribute a
+        # boundary-spanning job's full CPU time to this interval.
+        inside = [r for r in rows if r['worker'] == worker and
+                  start <= int(r['start_ns']) <= int(r['end_ns']) <= end]
+        metrics[worker + '_completed_during_burst'] = len(inside)
+        metrics[worker + '_cpu_ms_during_burst'] = sum(int(r['cpu_ns']) for r in inside)/1e6
+    return metrics
+
+
 def summarize(text, trace, variant, repetition):
     with trace.open() as file:
         jobs = list(csv.DictReader(file))
@@ -108,6 +144,7 @@ def main():
     pin = Path('/sys/fs/bpf') / f'dependent-loaded-{os.getpid()}'
     print(f'Raw logs: {output}', flush=True)
     summaries = []
+    bursts = []
     metadata = {'kernel': os.uname().release, 'cpu': args.cpu,
                 'housekeeping_cpu': args.housekeeping_cpu, 'duration_s': 2,
                 'hogs': 2, 'repetitions': 3, 'order': 'ordinary-1..3, fifo-1..3, hinted-1..3',
@@ -115,6 +152,10 @@ def main():
                                     'camera_processing': 50, 'estimator': 50},
                 'fifo_background_policy': 'SCHED_OTHER',
                 'be_slice_cap_us': 2000, 'background_server_us': '2000/10000'}
+    metadata['scenarios'] = ['nominal', 'estimator-burst']
+    metadata['scenario_order'] = 'nominal then estimator-burst within each variant'
+    metadata['burst'] = {'camera_sequence': 11, 'extra_cpu_ns': 80000000,
+                         'estimator_job_budget_ns': 4000000}
     for setting in ('sched_rt_runtime_us', 'sched_rt_period_us'):
         metadata[setting] = int((Path('/proc/sys/kernel') / setting).read_text())
     for name in ('dependent_workload', 'scx_slam_fresh_user'):
@@ -124,12 +165,12 @@ def main():
     (output / 'scheduler.diff').write_bytes((ROOT / 'build/scx_fresh.diff').read_bytes())
     (output / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
     (output / 'application.diff').write_bytes(subprocess.check_output(['git', 'diff', 'HEAD'], cwd=ROOT))
-    def workload(variant, repetition):
-        prefix = f'{variant}-{repetition}'
+    def workload(variant, repetition, scenario):
+        prefix = f'{scenario}-{variant}-{repetition}'
         trace = output / f'{prefix}.csv'
         command = [str(ROOT / 'build/dependent_workload'), '--cpu', str(args.cpu),
                    '--housekeeping-cpu', str(args.housekeeping_cpu), '--duration', '2',
-                   '--hogs', '2', '--trace', str(trace)]
+                   '--hogs', '2', '--trace', str(trace), '--scenario', scenario]
         if variant == 'hinted':
             command += ['--pin', str(pin)]
         elif variant == 'fifo':
@@ -139,17 +180,21 @@ def main():
         if result.returncode:
             raise RuntimeError(f'{prefix}: workload failed')
         validate(result.stdout, trace, variant == 'hinted', variant == 'fifo')
-        summaries.extend(summarize(result.stdout, trace, variant, repetition))
+        summaries.extend(dict(scenario=scenario, **r) for r in summarize(result.stdout, trace, variant, repetition))
+        if scenario == 'estimator-burst':
+            metrics = burst_metrics(result.stdout, trace)
+            bursts.append(dict(variant=variant, repetition=repetition, **metrics))
+            print(json.dumps(bursts[-1]), flush=True)
         print(f'{prefix}: lifecycle and accounting passed', flush=True)
         for line in result.stdout.splitlines():
             if line.startswith(('control ', 'control_age ')):
                 print(line, flush=True)
     loader = None
     try:
-        for repetition in range(1, 4):
-            workload('ordinary', repetition)
-        for repetition in range(1, 4):
-            workload('fifo', repetition)
+        for variant in ('ordinary', 'fifo'):
+            for scenario in metadata['scenarios']:
+                for repetition in range(1, 4):
+                    workload(variant, repetition, scenario)
         with (output / 'loader.log').open('w') as log:
             loader = subprocess.Popen(['taskset', '-c', str(args.housekeeping_cpu),
                 str(ROOT / 'build/scx_slam_fresh_user'), '--pin', str(pin),
@@ -160,14 +205,16 @@ def main():
                 if loader.poll() is not None or time.monotonic() > end:
                     raise RuntimeError('scheduler attachment failed')
                 time.sleep(.05)
-            for repetition in range(1, 4):
-                workload('hinted', repetition)
-                if loader.poll() is not None:
-                    raise RuntimeError('scheduler failed')
+            for scenario in metadata['scenarios']:
+                for repetition in range(1, 4):
+                    workload('hinted', repetition, scenario)
+                    if loader.poll() is not None:
+                        raise RuntimeError('scheduler failed')
         with (output / 'summary.csv').open('w') as file:
             writer = csv.DictWriter(file, fieldnames=list(summaries[0]))
             writer.writeheader(); writer.writerows(summaries)
-        print('Nine runs complete; callback misses remain reported in summary.csv.')
+        (output / 'burst-summary.json').write_text(json.dumps(bursts, indent=2) + '\n')
+        print('Eighteen runs complete; timing failures remain reported, not retried.')
     finally:
         if loader is not None:
             if loader.poll() is None:

@@ -57,7 +57,8 @@ sudo python3 scripts/test_dependent_loaded.py --cpu 14 --housekeeping-cpu 1
 ```
 
 The runner writes evidence under the Git-ignored `results/` directory and
-executes three ordinary-Linux runs, three FIFO runs, then three hinted runs,
+executes ordinary-Linux, FIFO, then hinted runs. Each variant runs three nominal
+cases followed by three estimator-burst cases (18 runs total),
 each with a two-second source window and two background workers. Hinted runs
 use a 2 ms Background slice cap and a 2 ms / 10 ms Background server. It captures
 binary hashes, source changes, loader and job logs, writes a per-run summary,
@@ -78,6 +79,28 @@ does not publish hints or attach sched_ext. It cannot be combined with `--pin`.
 The runner verifies actual worker policies and priorities and records the
 unchanged kernel RT runtime/period limits. Neither a Background reservation nor
 the sched_ext slice cap applies to FIFO. All workers enroll before source release.
+
+`--scenario estimator-burst` adds exactly 80 ms of synthetic thread CPU work to
+the estimator batch containing camera sequence 11 (released 500 ms into the
+source window). Every estimator job in this profile carries a 4 ms job budget;
+only hinted scheduling consumes that metadata. The ordinary and FIFO variants
+execute the same compute with the same queues and deadlines. The nominal profile
+retains zero job budgets and its original compute rules. These are controlled
+stress parameters, not measured estimator costs.
+
+The runner verifies one burst, records requested work and budgets in job traces,
+and writes `burst-summary.json`. It reports burst CPU and wall time, control
+deadline misses and stale selections, and delay from burst completion to the
+next usable control selection. Background interval CPU includes only jobs that
+start and finish inside the burst, so it is a lower bound. Mapping depends on
+completed estimator snapshots: zero mapping completions alone does not show
+scheduler starvation. No mapping service requirement is claimed when it has no
+ready work. Recovery and source conservation are distinct from control freshness;
+an on-time callback may still select stale input. The runner reports timing
+failures without retrying for a passing result.
+
+Use `--scenario estimator-burst` with the plotting script to select those rows
+from the combined summary; the default plots nominal runs.
 
 ## Build modes
 

@@ -29,6 +29,8 @@ struct Job {
     Time release=0, deadline=0, work=0;
     std::function<void(Time)> complete;
     Time assigned=0;
+    Time budget=0;
+    int outcome=-1;
 };
 struct Result { Job job; Time start, end, cpu; };
 
@@ -95,7 +97,7 @@ public:
     Time cpu_time=0,max_start=0,max_age=0;
     Time enrollment_begin=0,enrollment_end=0,shutdown_begin=0,shutdown_end=0;
     int actual_policy=0,actual_priority=0;
-    struct Trace { uint64_t id; Time release, assigned, start, end, observed, deadline, cpu; };
+    struct Trace { uint64_t id; Time release, assigned, start, end, observed, deadline, cpu, work, budget; int outcome; };
     std::vector<Trace> traces;
     bool tracing=false;
     std::deque<Job> queue;
@@ -139,7 +141,7 @@ public:
         if(busy || queue.empty()) return;
         const Job &j=queue.front();
         if(qos && freshqos_publish_job_for(qos,tid,stage,cls,j.id,j.release,
-                j.deadline,0,0,0,0)) throw std::runtime_error("hint publication failed");
+                j.deadline,0,j.budget,0,0)) throw std::runtime_error("hint publication failed");
         slot=std::move(queue.front()); slot->assigned=clock_ns();
         queue.pop_front(); busy=true; cv.notify_one();
     }
@@ -152,7 +154,7 @@ public:
         }
         if(!done) return;
         if(tracing) traces.push_back({done->job.id,done->job.release,done->job.assigned,
-            done->start,done->end,clock_ns(),done->job.deadline,done->cpu});
+            done->start,done->end,clock_ns(),done->job.deadline,done->cpu,done->job.work,done->job.budget,done->job.outcome});
         busy=false; ++completed; cpu_time+=done->cpu;
         max_start=std::max(max_start,done->start-done->job.release);
         max_age=std::max(max_age,done->end-done->job.release);
@@ -164,11 +166,11 @@ public:
 int main(int argc,char **argv) {
     try {
         int cpu=-1, housekeeping=-1, seconds=2, hog_count=0;
-        std::string pin, trace_path, policy="ordinary";
+        std::string pin, trace_path, policy="ordinary", scenario="nominal";
         for(int i=1;i<argc;i++) {
             std::string a=argv[i];
             if(a=="--help") {
-                std::cout<<"--cpu N --housekeeping-cpu N [--duration SECONDS] [--hogs 0..2] [--policy ordinary|fifo] [--pin BPF_DIRECTORY] [--trace FILE]\n";
+                std::cout<<"--cpu N --housekeeping-cpu N [--duration SECONDS] [--hogs 0..2] [--policy ordinary|fifo] [--scenario nominal|estimator-burst] [--pin BPF_DIRECTORY] [--trace FILE]\n";
                 return 0;
             }
             if(i+1==argc) throw std::invalid_argument("missing option value");
@@ -176,6 +178,7 @@ int main(int argc,char **argv) {
             if(a=="--pin") pin=v;
             else if(a=="--trace") trace_path=v;
             else if(a=="--policy") policy=v;
+            else if(a=="--scenario") scenario=v;
             else {
                 size_t used; int n=std::stoi(v,&used);
                 if(used!=v.size()) throw std::invalid_argument("invalid integer");
@@ -188,6 +191,8 @@ int main(int argc,char **argv) {
         }
         if((policy!="ordinary" && policy!="fifo") || (policy=="fifo" && !pin.empty()))
             throw std::invalid_argument("require ordinary or fifo policy; fifo cannot use hints");
+        if(scenario!="nominal" && scenario!="estimator-burst")
+            throw std::invalid_argument("unknown scenario");
         if(cpu<0 || housekeeping<0 || cpu>=CPU_SETSIZE || housekeeping>=CPU_SETSIZE ||
            cpu==housekeeping || seconds<1 || seconds>60 || hog_count<0 || hog_count>2)
             throw std::invalid_argument("require distinct CPUs and duration 1..60 seconds");
@@ -219,9 +224,11 @@ int main(int argc,char **argv) {
         Time next_imu=begin,next_camera=begin,next_control=begin;
         uint64_t imu_id=0,camera_id=0,control_id=0,usable=0,stale=0,missing=0;
         std::vector<Time> control_ages;
+        uint64_t burst_job=0;
         std::cout<<"profile=dependent-v1 synthetic=1 duration_s="<<seconds
                  <<" hints="<<!pin.empty()<<" worker_cpu="<<cpu<<" housekeeping_cpu="<<housekeeping
                  <<" policy="<<(hints?"hinted":policy)
+                 <<" scenario="<<scenario
                  <<" hogs="<<hog_count
                  <<" queue_capacity=32 batch_limit=8 imu_period_us=5000 camera_period_us=50000"
                  <<" control_period_us=10000 max_imu_age_us=20000\n";
@@ -250,13 +257,15 @@ int main(int argc,char **argv) {
                 }
                 // Freeze the snapshot when selecting work, not when compute finishes.
                 auto selection=graph.control(clock_ns(),id/100,20*ms);
-                bool accepted=control.offer({id,release,release+10*ms,200000,[&,selection](Time){
+                Job control_job{id,release,release+10*ms,200000,[&,selection](Time){
                     usable+=selection.outcome==Outcome::usable;
                     stale+=selection.outcome==Outcome::stale;
                     missing+=selection.outcome==Outcome::missing;
                     if(selection.snapshot && selection.snapshot->imu)
                         control_ages.push_back(selection.release-selection.snapshot->imu->source_time);
-                }});
+                }};
+                control_job.outcome=static_cast<int>(selection.outcome);
+                bool accepted=control.offer(std::move(control_job));
                 (void)accepted;
                 next_control+=10*ms;
             }
@@ -266,13 +275,19 @@ int main(int argc,char **argv) {
                     Time release=batch->inputs.front().source_time;
                     Time cost=300000;
                     for(const auto &m:batch->inputs) cost+=m.stream==Stream::imu?100000:2*ms;
-                    estimator.offer({batch->id,release,release+33*ms,cost,[&,batch](Time){
+                    if(scenario=="estimator-burst" && std::any_of(batch->inputs.begin(),batch->inputs.end(),
+                            [](const auto &m){return m.stream==Stream::camera && m.sequence==11;})) {
+                        cost+=80*ms; burst_job=batch->id;
+                    }
+                    Job job{batch->id,release,release+33*ms,cost,[&,batch](Time){
                         Snapshot snapshot=graph.complete(batch->id,clock_ns());
                         if(std::any_of(batch->inputs.begin(),batch->inputs.end(),[](const auto &m){return m.stream==Stream::camera;}))
                             mapping.offer({snapshot.batch_id,snapshot.camera->source_time,
                                 snapshot.camera->source_time+100*ms,2*ms,
                                 [snapshot](Time){(void)snapshot;}});
-                    }});
+                    }};
+                    job.budget=scenario=="estimator-burst"?4*ms:0;
+                    estimator.offer(std::move(job));
                 }
             }
             for(auto *w:workers) w->dispatch();
@@ -285,10 +300,10 @@ int main(int argc,char **argv) {
         for(auto *w:workers) w->finish();
         for(auto *w:workers) w->check();
         if(!trace_path.empty()) {
-            trace<<"worker,job,release_ns,assigned_ns,start_ns,end_ns,observed_ns,deadline_ns,cpu_ns\n";
+            trace<<"worker,job,release_ns,assigned_ns,start_ns,end_ns,observed_ns,deadline_ns,cpu_ns,work_ns,budget_ns,control_outcome\n";
             for(auto *w:workers) for(const auto &r:w->traces)
                 trace<<w->name<<','<<r.id<<','<<r.release<<','<<r.assigned<<','<<r.start<<','
-                     <<r.end<<','<<r.observed<<','<<r.deadline<<','<<r.cpu<<'\n';
+                     <<r.end<<','<<r.observed<<','<<r.deadline<<','<<r.cpu<<','<<r.work<<','<<r.budget<<','<<r.outcome<<'\n';
             trace.flush();
             if(!trace) throw std::runtime_error("trace write failed");
         }
@@ -312,6 +327,9 @@ int main(int argc,char **argv) {
                      <<" in_flight="<<graph.in_flight(s)<<"\n";
         }
         std::cout<<"control usable="<<usable<<" stale="<<stale<<" missing="<<missing<<"\n";
+        if(scenario=="estimator-burst")
+            std::cout<<"burst job="<<burst_job<<" camera_sequence=11 extra_work_ns="<<80*ms
+                     <<" estimator_budget_ns="<<4*ms<<"\n";
         std::sort(control_ages.begin(),control_ages.end());
         std::cout<<"control_age samples="<<control_ages.size()
                  <<" p99_us="<<(control_ages.empty()?0:control_ages[(control_ages.size()*99+99)/100-1]/1000)

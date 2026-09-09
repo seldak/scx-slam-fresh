@@ -10,10 +10,28 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
-from test_dependent_loaded import validate, summarize
+from test_dependent_loaded import validate, summarize, burst_metrics
 
 
 class ThreadedGraph(unittest.TestCase):
+    def test_burst_identity_and_recovery(self):
+        allowed = sorted(os.sched_getaffinity(0))
+        if len(allowed) < 2:
+            self.skipTest('requires two CPUs')
+        worker, housekeeping = (14, 1) if {14, 1} <= set(allowed) else (allowed[1], allowed[0])
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / 'jobs.csv'
+            result = subprocess.run([str(ROOT / 'build/dependent_workload'),
+                '--cpu', str(worker), '--housekeeping-cpu', str(housekeeping),
+                '--duration', '2', '--hogs', '2', '--scenario', 'estimator-burst',
+                '--trace', str(trace)], capture_output=True, text=True, check=True, timeout=15)
+            validate(result.stdout, trace, False)
+            metrics = burst_metrics(result.stdout, trace)
+            self.assertGreaterEqual(metrics['burst_cpu_ms'], 80)
+            self.assertIsNotNone(metrics['recovery_ms'])
+            with self.assertRaises(RuntimeError):
+                burst_metrics(result.stdout.replace('burst job=', 'burst job=999'), trace)
+
     def test_invalid_policy(self):
         for options in (['--policy', 'unknown'], ['--policy', 'fifo', '--pin', '/unused']):
             result = subprocess.run([str(ROOT / 'build/dependent_workload'), *options],
