@@ -102,6 +102,52 @@ failures without retrying for a passing result.
 Use `--scenario estimator-burst` with the plotting script to select those rows
 from the combined summary; the default plots nominal runs.
 
+## Independent deadline comparison
+
+```bash
+make build/edf_workload
+make test-edf
+sudo python3 scripts/test_edf_loaded.py --cpu 14 --housekeeping-cpu 1
+```
+
+Two independent workers release synchronous periodic jobs for two hyperperiods
+(700 ms): A executes 21 ms every 50 ms, B executes 29.5 ms every 70 ms.
+Each deadline equals its period. The ideal preemptive EDF schedule is feasible
+at 84.14% utilization. A-first FIFO misses B's initial deadline because
+`2*21 + 29.5 > 70`; B-first FIFO misses A's because `29.5 + 21 > 50`.
+The deterministic test checks both priority orders and the ideal EDF schedule.
+Measured runs retain every completion and deadline miss, including unexpected ones.
+
+The runner compares both FIFO orders (priorities 60/50), SCHED_DEADLINE, and
+SCX Deadline service, three times each. SCX uses no Urgent work, Background
+server, insertion cap or job budgets. SCHED_DEADLINE reserves 21.2 ms/50 ms and
+29.7 ms/70 ms, providing 0.2 ms overhead allowance per job. Kernel admission
+limits remain unchanged. The 200 ms inter-run gap lets exiting CBS reservations
+retire before the next admission. This tests a classical dynamic-priority
+advantage, not a capability unique to scx_fresh.
+
+A temporary single-CPU cpuset root partition is used for every variant and
+removed after the run. This is required by SCHED_DEADLINE's root-domain affinity
+constraint; the housekeeping runner stays outside it. The cpuset controller must
+already be enabled. CPU 15 is not used. Setup and admission errors stop the test
+and are not counted as deadline misses. See the
+[kernel task-affinity documentation](https://docs.kernel.org/scheduler/sched-deadline.html#tasks-cpu-affinity).
+Logs, CSV traces, source snapshots and binary hashes go under ignored `results/`.
+
+On the tested kernel (7.0.0-31-generic), with execution on CPU 14 and housekeeping
+on CPU 1, all 24 jobs completed in each of the three repetitions per policy:
+
+| Policy | Task A misses per repetition | Task B misses per repetition |
+| --- | --- | --- |
+| FIFO, A higher priority | 0 / 0 / 0 | 2 / 2 / 2 |
+| FIFO, B higher priority | 6 / 6 / 6 | 0 / 0 / 0 |
+| SCHED_DEADLINE | 0 / 0 / 0 | 0 / 0 / 0 |
+| scx_fresh Deadline | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Dynamic deadline ordering handled this task set where neither fixed-priority
+assignment did. SCHED_DEADLINE also passed; this is neither an advantage over
+SCHED_DEADLINE nor evidence about dependent application outcomes.
+
 ## Build modes
 
 `make` builds the external `scx_fresh` checkout and the local standalone demo.

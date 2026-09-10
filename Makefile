@@ -30,6 +30,9 @@ all: bpf userspace
 
 userspace: $(BUILD_DIR)/scx_slam_fresh_user $(BUILD_DIR)/slam_pipeline_demo $(BUILD_DIR)/dependent_workload
 
+$(BUILD_DIR)/edf_workload: demo/edf_workload.c $(SCX_FRESH_DIR)/src/freshqos.c $(wildcard $(SCX_FRESH_DIR)/include/* $(SCX_FRESH_DIR)/src/*.h) | $(BUILD_DIR)
+	$(CC) -std=gnu11 -O2 -Wall -Wextra -Werror -I"$(SCX_FRESH_DIR)/include" -I"$(SCX_FRESH_DIR)/src" $< "$(SCX_FRESH_DIR)/src/freshqos.c" -lbpf -lpthread -o $@
+
 $(BUILD_DIR)/dependent_workload: demo/dependent_workload.cpp demo/dependent_graph.h $(SCX_FRESH_DIR)/src/freshqos.c $(wildcard $(SCX_FRESH_DIR)/include/* $(SCX_FRESH_DIR)/src/*.h) | $(BUILD_DIR)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -I"$(SCX_FRESH_DIR)/include" -I"$(SCX_FRESH_DIR)/src" $< "$(SCX_FRESH_DIR)/src/freshqos.c" -lbpf -lpthread -o $@
 
@@ -58,6 +61,10 @@ $(BUILD_DIR)/test_dependent_graph: tests/test_dependent_graph.cpp demo/dependent
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror $< -o $@
 
 .PHONY: test-graph
+.PHONY: test-edf
+test-edf: $(BUILD_DIR)/edf_workload
+	$(PYTHON) tests/test_edf_workload.py
+
 test-graph: $(BUILD_DIR)/test_dependent_graph $(BUILD_DIR)/dependent_workload
 	$(BUILD_DIR)/test_dependent_graph
 	$(PYTHON) tests/test_dependent_workload.py
