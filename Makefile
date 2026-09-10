@@ -64,6 +64,7 @@ $(BUILD_DIR)/test_dependent_graph: tests/test_dependent_graph.cpp demo/dependent
 .PHONY: test-edf
 test-edf: $(BUILD_DIR)/edf_workload
 	$(PYTHON) tests/test_edf_workload.py
+	$(PYTHON) tests/test_edf_report.py
 
 test-graph: $(BUILD_DIR)/test_dependent_graph $(BUILD_DIR)/dependent_workload
 	$(BUILD_DIR)/test_dependent_graph

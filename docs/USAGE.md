@@ -134,6 +134,14 @@ and are not counted as deadline misses. See the
 [kernel task-affinity documentation](https://docs.kernel.org/scheduler/sched-deadline.html#tasks-cpu-affinity).
 Logs, CSV traces, source snapshots and binary hashes go under ignored `results/`.
 
+To inspect how closely jobs approached their deadlines, run
+`python3 scripts/report_edf_results.py RESULTS_DIRECTORY`. The report reads all
+twelve traces and shows each task's minimum completion margin, the responsible
+job, maximum start delay, and total CPU time. Positive margin means completion
+before the deadline; negative means lateness. `--json` emits exact nanosecond
+values, including maximum response time. Incomplete or invalid traces fail the
+report. These observed extrema are not worst-case execution guarantees.
+
 On the tested kernel (7.0.0-31-generic), with execution on CPU 14 and housekeeping
 on CPU 1, all 24 jobs completed in each of the three repetitions per policy:
 
