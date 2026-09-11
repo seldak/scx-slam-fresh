@@ -1,0 +1,342 @@
+{
+  "edf": {
+    "metadata": {
+      "cpu": 14,
+      "housekeeping_cpu": 1,
+      "kernel": "7.3.0-rc2-bpf-rt-investigation+",
+      "repetitions": 3,
+      "order": [
+        "fifo-a",
+        "fifo-b",
+        "deadline",
+        "scx"
+      ],
+      "work_ns": [
+        21000000,
+        29500000
+      ],
+      "period_ns": [
+        50000000,
+        70000000
+      ],
+      "reservation_ns": [
+        21200000,
+        29700000
+      ],
+      "background_server": false,
+      "job_budget_ns": 0,
+      "inter_run_pause_s": 0.2,
+      "edf_workload_sha256": "cfef99051dbcfffb4a05306dac9779aac5607634322cfe88d1bd4f0f2053eb0e",
+      "scx_slam_fresh_user_sha256": "c47048edb9efe1f340c62d61574d000e2c76818a03d652ff5ec78e6e41ccd156",
+      "sched_rt_runtime_us": 1000000,
+      "sched_rt_period_us": 1000000,
+      "application_revision": "cb88a4175871021a4b1cde652486dbbc48d74222",
+      "scheduler_revision": "0d113f2beed65b1a62a680506706b01036caab32"
+    },
+    "summary": [
+      {
+        "mode": "fifo-a",
+        "repetition": 1,
+        "misses": {
+          "A": 0,
+          "B": 2
+        }
+      },
+      {
+        "mode": "fifo-a",
+        "repetition": 2,
+        "misses": {
+          "A": 0,
+          "B": 2
+        }
+      },
+      {
+        "mode": "fifo-a",
+        "repetition": 3,
+        "misses": {
+          "A": 0,
+          "B": 2
+        }
+      },
+      {
+        "mode": "fifo-b",
+        "repetition": 1,
+        "misses": {
+          "A": 6,
+          "B": 0
+        }
+      },
+      {
+        "mode": "fifo-b",
+        "repetition": 2,
+        "misses": {
+          "A": 6,
+          "B": 0
+        }
+      },
+      {
+        "mode": "fifo-b",
+        "repetition": 3,
+        "misses": {
+          "A": 6,
+          "B": 0
+        }
+      },
+      {
+        "mode": "deadline",
+        "repetition": 1,
+        "misses": {
+          "A": 0,
+          "B": 0
+        }
+      },
+      {
+        "mode": "deadline",
+        "repetition": 2,
+        "misses": {
+          "A": 0,
+          "B": 0
+        }
+      },
+      {
+        "mode": "deadline",
+        "repetition": 3,
+        "misses": {
+          "A": 0,
+          "B": 0
+        }
+      },
+      {
+        "mode": "scx",
+        "repetition": 1,
+        "misses": {
+          "A": 0,
+          "B": 0
+        }
+      },
+      {
+        "mode": "scx",
+        "repetition": 2,
+        "misses": {
+          "A": 0,
+          "B": 0
+        }
+      },
+      {
+        "mode": "scx",
+        "repetition": 3,
+        "misses": {
+          "A": 0,
+          "B": 0
+        }
+      }
+    ]
+  },
+  "dependent": {
+    "metadata": {
+      "kernel": "7.3.0-rc2-bpf-rt-investigation+",
+      "cpu": 14,
+      "housekeeping_cpu": 1,
+      "duration_s": 2,
+      "hogs": 2,
+      "repetitions": 3,
+      "order": "ordinary-1..3, fifo-1..3, hinted-1..3",
+      "fifo_background_policy": "SCHED_OTHER",
+      "be_slice_cap_us": 2000,
+      "background_server_us": "2000/10000",
+      "scenarios": [
+        "nominal",
+        "estimator-burst"
+      ],
+      "scenario_order": "nominal then estimator-burst within each variant",
+      "sched_rt_runtime_us": 1000000,
+      "sched_rt_period_us": 1000000,
+      "dependent_workload_sha256": "8e99e8c4d4a1499ae8edc3df131fa3e73d3c147a60fdd7450d8befbd966a79c6",
+      "scx_slam_fresh_user_sha256": "c47048edb9efe1f340c62d61574d000e2c76818a03d652ff5ec78e6e41ccd156",
+      "application_revision": "cb88a4175871021a4b1cde652486dbbc48d74222",
+      "scheduler_revision": "0d113f2beed65b1a62a680506706b01036caab32"
+    },
+    "summary": [
+      {
+        "variant": "ordinary",
+        "repetition": 1,
+        "burst_wall_ms": 279.431426,
+        "burst_cpu_ms": 82.303655,
+        "control_late": 0,
+        "control_stale": 35,
+        "recovery_ms": 86.466563,
+        "imu_input_dropped": 24,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 3,
+        "estimator_late": 7,
+        "mapping_late": 4,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 79,
+        "hog0_cpu_ms_during_burst": 79.258108,
+        "hog1_completed_during_burst": 79,
+        "hog1_cpu_ms_during_burst": 79.260154
+      },
+      {
+        "variant": "ordinary",
+        "repetition": 2,
+        "burst_wall_ms": 274.653651,
+        "burst_cpu_ms": 82.304243,
+        "control_late": 0,
+        "control_stale": 35,
+        "recovery_ms": 91.514573,
+        "imu_input_dropped": 23,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 6,
+        "estimator_late": 8,
+        "mapping_late": 5,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 75,
+        "hog0_cpu_ms_during_burst": 75.247466,
+        "hog1_completed_during_burst": 78,
+        "hog1_cpu_ms_during_burst": 78.24958
+      },
+      {
+        "variant": "ordinary",
+        "repetition": 3,
+        "burst_wall_ms": 277.516587,
+        "burst_cpu_ms": 82.304222,
+        "control_late": 0,
+        "control_stale": 35,
+        "recovery_ms": 86.725644,
+        "imu_input_dropped": 23,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 1,
+        "estimator_late": 9,
+        "mapping_late": 5,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 77,
+        "hog0_cpu_ms_during_burst": 77.250959,
+        "hog1_completed_during_burst": 79,
+        "hog1_cpu_ms_during_burst": 79.248806
+      },
+      {
+        "variant": "fifo",
+        "repetition": 1,
+        "burst_wall_ms": 87.156378,
+        "burst_cpu_ms": 82.302908,
+        "control_late": 0,
+        "control_stale": 9,
+        "recovery_ms": 17.953877,
+        "imu_input_dropped": 0,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 0,
+        "estimator_late": 3,
+        "mapping_late": 1,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 0,
+        "hog0_cpu_ms_during_burst": 0.0,
+        "hog1_completed_during_burst": 0,
+        "hog1_cpu_ms_during_burst": 0.0
+      },
+      {
+        "variant": "fifo",
+        "repetition": 2,
+        "burst_wall_ms": 87.156819,
+        "burst_cpu_ms": 82.302528,
+        "control_late": 0,
+        "control_stale": 9,
+        "recovery_ms": 17.99129,
+        "imu_input_dropped": 0,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 0,
+        "estimator_late": 3,
+        "mapping_late": 1,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 0,
+        "hog0_cpu_ms_during_burst": 0.0,
+        "hog1_completed_during_burst": 0,
+        "hog1_cpu_ms_during_burst": 0.0
+      },
+      {
+        "variant": "fifo",
+        "repetition": 3,
+        "burst_wall_ms": 87.167151,
+        "burst_cpu_ms": 82.303141,
+        "control_late": 0,
+        "control_stale": 9,
+        "recovery_ms": 18.136609,
+        "imu_input_dropped": 0,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 0,
+        "estimator_late": 3,
+        "mapping_late": 1,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 0,
+        "hog0_cpu_ms_during_burst": 0.0,
+        "hog1_completed_during_burst": 0,
+        "hog1_cpu_ms_during_burst": 0.0
+      },
+      {
+        "variant": "hinted",
+        "repetition": 1,
+        "burst_wall_ms": 202.930498,
+        "burst_cpu_ms": 82.303771,
+        "control_late": 0,
+        "control_stale": 21,
+        "recovery_ms": 21.893264,
+        "imu_input_dropped": 9,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 3,
+        "estimator_late": 6,
+        "mapping_late": 3,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 43,
+        "hog0_cpu_ms_during_burst": 43.131791,
+        "hog1_completed_during_burst": 44,
+        "hog1_cpu_ms_during_burst": 44.138127
+      },
+      {
+        "variant": "hinted",
+        "repetition": 2,
+        "burst_wall_ms": 228.831541,
+        "burst_cpu_ms": 82.303715,
+        "control_late": 0,
+        "control_stale": 24,
+        "recovery_ms": 26.05631,
+        "imu_input_dropped": 14,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 2,
+        "estimator_late": 6,
+        "mapping_late": 3,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 54,
+        "hog0_cpu_ms_during_burst": 54.173442,
+        "hog1_completed_during_burst": 56,
+        "hog1_cpu_ms_during_burst": 56.177297
+      },
+      {
+        "variant": "hinted",
+        "repetition": 3,
+        "burst_wall_ms": 240.66575,
+        "burst_cpu_ms": 82.303242,
+        "control_late": 0,
+        "control_stale": 25,
+        "recovery_ms": 31.826611,
+        "imu_input_dropped": 16,
+        "camera_input_dropped": 0,
+        "imu_processing_late": 3,
+        "estimator_late": 6,
+        "mapping_late": 5,
+        "mapping_completed_during_burst": 0,
+        "mapping_cpu_ms_during_burst": 0.0,
+        "hog0_completed_during_burst": 60,
+        "hog0_cpu_ms_during_burst": 60.188365,
+        "hog1_completed_during_burst": 60,
+        "hog1_cpu_ms_during_burst": 60.195079
+      }
+    ]
+  }
+}

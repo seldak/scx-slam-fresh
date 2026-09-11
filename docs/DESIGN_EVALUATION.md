@@ -6,6 +6,11 @@ sensor timing and identity. Callback compute remains synthetic throughout.
 
 ## Current finding
 
+The [closing comparison](evaluation/conclusion.md) supersedes the older bag
+result as the project's overall conclusion: the tested dependent workload did
+not demonstrate a freshness advantage over FIFO. The bag findings below remain
+valid for their specific synthetic graph and comparison cells.
+
 On the tested EuRoC graph with two EXT hogs, the IMU queue/preemption bundle
 keeps the 200 Hz worker on time. An opt-in 2 ms BE slice cap makes the shared
 33 ms camera chain completable. Under that cap, downstream FE hints reduce

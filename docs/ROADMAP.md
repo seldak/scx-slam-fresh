@@ -1,37 +1,17 @@
 # Project status
 
-This repository owns the workloads, ROS integration and evaluation. Scheduler
-implementation lives in scx_fresh. The BE insertion cap and Background server
-remain disabled by default; current work does not change scheduler policy.
+Feature development is paused. The [closing findings](evaluation/conclusion.md)
+record what the experiments established and what they did not.
 
-## Completed
+The repository retains synthetic standalone workloads, ROS executor integration,
+bag replay and explicit accounting. It does not implement SLAM or a real fusion
+estimator. Scheduler policy and experimental PREEMPT_RT patches live in
+[scx_fresh](https://github.com/seldak/scx_fresh).
 
-- Standalone calibration, overload, burst, budget, and IMU-load experiments.
-- ROS callback execution with one worker per callback group.
-- Application-owned expiry and executor stale-selection rejection.
-- Deterministic bag identity, source windows, and explicit drop accounting.
-- EuRoC uncapped baseline, opt-in 2 ms cap, and capped hint ablations.
-- Optional Background-server integration, adapter match readiness and delivery tracing.
+The dependent overload experiment did not demonstrate better freshness than
+FIFO. The separate EDF task set matched Linux SCHED_DEADLINE; generic and
+experimental RT runs had the same deadline-miss counts.
 
-See the [evaluation reports](DESIGN_EVALUATION.md) for results and scope.
-
-## Open questions
-
-The current evidence does not separate FE class priority from EDF ordering
-and budgets. It also does not quantify cap overhead against an uncapped run
-with equivalent hog counters. These are limits of the results, not scheduled
-policy changes.
-
-Additional slice values, FIFO comparisons, other datasets, and a real estimator
-integration are outside the current cleanup.
-
-One server-enabled bag run produced a large delivery burst and missed IMU
-deadlines. Subsequent diagnostic and uninstrumented checks passed, but the
-original cause remains unresolved. Adapter readiness now checks local middleware
-matches before playback; this is not evidence that the burst was fixed.
-
-## Contract boundaries
-
-Userspace remains responsible for selecting and evicting work. A BPF pending-job
-queue would duplicate that ownership and is not planned. Mid-callback migration
-would require job-scoped budget accounting before it could be supported.
+No further scheduler variants, datasets or estimator integration are scheduled.
+Historical reports remain evidence for their stated configurations, not current
+performance promises. Kernel timer work can be revisited independently.
