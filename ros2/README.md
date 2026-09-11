@@ -2,6 +2,9 @@
 
 The optional ROS 2 Lyrical workspace provides an executor, synthetic callback
 graph, and sensor-bag adapter. It is separate from the standalone build.
+Its graph also differs from the dependent threaded workload: the IMU callback
+does not feed the camera chain. Both workloads use synthetic compute and neither
+implements sensor fusion. See the [architecture](../docs/DESIGN.md#workloads).
 
 ## Build and test
 

@@ -142,19 +142,9 @@ before the deadline; negative means lateness. `--json` emits exact nanosecond
 values, including maximum response time. Incomplete or invalid traces fail the
 report. These observed extrema are not worst-case execution guarantees.
 
-On the tested kernel (7.0.0-31-generic), with execution on CPU 14 and housekeeping
-on CPU 1, all 24 jobs completed in each of the three repetitions per policy:
-
-| Policy | Task A misses per repetition | Task B misses per repetition |
-| --- | --- | --- |
-| FIFO, A higher priority | 0 / 0 / 0 | 2 / 2 / 2 |
-| FIFO, B higher priority | 6 / 6 / 6 | 0 / 0 / 0 |
-| SCHED_DEADLINE | 0 / 0 / 0 | 0 / 0 / 0 |
-| scx_fresh Deadline | 0 / 0 / 0 | 0 / 0 / 0 |
-
-Dynamic deadline ordering handled this task set where neither fixed-priority
-assignment did. SCHED_DEADLINE also passed; this is neither an advantage over
-SCHED_DEADLINE nor evidence about dependent application outcomes.
+Measured outcomes for this task set and the dependent workload are in the
+[closing comparison](evaluation/conclusion.md). Usage commands specify the
+experiment; its reports hold the results.
 
 ## Build modes
 

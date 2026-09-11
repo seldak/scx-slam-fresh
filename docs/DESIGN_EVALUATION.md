@@ -11,6 +11,8 @@ result as the project's overall conclusion: the tested dependent workload did
 not demonstrate a freshness advantage over FIFO. The bag findings below remain
 valid for their specific synthetic graph and comparison cells.
 
+## Historical bag finding
+
 On the tested EuRoC graph with two EXT hogs, the IMU queue/preemption bundle
 keeps the 200 Hz worker on time. An opt-in 2 ms BE slice cap makes the shared
 33 ms camera chain completable. Under that cap, downstream FE hints reduce
@@ -19,12 +21,15 @@ hog iteration count between hint variants.
 
 The cap remains disabled by default. This finding does not separate FE class,
 EDF ordering, and budget effects, or measure cap overhead against the older
-uncapped run. No FIFO comparison or real-estimator accuracy result is included.
+uncapped run. That bag experiment includes no FIFO comparison or real-estimator
+accuracy result; the later dependent and EDF comparisons are separate tests.
 
 ## Reports
 
 | Workload | Question and evidence |
 | --- | --- |
+| [Closing comparisons](evaluation/conclusion.md) | EDF and dependent-graph comparisons on generic and experimental RT kernels, with scope and limits. |
+| [Dependent workload](evaluation/dependent-workload.md) | Earlier nominal comparison of ordinary Linux and hinted scheduling. |
 | [EuRoC bag replay](evaluation/euroc.md) | Executor recovery, failed uncapped baseline, 2 ms cap, and three-cell hint ablation. |
 | [ROS periodic sources](evaluation/ros-synthetic.md) | Earlier callback scheduling matrix and CPU-interference diagnosis. |
 | [Standalone demo](evaluation/standalone.md) | LiDAR calibration, overload, stale shedding, burst recovery, and budgets (E0–E3). |

@@ -1,6 +1,6 @@
-# Dependent workload comparison
+# Initial nominal dependent-workload comparison
 
-On September 9, 2026, the dependent-v1 synthetic workload ran three times under
+In the initial nominal comparison, the dependent-v1 synthetic workload ran three times under
 ordinary Linux scheduling, then three times under hinted sched_ext. Each run
 offered 400 IMU measurements, 40 camera measurements and 200 control ticks over
 two seconds. Workers shared CPU 14; the dispatcher used CPU 1. Two Background
@@ -15,6 +15,9 @@ workload binary and synthetic compute rules. This compares the complete hinted
 configuration, not the contribution of an individual scheduler mechanism.
 
 ## Results
+
+This report covers the earlier two-policy comparison only. The later FIFO,
+estimator-burst and RT results are in the [closing findings](conclusion.md).
 
 Ranges below are the minimum and maximum of three per-run p99 values, not a
 pooled percentile or a confidence interval.

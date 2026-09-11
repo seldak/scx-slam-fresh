@@ -1,95 +1,79 @@
-# Architecture
+# Application architecture
 
-scx-slam-fresh separates application work selection from CPU scheduling.
-The application decides which message a worker owns. The scheduler sees a
-single hint describing that selection and routes the worker accordingly.
+This repository owns workloads, work selection, ROS integration and evaluation.
+The external scx_fresh repository owns the scheduler, loader and hint ABI.
+The application publishes one selected job per worker using ABI version 1;
+the client library stamps the version when writing the map.
 
-## Components
+## Workloads
 
-The BPF scheduler, loader, and MIT client API live in the external `scx_fresh`
-repository. This repository owns the workload, ROS adapter, and evaluation.
-The version 1 hint ABI selects Urgent, Deadline or Background service explicitly
-and leaves expiry to the application.
-The application assigns IMU propagation to Urgent, vision and estimation to
-Deadline, and mapping to Background. Sensor IDs remain application diagnostics;
-they no longer select a scheduler route.
+These are distinct graphs, not interchangeable implementations of one pipeline.
 
-| Component | Responsibility |
-| --- | --- |
-| BPF scheduler | Route runnable workers, account execution, apply budget and age rules. |
-| Loader | Attach the scheduler, pin maps, configure options, and read events. |
-| libfreshqos | Publish a hint for the current thread or an explicitly identified worker. |
-| Standalone demo | Generate synthetic sensor jobs and manage FIFO stage queues. |
-| ROS FreshnessExecutor | Select callbacks, publish before wake, and release selected messages. |
-| Bag adapter | Translate ROS sensor messages into jobs with source identity and monotonic release time. |
+| Workload | Structure | Purpose |
+| --- | --- | --- |
+| Dependent threaded workload | IMU and camera processing feed a bounded-batch estimator; periodic control selects a completed snapshot; mapping consumes camera-bearing snapshots. | Compare scheduling policies with dependencies, stale inputs and estimator overload. |
+| ROS workload | Independent IMU callback alongside a camera-triggered vision → estimation → mapping chain. | Exercise executor ownership, middleware delivery and deterministic bag accounting. |
+| Legacy standalone demo | Synthetic stage queues with configurable sensor releases, compute and backlog. | Reproduce the earlier calibration, shedding and budget experiments. |
 
-```mermaid
-flowchart LR
-  Input["Sensor message or synthetic release"] --> Select["Userspace selects work"]
-  Select --> Hint["Publish selected job hint"]
-  Hint --> Wake["Wake assigned worker"]
-  Hint --> Map["One hint slot per worker"]
-  Map --> SCX["sched_ext routing"]
-  Wake --> SCX
-  SCX --> Worker["Execute or reject before callback entry"]
-  Worker --> Done["Release ownership"]
-  Done --> Select
-```
+All three consume synthetic CPU work. None implements SLAM, estimation
+mathematics or a physical plant. Bag replay supplies real recorded input timing
+and identity, not a real estimation algorithm.
 
-The BPF map is not a pending-work queue. It cannot choose another message,
-cancel an application callback, or infer that a completed worker is safe to
-reassign. Those are executor responsibilities.
+## Dependent threaded workload
 
-## Execution models
+A dispatcher owns work selection. IMU and camera processing place measurements
+in bounded inboxes; the estimator consumes at most eight measurements per job.
+Periodic control selects the latest completed snapshot and a predetermined
+setpoint. Mapping becomes ready after an estimator batch containing camera input.
 
-The standalone demo has one FIFO consumer per stage queue. A producer publishes
-the head item's hint when waking a sleeping consumer. After popping, the
-consumer republishes the exact item it selected. Producers must not overwrite
-a busy consumer's hint.
+In the hinted profile, control uses Urgent, IMU processing, camera processing
+and estimation use Deadline, and mapping and background workers use Background.
+The estimator-burst profile gives estimator jobs a CPU budget. These assignments
+belong to the workload, not to sensor-specific scheduler routes.
 
-The ROS workload uses one executor instance per stage, each with a dispatcher
-and one callback worker. Dispatchers and DDS run on a housekeeping CPU.
-Workers and synthetic hogs share the experimental CPU. Message-aware
-subscriptions are taken directly from DDS; the executor does not copy pending
-messages into a second application queue.
+Workers enroll and park before the source window begins. The dispatcher
+publishes selected work before waking its worker and waits for completion before
+replacing the hint. Work released within the source window drains afterward.
+See [usage](USAGE.md#dependent-threaded-workload) for costs, timing bounds,
+queue limits and comparison configurations.
 
-For admitted ROS messages, hint ownership extends through the callback's
-completion and parking path. The next assignment directly replaces the old
-hint. This prevents a completed callback's tail from being stranded in BE
-after an intermediate clear. The
-[hints contract](DESIGN_HINTS_API.md#executor-contract) defines the ordering
-and cleanup requirements.
+## ROS workload
 
-## CPU scheduling
+Each stage has an executor dispatcher and one callback worker. Dispatchers,
+DDS and the adapter use the housekeeping CPU; callback workers and hogs share
+the worker CPU. Message-aware subscriptions take messages directly from DDS
+rather than duplicating its pending queue.
 
-The custom dispatch queues are served in order: Urgent, Deadline, Background.
-A waking Urgent worker can preempt through direct local insertion. Deadline ordering
-alone does not interrupt the currently running slice; this is why background
-slice length affects a multi-hop callback chain.
+The workload assigns IMU to Urgent, vision and estimation to Deadline, and
+mapping and hogs to Background. This differs from the dependent graph's
+assignment, where control is Urgent.
 
-The [scheduler reference](DESIGN_SCHED_ALGO.md) defines deadline ordering,
-budget demotion, default slices, and optional BE cap. These rules schedule
-threads, not messages.
+The executor may reject expired messages before publication or after handoff,
+before callback entry. Accepted work retains its hint through completion and
+parking; the next assignment replaces it. Message cleanup and callback-group
+release remain executor responsibilities. See the
+[application hint contract](DESIGN_HINTS_API.md#executor-contract).
 
-## Time and identity
+## Legacy demo
 
-Job IDs identify selected work. Scheduler timestamps use `CLOCK_MONOTONIC`.
-Bag timestamps remain separate: they identify the fixed dataset window and
-must not be used as kernel deadlines. Downstream camera jobs preserve the
-camera identity and original monotonic release time, so their deadline is
-shared across the chain.
+The legacy demo uses one consumer per FIFO stage queue. Producers may publish
+the head hint when waking an idle consumer; the consumer republishes the exact
+item it selects. A producer must not overwrite a busy consumer's hint.
+This lifecycle differs from the dependent workload's dispatcher-owned selection.
 
-[Evaluation methodology](DESIGN_EVALUATION.md) distinguishes source-window
-accounting from callback execution and completion.
+## Time and scheduling boundaries
 
-## Boundaries
+Scheduler timestamps use CLOCK_MONOTONIC. Bag timestamps identify source input
+and are kept separate from scheduler deadlines. In the ROS camera chain,
+downstream jobs retain the original camera identity and monotonic release time.
+The dependent workload derives job bounds from its selected inputs and periodic
+control releases.
 
-The default build uses partial-switch mode. Other scheduling classes remain
-outside these DSQs; pinning workers does not isolate the CPU from unrelated
-processes. The kernel can detach a failing scheduler, but that is not a
-substitute for testing on a suitable machine.
+The map transports metadata; it cannot select messages, cancel callbacks or
+establish application completion. CPU affinity and partial-switch enrollment
+do not exclude unrelated kernel or application work.
 
-Strict IMU priority can starve lower lanes at high IMU utilization. Budget
-demotion does not cancel work, and executor age protection does not guarantee
-progress after a budget overrun. There are no hard real-time guarantees,
-GPU scheduling, or mid-callback migration in this implementation.
+Routing, preemption, budget demotion and optional Background allocation are
+defined in the [scheduler rules](https://github.com/seldak/scx_fresh/blob/main/docs/SCHEDULER.md).
+The [evaluation guide](DESIGN_EVALUATION.md) defines accounting and links each
+result to its workload. Timing results are not estimation-accuracy or control-safety claims.

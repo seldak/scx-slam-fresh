@@ -39,12 +39,20 @@ job or authorize kernel-side selection.
 Serialized, dynamic, and intra-process message delivery are outside the
 message-aware path. The current worker does not steal or migrate callbacks.
 
-### Standalone FIFO lifecycle
+### Dependent workload lifecycle
+
+Workers enroll and park before source release. The dispatcher selects a job,
+publishes its hint and wakes the assigned worker. Completion is observed before
+the next assignment replaces the slot. Once the source window closes, outstanding
+work drains; final hints are retired before workers wake for shutdown. Measurement
+inboxes and batching belong to this application, not to the BPF map.
+
+### Legacy demo FIFO lifecycle
 
 Each queue has one consumer. Producers publish the head item's hint only when
 waking a sleeping consumer; after `pop()`, the consumer republishes the exact
 selected item. Busy consumers' slots are not overwritten by later arrivals.
-This is the standalone instance of the same ownership contract.
+This is the legacy demo's implementation of the ownership contract.
 
 ## Release time and bag identity
 

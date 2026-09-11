@@ -5,7 +5,7 @@ The current scheduling policy is documented in
 That repository owns routing, deadline and budget rules, slices, and kernel
 compatibility.
 
-SLAM workload assumptions, ROS message handling, and measurements remain here:
+Synthetic workload assumptions, ROS message handling, and measurements remain here:
 
 - [Application architecture](DESIGN.md)
 - [Application hint integration](DESIGN_HINTS_API.md)
