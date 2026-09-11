@@ -8,7 +8,7 @@ single hint describing that selection and routes the worker accordingly.
 
 The BPF scheduler, loader, and MIT client API live in the external `scx_fresh`
 repository. This repository owns the workload, ROS adapter, and evaluation.
-The version 3 hint ABI selects Urgent, Deadline or Background service explicitly
+The version 1 hint ABI selects Urgent, Deadline or Background service explicitly
 and leaves expiry to the application.
 The application assigns IMU propagation to Urgent, vision and estimation to
 Deadline, and mapping to Background. Sensor IDs remain application diagnostics;

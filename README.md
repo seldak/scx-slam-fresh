@@ -36,8 +36,8 @@ make all build/edf_workload build/dependent_workload
 make test-edf
 ```
 
-Build scheduler and clients together: the hint interface is unversioned and
-not stable. Loaded tests require root and explicit worker/housekeeping CPUs.
+Build scheduler and clients together using hint ABI version 1. The client library
+stamps the version when publishing. Loaded tests require root and explicit worker/housekeeping CPUs.
 Follow the [closing report](docs/evaluation/conclusion.md) for comparison
 commands and the [ROS guide](ros2/README.md) for optional bag replay.
 
